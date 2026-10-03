@@ -9,10 +9,15 @@ const {t} = useI18n({useScope: "global"});
 <template>
   <section class="settings-card" aria-labelledby="application-settings-title">
     <h2 id="application-settings-title">{{ t("settings.application") }}</h2>
-    <div class="setting-row">
+    <div
+        class="setting-row"
+        role="group"
+        aria-labelledby="interface-language-label"
+        aria-describedby="interface-language-description"
+    >
       <div class="setting-description">
-        <label for="interface-language">{{ t("settings.language") }}</label>
-        <p>{{ t("settings.languageDescription") }}</p>
+        <label id="interface-language-label" for="interface-language">{{ t("settings.language") }}</label>
+        <p id="interface-language-description">{{ t("settings.languageDescription") }}</p>
       </div>
       <ElSelect
           id="interface-language"
@@ -42,7 +47,7 @@ const {t} = useI18n({useScope: "global"});
 .settings-card h2 {
   margin: 0 0 20px;
   color: var(--app-text);
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 600;
 }
 
@@ -65,7 +70,7 @@ const {t} = useI18n({useScope: "global"});
 
 .setting-description p {
   margin: 6px 0 0;
-  color: var(--app-text-muted);
+  color: var(--app-text-secondary);
   font-size: 12px;
   line-height: 1.7;
 }

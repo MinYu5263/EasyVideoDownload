@@ -1,16 +1,16 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
-import { ElConfigProvider, ElEmpty, ElIcon } from "element-plus";
-import { useI18n } from "vue-i18n";
+import {computed, ref} from "vue";
+import {ElConfigProvider, ElEmpty, ElIcon} from "element-plus";
+import {useI18n} from "vue-i18n";
 import AppSidebar from "./components/AppSidebar.vue";
-import LanguageSettings from "./components/LanguageSettings.vue";
-import { elementPlusLocale } from "./i18n";
-import { appPages, type AppPageId } from "./navigation";
+import SettingsPage from "./components/SettingsPage.vue";
+import {elementPlusLocale} from "./i18n";
+import {appPages, type AppPageId} from "./navigation";
 
 const activePageId = ref<AppPageId>("download");
-const { t } = useI18n({ useScope: "global" });
+const {t} = useI18n({useScope: "global"});
 const activePage = computed(
-  () => appPages.find((page) => page.id === activePageId.value) ?? appPages[0],
+    () => appPages.find((page) => page.id === activePageId.value) ?? appPages[0],
 );
 </script>
 
@@ -21,25 +21,25 @@ const activePage = computed(
     </a>
 
     <div class="app-shell">
-      <AppSidebar v-model="activePageId" />
+      <AppSidebar v-model="activePageId"/>
 
       <main id="main-content" class="app-main" tabindex="-1">
         <header class="page-heading">
           <h1 id="page-title">{{ t(activePage.labelKey) }}</h1>
         </header>
 
-        <LanguageSettings v-if="activePage.id === 'settings'" />
+        <SettingsPage v-show="activePage.id === 'settings'"/>
         <section
-          v-else
-          :key="activePage.id"
-          class="page-placeholder"
-          aria-labelledby="page-title"
+            v-if="activePage.id !== 'settings'"
+            :key="activePage.id"
+            class="page-placeholder"
+            aria-labelledby="page-title"
         >
           <ElEmpty :image-size="56">
             <template #image>
               <span class="placeholder-icon" aria-hidden="true">
                 <ElIcon :size="24">
-                  <component :is="activePage.icon" />
+                  <component :is="activePage.icon"/>
                 </ElIcon>
               </span>
             </template>

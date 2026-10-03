@@ -7,6 +7,8 @@ import "element-plus/es/components/menu/style/css";
 import "element-plus/es/components/menu-item/style/css";
 import "element-plus/es/components/select/style/css";
 import "element-plus/es/components/option/style/css";
+import "element-plus/es/components/button/style/css";
+import "element-plus/es/components/input/style/css";
 import "./styles/theme.css";
 
 createApp(App).use(i18n).mount("#app");
