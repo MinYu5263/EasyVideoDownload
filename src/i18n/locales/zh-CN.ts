@@ -50,6 +50,12 @@ const zhCN = {
             tray: "最小化到系统托盘",
             exit: "直接退出",
         },
+        dataDirectory: {
+            title: "应用数据文件夹",
+            description: "查看保存的应用设置和工具配置。",
+            open: "打开文件夹",
+            openFailed: "无法打开应用数据文件夹，请稍后重试。",
+        },
         persistence: {
             loading: "正在读取设置…",
             saving: "正在保存…",

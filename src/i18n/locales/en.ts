@@ -55,6 +55,12 @@ const en = {
             tray: "Minimize to system tray",
             exit: "Exit the application",
         },
+        dataDirectory: {
+            title: "Application data folder",
+            description: "View saved application settings and tool configurations.",
+            open: "Open folder",
+            openFailed: "Could not open the application data folder. Try again later.",
+        },
         persistence: {
             loading: "Loading settings…",
             saving: "Saving…",

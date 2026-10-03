@@ -15,7 +15,7 @@ export interface RequiredToolConfig {
     source: RequiredToolSource;
     manualPath: string;
     programs: { name: string; path: string; version: string }[];
-    checkedAt: number;
+    checkedAt: string;
 }
 
 export interface RequiredToolState {

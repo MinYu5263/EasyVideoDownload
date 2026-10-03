@@ -1,6 +1,8 @@
 <script lang="ts" setup>
-import {computed} from "vue";
-import {ElOption, ElSelect, ElSwitch} from "element-plus";
+import {computed, ref} from "vue";
+import {ElButton, ElMessage, ElOption, ElSelect, ElSwitch} from "element-plus";
+import {FolderOpened} from "@element-plus/icons-vue";
+import {invoke} from "@tauri-apps/api/core";
 import {useI18n} from "vue-i18n";
 import {languageOptions} from "../i18n";
 import {useAppSettings} from "../composables/useAppSettings";
@@ -11,6 +13,19 @@ const locked = computed(() => !ready.value);
 const error = computed(() => loadError.value ?? saveError.value);
 const themeOptions = ["system", "light", "dark"] as const;
 const closeOptions = ["ask", "tray", "exit"] as const;
+const openingDataDirectory = ref(false);
+
+async function openDataDirectory() {
+  if (!desktop || openingDataDirectory.value) return;
+  openingDataDirectory.value = true;
+  try {
+    await invoke("open_app_data_directory");
+  } catch {
+    ElMessage.error(t("settings.dataDirectory.openFailed"));
+  } finally {
+    openingDataDirectory.value = false;
+  }
+}
 
 function changeLocale(value: unknown) {
   if (value === "zh-CN" || value === "en") void update({locale: value});
@@ -96,6 +111,18 @@ function changeCloseAction(value: unknown) {
       </ElSelect>
     </div>
 
+    <div aria-describedby="data-directory-description" aria-labelledby="data-directory-label" class="setting-row"
+         role="group">
+      <div class="setting-description">
+        <span id="data-directory-label" class="setting-label">{{ t("settings.dataDirectory.title") }}</span>
+        <p id="data-directory-description">{{ t("settings.dataDirectory.description") }}</p>
+      </div>
+      <ElButton :disabled="!desktop || openingDataDirectory" :icon="FolderOpened" :loading="openingDataDirectory"
+                @click="openDataDirectory">
+        {{ t("settings.dataDirectory.open") }}
+      </ElButton>
+    </div>
+
     <p v-if="!desktop" class="preview-notice">{{ t("settings.persistence.desktopOnly") }}</p>
     <div v-if="error" class="settings-error" role="alert">
       <p>{{ t(`settings.persistence.errors.${error.code}`) }}</p>
@@ -151,7 +178,8 @@ function changeCloseAction(value: unknown) {
   min-width: 0;
 }
 
-.setting-description label {
+.setting-description label,
+.setting-label {
   color: var(--app-text);
   font-size: 13px;
   font-weight: 500;
@@ -167,6 +195,11 @@ function changeCloseAction(value: unknown) {
 .setting-select {
   width: 180px;
   flex-shrink: 0;
+}
+
+.setting-row :deep(.el-button) {
+  flex-shrink: 0;
+  font-size: 12px;
 }
 
 .preferences-notice {

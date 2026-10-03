@@ -8,5 +8,5 @@
 - [ ] 关闭行为：按 `closeAction` 处理窗口关闭按钮，支持询问、隐藏到托盘与退出；提供托盘恢复及退出入口，处理下载进行中退出、托盘不可用及
   macOS 生命周期。
 
-数据库：`app_local_data_dir()/EasyVideoDownload/app.db`，由 Tauri 按系统解析应用本地数据目录。
+数据库：`local_data_dir()/EasyVideoDownload/app.db`，由 Tauri 按系统解析本地数据目录，不添加应用标识子目录。
 默认值：主题跟随系统、两种通知开启、关闭时询问。

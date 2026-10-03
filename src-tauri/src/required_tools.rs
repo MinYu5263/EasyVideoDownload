@@ -1,4 +1,5 @@
 use crate::database::{Storage, StorageError};
+use crate::datetime;
 use serde::{Deserialize, Serialize};
 mod process_tree;
 use std::{
@@ -6,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex as StdMutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tauri_plugin_dialog::DialogExt;
 use tokio::{
@@ -52,7 +53,8 @@ pub struct RequiredToolConfig {
     pub source: RequiredToolSource,
     pub manual_path: String,
     pub programs: Vec<Program>,
-    pub checked_at: u64,
+    #[serde(deserialize_with = "datetime::deserialize_legacy")]
+    pub checked_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,7 +255,7 @@ pub(crate) fn validate_settings(settings: &RequiredToolSettings) -> Result<(), R
             })
             && (config.source != RequiredToolSource::Manual
                 || Path::new(&config.manual_path).is_absolute())
-            && config.checked_at <= 8_640_000_000_000;
+            && datetime::is_valid(&config.checked_at);
         if !valid {
             return Err(error(
                 "loadFailed",
@@ -394,10 +396,7 @@ async fn detect(request: &RequiredToolRequest) -> Result<RequiredToolConfig, Req
             String::new()
         },
         programs,
-        checked_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
+        checked_at: datetime::now(),
     })
 }
 
@@ -538,7 +537,7 @@ mod tests {
                 path,
                 version: version.into(),
             }],
-            checked_at: 123,
+            checked_at: "1970-01-01 08:02:03".into(),
         }
     }
 
@@ -716,7 +715,7 @@ mod tests {
                 0 => candidate.programs.clear(),
                 1 => candidate.programs[0].name = "node".into(),
                 2 => candidate.programs[0].path = "relative.exe".into(),
-                _ => candidate.checked_at = u64::MAX,
+                _ => candidate.checked_at = "2026-02-30 00:00:00".into(),
             }
             let mut settings = RequiredToolSettings::default();
             settings.tools.insert(RequiredToolId::Ytdlp, candidate);

@@ -30,34 +30,37 @@
 
 核心技术已确认；下表中标注“建议”的配套技术供用户复核，并不表示已安装或完成验证。
 
-| 层次               | 技术                                                                          | 用途与状态                                                                                                   |
-|--------------------|-------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------|
-| 桌面框架           | Tauri 2                                                                       | 已确认；窗口、系统能力与标准打包                                                                             |
-| 后端语言           | Rust                                                                          | 已确认；工具检测、任务调度、进程与文件管理                                                                   |
-| 前端               | Vue 3 + TypeScript                                                            | 已确认；Composition API、单文件组件及类型约束                                                                |
-| 前端构建           | Vite                                                                          | 已确认；开发服务、生产构建与资源打包                                                                         |
-| 组件库             | Element Plus                                                                  | 已确认；按需引入基础组件，主题与布局适配定稿原型                                                             |
-| 样式与图标         | CSS、Vue scoped 样式、Element Plus 主题变量；@element-plus/icons-vue 按需使用 | 建议；保留原型视觉风格                                                                                       |
-| 前端状态           | Pinia                                                                         | 建议；页面共享设置、平台草稿与任务展示状态，真实任务状态由 Rust 管理                                         |
-| 多语言             | Vue I18n                                                                      | 建议；简体中文、繁体中文、English                                                                            |
-| 前后端通信         | Tauri invoke + IPC Channel                                                    | 建议；请求通过命令调用，任务进度与阶段通过通道推送                                                           |
-| 异步任务与进程     | Tokio、tokio::process                                                         | 建议；异步解析与下载、输出读取、超时；进程树取消还需平台适配                                                 |
-| 结构化数据         | serde + serde_json                                                            | 建议；解析 yt-dlp/FFprobe JSON，序列化应用数据与通信模型                                                     |
-| 本地设置与完成记录 | rusqlite + SQLite                                                             | 已接入设置持久化；数据库位于 app_local_data_dir()/EasyVideoDownload/app.db，完成记录的结构与保留策略后续确定 |
-| Cookie 与应用目录  | Tauri PathResolver + Rust std::fs / std::path                                 | 已确认保存方向；Netscape 文本按平台分开，文件权限在实现时处理                                                |
-| 系统选择器         | tauri-plugin-dialog                                                           | 建议；选择 Cookie 文件、工具程序与保存目录                                                                   |
-| 打开文件与位置     | tauri-plugin-opener                                                           | 建议；打开完成文件、显示其所在位置与访问官方说明链接                                                         |
-| 复制命令           | tauri-plugin-clipboard-manager                                                | 建议；用户主动复制时写入剪贴板                                                                               |
-| 日志               | tauri-plugin-log + Rust log                                                   | 建议；记录阶段与诊断信息，过滤凭据及敏感输出                                                                 |
-| 下载工具           | yt-dlp                                                                        | 已确认；通过可执行程序与参数列表调用，使用结构化元数据和自定义进度输出                                       |
-| 合并与检查         | FFmpeg + FFprobe                                                              | 已确认；合并音视频、检查最终文件规格                                                                         |
-| YouTube 解析依赖   | 支持的 Deno 或 Node.js + 匹配的 yt-dlp EJS                                    | 工具依赖；通过 PATH/手动配置使用，兼容要求按 yt-dlp 版本检测                                                 |
-| 开发与构建环境     | Node.js、pnpm、Rust 工具链/Cargo、Tauri CLI、各系统构建工具与 WebView         | 建议使用 pnpm；环境准备与版本锁定待开发阶段验证                                                              |
-| 自动化验证         | Vitest + Vue Test Utils、cargo test                                           | 建议；前端关键交互与状态测试、后端参数和数据处理测试，平台能力以真实样例验证                                 |
+| 层次               | 技术                                                                          | 用途与状态                                                                                               |
+|--------------------|-------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| 桌面框架           | Tauri 2                                                                       | 已确认；窗口、系统能力与标准打包                                                                         |
+| 后端语言           | Rust                                                                          | 已确认；工具检测、任务调度、进程与文件管理                                                               |
+| 前端               | Vue 3 + TypeScript                                                            | 已确认；Composition API、单文件组件及类型约束                                                            |
+| 前端构建           | Vite                                                                          | 已确认；开发服务、生产构建与资源打包                                                                     |
+| 组件库             | Element Plus                                                                  | 已确认；按需引入基础组件，主题与布局适配定稿原型                                                         |
+| 样式与图标         | CSS、Vue scoped 样式、Element Plus 主题变量；@element-plus/icons-vue 按需使用 | 建议；保留原型视觉风格                                                                                   |
+| 前端状态           | Pinia                                                                         | 建议；页面共享设置、平台草稿与任务展示状态，真实任务状态由 Rust 管理                                     |
+| 多语言             | Vue I18n                                                                      | 建议；简体中文、繁体中文、English                                                                        |
+| 前后端通信         | Tauri invoke + IPC Channel                                                    | 建议；请求通过命令调用，任务进度与阶段通过通道推送                                                       |
+| 异步任务与进程     | Tokio、tokio::process                                                         | 建议；异步解析与下载、输出读取、超时；进程树取消还需平台适配                                             |
+| 结构化数据         | serde + serde_json                                                            | 建议；解析 yt-dlp/FFprobe JSON，序列化应用数据与通信模型                                                 |
+| 本地设置与完成记录 | rusqlite + SQLite                                                             | 已接入设置持久化；数据库位于 local_data_dir()/EasyVideoDownload/app.db，完成记录的结构与保留策略后续确定 |
+| Cookie 与应用目录  | Tauri PathResolver + Rust std::fs / std::path                                 | 已确认保存方向；Netscape 文本按平台分开，文件权限在实现时处理                                            |
+| 系统选择器         | tauri-plugin-dialog                                                           | 建议；选择 Cookie 文件、工具程序与保存目录                                                               |
+| 打开文件与位置     | tauri-plugin-opener                                                           | 建议；打开完成文件、显示其所在位置与访问官方说明链接                                                     |
+| 复制命令           | tauri-plugin-clipboard-manager                                                | 建议；用户主动复制时写入剪贴板                                                                           |
+| 日志               | tauri-plugin-log + Rust log                                                   | 建议；记录阶段与诊断信息，过滤凭据及敏感输出                                                             |
+| 下载工具           | yt-dlp                                                                        | 已确认；通过可执行程序与参数列表调用，使用结构化元数据和自定义进度输出                                   |
+| 合并与检查         | FFmpeg + FFprobe                                                              | 已确认；合并音视频、检查最终文件规格                                                                     |
+| YouTube 解析依赖   | 支持的 Deno 或 Node.js + 匹配的 yt-dlp EJS                                    | 工具依赖；通过 PATH/手动配置使用，兼容要求按 yt-dlp 版本检测                                             |
+| 开发与构建环境     | Node.js、pnpm、Rust 工具链/Cargo、Tauri CLI、各系统构建工具与 WebView         | 建议使用 pnpm；环境准备与版本锁定待开发阶段验证                                                          |
+| 自动化验证         | Vitest + Vue Test Utils、cargo test                                           | 建议；前端关键交互与状态测试、后端参数和数据处理测试，平台能力以真实样例验证                             |
 
 参考：[Tauri 前端配置](https://v2.tauri.app/start/frontend/)、[Element Plus 按需引入](https://element-plus.org/en-US/guide/quickstart.html)、[Pinia](https://pinia.vuejs.org/introduction.html)、[Vue I18n](https://vue-i18n.intlify.dev/guide/introduction)、[Tauri Channel](https://v2.tauri.app/develop/calling-frontend/#channels)、[Tokio 进程接口](https://docs.rs/tokio/latest/tokio/process/index.html)、[Store](https://v2.tauri.app/plugin/store/)、[Dialog](https://v2.tauri.app/plugin/dialog/)、[Opener](https://v2.tauri.app/plugin/opener/)、[Clipboard](https://v2.tauri.app/plugin/clipboard/)、[Logging](https://v2.tauri.app/plugin/logging/)、[Vitest](https://vitest.dev/guide/)、[Vue Test Utils](https://test-utils.vuejs.org/guide/)。
 
 ### 当前待办
+
+本地持久化已升级为版本 3：应用设置使用键值记录，工具与程序信息合并保存，业务时间统一使用北京时间（固定 UTC+8）的日期时间文本，格式为
+`YYYY-MM-DD HH:mm:ss`，不带时区后缀。结构与迁移约定见 [本地数据库](database.md)。
 
 - [ ] 同步 HTML 原型：工具来源仅保留 PATH 与手动选择，移除工具下载及安装演示；平台表述改为跨平台。
 - [ ] 增加查看/复制下载命令入口：从同一份实际程序路径与参数列表生成预览和复制文本，按 PowerShell 与 macOS/Linux shell 分别正确引用；Cookie 仅显示文件路径，不嵌入内容。复制后可在终端复现选项，执行时仍由 Rust 直接传参启动程序。

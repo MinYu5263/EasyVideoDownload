@@ -1,13 +1,15 @@
+use crate::datetime;
 use crate::required_tools::{
     self, Program, RequiredToolConfig, RequiredToolId, RequiredToolSettings, RequiredToolSource,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
+use tauri_plugin_opener::OpenerExt;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageError {
@@ -40,54 +42,83 @@ pub struct Database {
 
 impl Database {
     pub fn open(path: &Path, legacy: &Path) -> Result<Self, StorageError> {
-        let initialize = || -> Result<Connection, StorageError> {
-            let parent = path
-                .parent()
-                .ok_or_else(|| StorageError::new("loadFailed", "missing database directory"))?;
-            std::fs::create_dir_all(parent).map_err(|e| StorageError::new("loadFailed", e))?;
-            let mut connection =
-                Connection::open(path).map_err(|e| StorageError::new("loadFailed", e))?;
-            connection
-                .busy_timeout(Duration::from_secs(5))
-                .map_err(|e| StorageError::new("loadFailed", e))?;
-            connection
-                .pragma_update(None, "foreign_keys", true)
-                .map_err(|e| StorageError::new("loadFailed", e))?;
-            // Inspect and migrate under the same lock so simultaneous launches cannot both import JSON.
-            let transaction = connection
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| StorageError::new("loadFailed", e))?;
-            let version: i64 = transaction
-                .pragma_query_value(None, "user_version", |row| row.get(0))
-                .map_err(|e| StorageError::new("loadFailed", e))?;
-            match version {
-                0 => {
-                    let old = required_tools::load_settings(legacy)
-                        .map_err(|e| StorageError::new("loadFailed", e.detail))?;
+        let initialize =
+            || -> Result<Connection, StorageError> {
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| StorageError::new("loadFailed", "missing database directory"))?;
+                std::fs::create_dir_all(parent).map_err(|e| StorageError::new("loadFailed", e))?;
+                let mut connection =
+                    Connection::open(path).map_err(|e| StorageError::new("loadFailed", e))?;
+                connection
+                    .busy_timeout(Duration::from_secs(5))
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                connection
+                    .pragma_update(None, "foreign_keys", true)
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                // Inspect and migrate under the same lock so simultaneous launches cannot both import JSON.
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                let version: i64 = transaction
+                    .pragma_query_value(None, "user_version", |row| row.get(0))
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                let mut imported_tools = None;
+                match version {
+                    0 => {
+                        imported_tools = Some(
+                            required_tools::load_settings(legacy)
+                                .map_err(|e| StorageError::new("loadFailed", e.detail))?,
+                        );
+                        transaction
+                            .execute_batch(include_str!("../migrations/001_settings.sql"))
+                            .map_err(|e| StorageError::new("loadFailed", e))?;
+                        transaction
+                            .execute_batch(include_str!("../migrations/002_settings_key_value.sql"))
+                            .map_err(|e| StorageError::new("loadFailed", e))?;
+                    }
+                    1 => {
+                        // Reject incomplete legacy groups before the join can discard them.
+                        read_tools(&transaction, true)?;
+                        let orphaned: bool = transaction.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM required_tool_programs p WHERE NOT EXISTS
+                         (SELECT 1 FROM required_tools t WHERE t.tool_id = p.tool_id))",
+                        [], |row| row.get(0),
+                    ).map_err(|e| StorageError::new("loadFailed", e))?;
+                        if orphaned {
+                            return Err(StorageError::new("loadFailed", "orphaned legacy program"));
+                        }
+                        transaction
+                            .execute_batch(include_str!("../migrations/002_settings_key_value.sql"))
+                            .map_err(|e| StorageError::new("loadFailed", e))?;
+                    }
+                    2 | 3 => {}
+                    _ => {
+                        return Err(StorageError::new(
+                            "loadFailed",
+                            format!("unsupported database schema version: {version}"),
+                        ))
+                    }
+                }
+                if version < 3 {
+                    migrate_beijing_times(&transaction)?;
                     transaction
-                        .execute_batch(include_str!("../migrations/001_settings.sql"))
+                        .pragma_update(None, "user_version", 3)
                         .map_err(|e| StorageError::new("loadFailed", e))?;
+                }
+                // Legacy JSON is normalized to Beijing time during deserialization.
+                // Import after schema migration so it cannot receive the offset twice.
+                if let Some(old) = imported_tools {
                     for (id, config) in old.tools {
                         write_tool(&transaction, id, &config)
                             .map_err(|e| StorageError::new("loadFailed", e))?;
                     }
-                    transaction
-                        .pragma_update(None, "user_version", 1)
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
                 }
-                1 => {}
-                _ => {
-                    return Err(StorageError::new(
-                        "loadFailed",
-                        format!("unsupported database schema version: {version}"),
-                    ))
-                }
-            }
-            transaction
-                .commit()
-                .map_err(|e| StorageError::new("loadFailed", e))?;
-            Ok(connection)
-        };
+                transaction
+                    .commit()
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                Ok(connection)
+            };
         Ok(Self {
             connection: Mutex::new(initialize()?),
         })
@@ -110,22 +141,15 @@ impl Database {
         let transaction = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| StorageError::new("loadFailed", e))?;
-        let existing = transaction.query_row(
-            "SELECT locale, theme, notify_on_completion, notify_on_failure, close_action FROM app_settings WHERE id = 1",
-            [], read_app_settings,
-        ).optional().map_err(|e| StorageError::new("loadFailed", e))?;
-        let settings = existing.unwrap_or_else(|| AppSettings {
-            locale: initial_locale.into(),
-            theme: "system".into(),
-            notify_on_completion: true,
-            notify_on_failure: true,
-            close_action: "ask".into(),
-        });
-        validate_preferences(&settings)?;
-        transaction.execute(
-            "INSERT INTO app_settings (id, locale, updated_at) VALUES (1, ?1, ?2) ON CONFLICT (id) DO NOTHING",
-            params![initial_locale, now()],
-        ).map_err(|e| StorageError::new("loadFailed", e))?;
+        let settings = read_app_settings(&transaction, initial_locale)?;
+        let date = datetime::now();
+        for (key, value) in setting_values(&settings) {
+            transaction.execute(
+                "INSERT INTO app_settings (setting_key, value_json, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (setting_key) DO NOTHING",
+                params![key, value.to_string(), date],
+            ).map_err(|e| StorageError::new("loadFailed", e))?;
+        }
         transaction
             .commit()
             .map_err(|e| StorageError::new("loadFailed", e))?;
@@ -134,75 +158,28 @@ impl Database {
 
     pub fn save_app_settings(&self, settings: &AppSettings) -> Result<(), StorageError> {
         validate_preferences(settings)?;
-        let connection = self.connection("saveFailed")?;
-        connection.execute(
-            "INSERT INTO app_settings (id, locale, theme, notify_on_completion, notify_on_failure, close_action, updated_at)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT (id) DO UPDATE SET locale=excluded.locale, theme=excluded.theme,
-             notify_on_completion=excluded.notify_on_completion, notify_on_failure=excluded.notify_on_failure,
-             close_action=excluded.close_action, updated_at=excluded.updated_at",
-            params![settings.locale, settings.theme, settings.notify_on_completion, settings.notify_on_failure, settings.close_action, now()],
-        ).map_err(|e| StorageError::new("saveFailed", e))?;
+        let mut connection = self.connection("saveFailed")?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| StorageError::new("saveFailed", e))?;
+        let date = datetime::now();
+        for (key, value) in setting_values(settings) {
+            transaction.execute(
+                "INSERT INTO app_settings (setting_key, value_json, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (setting_key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at
+                 WHERE app_settings.value_json <> excluded.value_json",
+                params![key, value.to_string(), date],
+            ).map_err(|e| StorageError::new("saveFailed", e))?;
+        }
+        transaction
+            .commit()
+            .map_err(|e| StorageError::new("saveFailed", e))?;
         Ok(())
     }
 
     pub fn tools(&self) -> Result<RequiredToolSettings, StorageError> {
         let connection = self.connection("loadFailed")?;
-        let mut settings = RequiredToolSettings::default();
-        let mut statement = connection
-            .prepare("SELECT tool_id, source, manual_path, checked_at FROM required_tools")
-            .map_err(|e| StorageError::new("loadFailed", e))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, u64>(3)?,
-                ))
-            })
-            .map_err(|e| StorageError::new("loadFailed", e))?;
-        for row in rows {
-            let (id, source, manual_path, checked_at) =
-                row.map_err(|e| StorageError::new("loadFailed", e))?;
-            let tool_id = match id.as_str() {
-                "ytdlp" => RequiredToolId::Ytdlp,
-                "ffmpeg" => RequiredToolId::Ffmpeg,
-                "deno" => RequiredToolId::Deno,
-                _ => return Err(StorageError::new("loadFailed", "invalid tool id")),
-            };
-            let source = match source.as_str() {
-                "path" => RequiredToolSource::Path,
-                "manual" => RequiredToolSource::Manual,
-                _ => return Err(StorageError::new("loadFailed", "invalid tool source")),
-            };
-            let mut programs = connection.prepare(
-                "SELECT program_name, executable_path, version FROM required_tool_programs WHERE tool_id = ?1 ORDER BY program_name"
-            ).map_err(|e| StorageError::new("loadFailed", e))?;
-            let programs = programs
-                .query_map([id], |row| {
-                    Ok(Program {
-                        name: row.get(0)?,
-                        path: row.get::<_, String>(1)?.into(),
-                        version: row.get(2)?,
-                    })
-                })
-                .map_err(|e| StorageError::new("loadFailed", e))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| StorageError::new("loadFailed", e))?;
-            settings.tools.insert(
-                tool_id,
-                RequiredToolConfig {
-                    source,
-                    manual_path: manual_path.unwrap_or_default(),
-                    programs,
-                    checked_at,
-                },
-            );
-        }
-        required_tools::validate_settings(&settings)
-            .map_err(|e| StorageError::new("loadFailed", e.detail))?;
-        Ok(settings)
+        read_tools(&connection, false)
     }
 
     pub fn save_tool(
@@ -227,11 +204,27 @@ impl Database {
     }
 }
 
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+fn migrate_beijing_times(connection: &Connection) -> Result<(), StorageError> {
+    {
+        let mut statement = connection
+            .prepare("SELECT updated_at FROM app_settings UNION ALL SELECT checked_at FROM required_tools")
+            .map_err(|e| StorageError::new("loadFailed", e))?;
+        let dates = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| StorageError::new("loadFailed", e))?;
+        for date in dates {
+            let date = date.map_err(|e| StorageError::new("loadFailed", e))?;
+            if datetime::from_legacy_utc(&date).is_none() {
+                return Err(StorageError::new(
+                    "loadFailed",
+                    format!("invalid legacy UTC time: {date}"),
+                ));
+            }
+        }
+    }
+    connection
+        .execute_batch(include_str!("../migrations/003_beijing_datetime.sql"))
+        .map_err(|e| StorageError::new("loadFailed", e))
 }
 
 fn validate_preferences(settings: &AppSettings) -> Result<(), StorageError> {
@@ -248,14 +241,132 @@ fn validate_preferences(settings: &AppSettings) -> Result<(), StorageError> {
     }
 }
 
-fn read_app_settings(row: &rusqlite::Row<'_>) -> rusqlite::Result<AppSettings> {
-    Ok(AppSettings {
-        locale: row.get(0)?,
-        theme: row.get(1)?,
-        notify_on_completion: row.get(2)?,
-        notify_on_failure: row.get(3)?,
-        close_action: row.get(4)?,
-    })
+fn setting_values(settings: &AppSettings) -> [(&'static str, serde_json::Value); 5] {
+    [
+        ("locale", serde_json::json!(settings.locale)),
+        ("theme", serde_json::json!(settings.theme)),
+        (
+            "notify_on_completion",
+            serde_json::json!(settings.notify_on_completion),
+        ),
+        (
+            "notify_on_failure",
+            serde_json::json!(settings.notify_on_failure),
+        ),
+        ("close_action", serde_json::json!(settings.close_action)),
+    ]
+}
+
+fn read_app_settings(
+    connection: &Connection,
+    initial_locale: &str,
+) -> Result<AppSettings, StorageError> {
+    let mut settings = AppSettings {
+        locale: initial_locale.into(),
+        theme: "system".into(),
+        notify_on_completion: true,
+        notify_on_failure: true,
+        close_action: "ask".into(),
+    };
+    let mut statement = connection
+        .prepare("SELECT setting_key, value_json FROM app_settings")
+        .map_err(|e| StorageError::new("loadFailed", e))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| StorageError::new("loadFailed", e))?;
+    for row in rows {
+        let (key, value) = row.map_err(|e| StorageError::new("loadFailed", e))?;
+        let invalid =
+            |error| StorageError::new("loadFailed", format!("invalid setting {key}: {error}"));
+        match key.as_str() {
+            "locale" => settings.locale = serde_json::from_str(&value).map_err(invalid)?,
+            "theme" => settings.theme = serde_json::from_str(&value).map_err(invalid)?,
+            "notify_on_completion" => {
+                settings.notify_on_completion = serde_json::from_str(&value).map_err(invalid)?
+            }
+            "notify_on_failure" => {
+                settings.notify_on_failure = serde_json::from_str(&value).map_err(invalid)?
+            }
+            "close_action" => {
+                settings.close_action = serde_json::from_str(&value).map_err(invalid)?
+            }
+            _ => {} // Future settings survive reads and saves by this application version.
+        }
+    }
+    validate_preferences(&settings)?;
+    Ok(settings)
+}
+
+fn read_tools(connection: &Connection, legacy: bool) -> Result<RequiredToolSettings, StorageError> {
+    let query = if legacy {
+        "SELECT t.tool_id, t.source, t.manual_path,
+                strftime('%Y-%m-%d %H:%M:%S', t.checked_at, 'unixepoch', '+8 hours'),
+                p.program_name, p.executable_path, p.version
+         FROM required_tools t LEFT JOIN required_tool_programs p ON p.tool_id = t.tool_id
+         ORDER BY t.tool_id, p.program_name"
+    } else {
+        "SELECT tool_id, source, manual_path, checked_at, program_name, executable_path, version
+         FROM required_tools ORDER BY tool_id, program_name"
+    };
+    let mut settings = RequiredToolSettings::default();
+    let mut statement = connection
+        .prepare(query)
+        .map_err(|e| StorageError::new("loadFailed", e))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                Program {
+                    name: row.get(4)?,
+                    path: row.get::<_, String>(5)?.into(),
+                    version: row.get(6)?,
+                },
+            ))
+        })
+        .map_err(|e| StorageError::new("loadFailed", e))?;
+    for row in rows {
+        let (id, source, manual_path, checked_at, program) =
+            row.map_err(|e| StorageError::new("loadFailed", e))?;
+        let id = match id.as_str() {
+            "ytdlp" => RequiredToolId::Ytdlp,
+            "ffmpeg" => RequiredToolId::Ffmpeg,
+            "deno" => RequiredToolId::Deno,
+            _ => return Err(StorageError::new("loadFailed", "invalid tool id")),
+        };
+        let source = match source.as_str() {
+            "path" => RequiredToolSource::Path,
+            "manual" => RequiredToolSource::Manual,
+            _ => return Err(StorageError::new("loadFailed", "invalid tool source")),
+        };
+        let manual_path = manual_path.unwrap_or_default();
+        let config = settings
+            .tools
+            .entry(id)
+            .or_insert_with(|| RequiredToolConfig {
+                source,
+                manual_path: manual_path.clone(),
+                checked_at: checked_at.clone(),
+                programs: Vec::new(),
+            });
+        if config.source != source
+            || config.manual_path != manual_path
+            || config.checked_at != checked_at
+        {
+            return Err(StorageError::new(
+                "loadFailed",
+                format!("inconsistent metadata for {id:?}"),
+            ));
+        }
+        config.programs.push(program);
+    }
+    required_tools::validate_settings(&settings)
+        .map_err(|e| StorageError::new("loadFailed", e.detail))?;
+    Ok(settings)
 }
 
 fn write_tool(
@@ -274,19 +385,12 @@ fn write_tool(
     };
     let manual_path =
         (config.source == RequiredToolSource::Manual).then_some(config.manual_path.as_str());
-    transaction.execute(
-        "INSERT INTO required_tools (tool_id, source, manual_path, checked_at) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (tool_id) DO UPDATE SET source=excluded.source, manual_path=excluded.manual_path, checked_at=excluded.checked_at",
-        params![id, source, manual_path, config.checked_at],
-    )?;
-    transaction.execute(
-        "DELETE FROM required_tool_programs WHERE tool_id = ?1",
-        [id],
-    )?;
+    transaction.execute("DELETE FROM required_tools WHERE tool_id = ?1", [id])?;
     for program in &config.programs {
         transaction.execute(
-            "INSERT INTO required_tool_programs (tool_id, program_name, executable_path, version) VALUES (?1, ?2, ?3, ?4)",
-            params![id, program.name, program.path.to_string_lossy(), program.version],
+            "INSERT INTO required_tools (tool_id, program_name, source, manual_path, executable_path, version, checked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, program.name, source, manual_path, program.path.to_string_lossy(), program.version, config.checked_at],
         )?;
     }
     Ok(())
@@ -295,18 +399,86 @@ fn write_tool(
 #[derive(Clone)]
 pub struct Storage {
     database: Result<Arc<Database>, StorageError>,
+    database_path: PathBuf,
 }
 
 impl Storage {
     pub fn new(path: &Path, legacy: &Path) -> Self {
         Self {
             database: Database::open(path, legacy).map(Arc::new),
+            database_path: path.to_path_buf(),
         }
     }
 
     pub fn database(&self) -> Result<Arc<Database>, StorageError> {
         self.database.clone()
     }
+
+    pub fn new_with_previous(path: &Path, legacy: &Path, previous: &Path) -> Self {
+        match import_previous_database(path, previous) {
+            Ok(()) => Self::new(path, legacy),
+            Err(error) => Self {
+                database: Err(error),
+                database_path: path.to_path_buf(),
+            },
+        }
+    }
+
+    fn prepare_data_directory(&self) -> Result<PathBuf, StorageError> {
+        let directory = self
+            .database_path
+            .parent()
+            .ok_or_else(|| StorageError::new("openFailed", "missing application data directory"))?;
+        std::fs::create_dir_all(directory).map_err(|e| StorageError::new("openFailed", e))?;
+        Ok(directory.to_path_buf())
+    }
+}
+
+fn import_previous_database(path: &Path, previous: &Path) -> Result<(), StorageError> {
+    let failed = |error| StorageError::new("loadFailed", error);
+    if path.try_exists().map_err(failed)? || !previous.try_exists().map_err(failed)? {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| StorageError::new("loadFailed", "missing database directory"))?;
+    std::fs::create_dir_all(parent).map_err(failed)?;
+    let snapshot = tempfile::Builder::new()
+        .prefix(".database-migration-")
+        .tempfile_in(parent)
+        .map_err(failed)?
+        .into_temp_path();
+    let source = Connection::open_with_flags(previous, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| StorageError::new("loadFailed", e))?;
+    source
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|e| StorageError::new("loadFailed", e))?;
+    // SQLite backup includes committed WAL pages; copying only app.db could lose them.
+    source
+        .backup(rusqlite::MAIN_DB, &snapshot, None)
+        .map_err(|e| StorageError::new("loadFailed", e))?;
+    match snapshot.persist_noclobber(path) {
+        Ok(()) => Ok(()),
+        // Another launch may have initialized the destination while the snapshot was made.
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(StorageError::new("loadFailed", error.error)),
+    }
+}
+
+#[tauri::command]
+pub async fn open_app_data_directory(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Storage>,
+) -> Result<(), StorageError> {
+    let storage = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let directory = storage.prepare_data_directory()?;
+        app.opener()
+            .open_path(directory.to_string_lossy().into_owned(), None::<&str>)
+            .map_err(|e| StorageError::new("openFailed", e))
+    })
+    .await
+    .map_err(|e| StorageError::new("openFailed", e))?
 }
 
 #[tauri::command]
