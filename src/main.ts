@@ -17,6 +17,8 @@ import "element-plus/es/components/dialog/style/css";
 import "element-plus/es/components/tooltip/style/css";
 import "element-plus/es/components/skeleton/style/css";
 import "element-plus/es/components/skeleton-item/style/css";
+import "element-plus/es/components/progress/style/css";
+import "element-plus/es/components/scrollbar/style/css";
 import "./styles/theme.css";
 
 async function bootstrap() {

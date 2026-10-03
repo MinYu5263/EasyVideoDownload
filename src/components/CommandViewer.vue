@@ -50,7 +50,8 @@ async function copy() {
         <ElButton :aria-expanded="open" :aria-label="t('download.command.viewNamed', {title})" :disabled="disabled"
                   class="command-trigger" native-type="button"
                   @click="viewer.show(platform, input, downloadOptions)">
-          <svg aria-hidden="true" fill="none" height="18" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"
+          <svg aria-hidden="true" fill="none" height="18" stroke="currentColor" stroke-linecap="round"
+               stroke-linejoin="round"
                stroke-width="1.7" viewBox="0 0 24 24" width="18">
             <rect height="16" rx="3" width="18" x="3" y="4"/>
             <path d="m7 8 3 3-3 3m6 0h4"/>

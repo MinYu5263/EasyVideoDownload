@@ -383,6 +383,30 @@ fn download_tools() -> RequiredToolSettings {
 }
 
 #[test]
+fn public_download_preview_does_not_read_or_pass_cookies() {
+    let directory = tempfile::tempdir().unwrap();
+    eprintln!(
+        "temporary public download preview directory: {}",
+        directory.path().display()
+    );
+    let store = CookieStore::new(directory.path());
+    std::fs::create_dir_all(store.path(CookiePlatform::Youtube)).unwrap();
+    let options: DownloadCommandOptions = serde_json::from_value(json!({
+        "directory": directory.path(), "formatId": "399", "cookieFallback": true
+    }))
+    .unwrap();
+    let preview = download_command_preview(
+        &download_tools(),
+        &store,
+        CookiePlatform::Youtube,
+        "https://youtu.be/abc",
+        &options,
+    )
+    .unwrap();
+    assert!(!preview.text.contains("--cookies"));
+}
+
+#[test]
 fn download_preview_uses_the_selected_native_format_without_conversion_or_writing_files() {
     let directory = tempfile::tempdir().unwrap();
     println!(
@@ -418,6 +442,12 @@ fn download_preview_uses_the_selected_native_format_without_conversion_or_writin
     assert!(!args
         .iter()
         .any(|arg| arg == "--simulate" || arg == "--dump-single-json"));
+    assert!(args.iter().any(|arg| arg == "--progress"));
+    assert!(args.windows(2).any(|pair| pair
+        == [
+            "--print",
+            "after_move:__EVD_FILE__%(.{filepath,__real_download})j"
+        ]));
     let store = CookieStore::new(directory.path());
     store
         .save(CookiePlatform::Youtube, "private-cookie-value")
@@ -437,6 +467,52 @@ fn download_preview_uses_the_selected_native_format_without_conversion_or_writin
         store.load(CookiePlatform::Youtube).unwrap(),
         "private-cookie-value"
     );
+}
+
+#[test]
+fn download_command_preserves_mp4_without_overriding_automatic_audio_selection() {
+    let directory = tempfile::tempdir().unwrap();
+    eprintln!("container test directory: {}", directory.path().display());
+    let settings = download_tools();
+    for (container, selector) in [(
+        "mp4",
+        "bestvideo[format_id=\"616\"]+bestaudio/best*[format_id=\"616\"]",
+    )] {
+        let options: DownloadCommandOptions = serde_json::from_value(json!({
+            "directory": directory.path(), "formatId": "616", "container": container
+        }))
+        .unwrap();
+        let command = download_command(&settings, "https://youtu.be/abc", None, &options).unwrap();
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--merge-output-format", container]),
+            "{container}"
+        );
+        assert!(
+            args.windows(2).any(|pair| pair == ["--format", selector]),
+            "{container}"
+        );
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--recode-video" || arg == "--remux-video"));
+    }
+    for container in ["webm", "mp4/mkv"] {
+        let invalid: DownloadCommandOptions = serde_json::from_value(json!({
+            "directory": directory.path(), "formatId": "616", "container": container
+        }))
+        .unwrap();
+        assert_eq!(
+            download_command(&settings, "https://youtu.be/abc", None, &invalid)
+                .unwrap_err()
+                .code,
+            "invalidDownloadOptions"
+        );
+    }
 }
 
 #[test]

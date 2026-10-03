@@ -4,6 +4,8 @@ import {validateVideoLink, type VideoPlatform} from "./videoPlatforms.ts";
 export interface DownloadCommandOptions {
     directory: string;
     formatId: string;
+    container?: "mp4";
+    cookieFallback?: boolean;
 }
 
 interface VideoCommand {

@@ -69,8 +69,11 @@ pub(super) fn parsing_command(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadCommandOptions {
-    directory: String,
-    format_id: String,
+    pub(super) directory: String,
+    pub(super) format_id: String,
+    pub(super) container: Option<String>,
+    #[serde(default)]
+    pub(super) cookie_fallback: bool,
 }
 
 pub(super) fn download_command(
@@ -93,10 +96,39 @@ pub(super) fn download_command(
     {
         return Err(error("invalidDownloadOptions", "Invalid native format ID"));
     }
+    if options
+        .container
+        .as_deref()
+        .is_some_and(|container| container != "mp4")
+    {
+        return Err(error(
+            "invalidDownloadOptions",
+            "Unsupported output container",
+        ));
+    }
     let mut command = configured_command(
         settings,
-        cookie,
-        &["--no-simulate", "--newline", "--no-overwrites"],
+        if options.cookie_fallback {
+            None
+        } else {
+            cookie
+        },
+        &[
+            "--no-simulate",
+            "--newline",
+            "--no-overwrites",
+            "--progress",
+            "--progress-delta",
+            "0.3",
+            "--progress-template",
+            "download:__EVD_PROGRESS__{\"formatId\":%(info.format_id)j,\"progress\":%(progress.{status,downloaded_bytes,total_bytes,total_bytes_estimate,speed,eta})j}",
+            "--progress-template",
+            "postprocess:__EVD_PROCESSING__%(progress.{status,postprocessor})j",
+            "--print",
+            "before_dl:__EVD_PLAN__{\"formats\":%(requested_formats.:.{format_id,filesize,filesize_approx}|[])j,\"formatId\":%(format_id)j,\"size\":%(filesize,filesize_approx|0)j}",
+            "--print",
+            "after_move:__EVD_FILE__%(.{filepath,__real_download})j",
+        ],
     )?;
     let ffmpeg = settings
         .tools
@@ -111,14 +143,21 @@ pub(super) fn download_command(
     // Video-only streams use separate audio when present. The second branch also
     // handles combined streams and genuinely silent videos without forcing audio.
     let filters = format!("[format_id=\"{}\"]", options.format_id);
+    let format = format!("bestvideo{filters}+bestaudio/best*{filters}");
+    if let Some(container) = &options.container {
+        // Keep the selected video's container when audio is merged. This changes
+        // muxing only; the selected stream and its codec are not re-encoded.
+        command.args(["--merge-output-format", container]);
+    }
     command
         .arg("--ffmpeg-location")
         .arg(&ffmpeg.path)
         .arg("--format")
-        .arg(format!("bestvideo{filters}+bestaudio/best*{filters}"))
+        .arg(format)
         .arg("--paths")
         .arg(&options.directory)
-        .args(["--output", "%(title)s [%(id)s].%(ext)s"]);
+        // Different quality/codec choices must not reuse another format's file.
+        .args(["--output", "%(title)s [%(id)s] [%(format_id)s].%(ext)s"]);
     command.arg("--").arg(url);
     Ok(command)
 }
@@ -180,10 +219,11 @@ pub(super) fn download_command_preview(
     options: &DownloadCommandOptions,
 ) -> Result<VideoCommand, VideoError> {
     let url = normalize_link(input, platform)?;
-    let has_cookie = !store
-        .load(platform)
-        .map_err(|e| error("cookieReadFailed", e.detail))?
-        .is_empty();
+    let has_cookie = !options.cookie_fallback
+        && !store
+            .load(platform)
+            .map_err(|e| error("cookieReadFailed", e.detail))?
+            .is_empty();
     let path = store.path(platform);
     let command = download_command(
         settings,

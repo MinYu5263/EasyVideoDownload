@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {computed, ref} from "vue";
-import {ElConfigProvider, ElEmpty, ElIcon} from "element-plus";
+import {ElConfigProvider, ElEmpty, ElIcon, ElScrollbar} from "element-plus";
 import {useI18n} from "vue-i18n";
 import AppSidebar from "./components/AppSidebar.vue";
 import DownloadPage from "./components/DownloadPage.vue";
@@ -31,26 +31,36 @@ const activePage = computed(
 
         <DownloadPage v-show="activePage.id === 'download'" :active="activePage.id === 'download'"/>
         <SettingsPage v-show="activePage.id === 'settings'"/>
-        <section
-            v-if="activePage.id === 'history'"
-            :key="activePage.id"
-            class="page-placeholder"
-            aria-labelledby="page-title"
+        <ElScrollbar
+            v-show="activePage.id === 'history'"
+            :aria-label="t(activePage.labelKey)"
+            :tabindex="0"
+            class="page-scrollbar"
+            height="100%"
+            role="region"
+            view-class="page-content"
         >
-          <ElEmpty :image-size="56">
-            <template #image>
-              <span class="placeholder-icon" aria-hidden="true">
-                <ElIcon :size="24">
-                  <component :is="activePage.icon"/>
-                </ElIcon>
-              </span>
-            </template>
-            <template #description>
-              <h2>{{ t(activePage.emptyTitleKey) }}</h2>
-              <p>{{ t(activePage.emptyDescriptionKey) }}</p>
-            </template>
-          </ElEmpty>
-        </section>
+          <section
+              v-if="activePage.id === 'history'"
+              :key="activePage.id"
+              aria-labelledby="page-title"
+              class="page-placeholder"
+          >
+            <ElEmpty :image-size="56">
+              <template #image>
+                <span aria-hidden="true" class="placeholder-icon">
+                  <ElIcon :size="24">
+                    <component :is="activePage.icon"/>
+                  </ElIcon>
+                </span>
+              </template>
+              <template #description>
+                <h2>{{ t(activePage.emptyTitleKey) }}</h2>
+                <p>{{ t(activePage.emptyDescriptionKey) }}</p>
+              </template>
+            </ElEmpty>
+          </section>
+        </ElScrollbar>
       </main>
     </div>
   </ElConfigProvider>
@@ -81,9 +91,15 @@ const activePage = computed(
 }
 
 .app-main {
+  --app-page-padding-x: 32px;
+  --app-page-padding-bottom: 26px;
+
+  display: flex;
+  flex-direction: column;
   min-width: 0;
-  overflow-y: auto;
-  padding: 30px 32px 26px;
+  min-height: 0;
+  overflow: hidden;
+  padding-top: 30px;
 }
 
 .app-main:focus {
@@ -91,7 +107,17 @@ const activePage = computed(
 }
 
 .page-heading {
-  margin-bottom: 24px;
+  flex-shrink: 0;
+  margin: 0 var(--app-page-padding-x) 24px;
+}
+
+.page-scrollbar {
+  flex: 1;
+  min-height: 0;
+}
+
+.page-scrollbar :deep(.page-content) {
+  padding: 0 var(--app-page-padding-x) var(--app-page-padding-bottom);
 }
 
 .page-heading h1 {
@@ -143,7 +169,10 @@ const activePage = computed(
 
 @media (max-width: 1000px) {
   .app-main {
-    padding: 27px 24px 24px;
+    --app-page-padding-x: 24px;
+    --app-page-padding-bottom: 24px;
+
+    padding-top: 27px;
   }
 }
 </style>

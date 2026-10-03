@@ -70,6 +70,33 @@ textarea {
   font: inherit;
 }
 
+/* Match the native textarea scrollbar styling used by the Element Plus docs. */
+.el-textarea__inner::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.el-textarea__inner::-webkit-scrollbar-track {
+  margin: 4px;
+  border-radius: 10px;
+  background-color: transparent;
+}
+
+.el-textarea__inner::-webkit-scrollbar-thumb {
+  border-radius: 10px;
+  background-color: rgba(0, 0, 0, 0.2);
+  transition: background-color 0.2s ease-in-out;
+}
+
+.el-textarea__inner::-webkit-scrollbar-thumb:hover {
+  cursor: pointer;
+  background-color: rgba(0, 0, 0, 0.3);
+}
+
+.el-textarea__inner::-webkit-scrollbar-corner {
+  background-color: transparent;
+}
+
 @media (max-width: 1000px) {
   :root {
     --app-sidebar-width: 216px;

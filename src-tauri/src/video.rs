@@ -3,6 +3,7 @@ use crate::cookies::{CookiePlatform, CookieStore};
 use crate::required_tools::RequiredToolId;
 use crate::required_tools::{process_tree, RequiredToolManager, RequiredToolSettings};
 mod commands;
+pub mod download;
 #[cfg(test)]
 use commands::{command_preview, download_command, download_command_preview, render_command};
 use commands::{parsing_command, DownloadCommandOptions, VideoCommand};

@@ -1,13 +1,13 @@
 <script lang="ts" setup>
 import {onUnmounted, watch} from "vue";
 import {ElButton, ElInput, ElMessage} from "element-plus";
-import {Close} from "@element-plus/icons-vue";
+import {Close, CloseBold} from "@element-plus/icons-vue";
 import {useI18n} from "vue-i18n";
 import {type VideoPlatform} from "../composables/videoPlatforms";
 import {createCookieEditor} from "../composables/useCookieEditor";
 import {useDesktopActions} from "../composables/useDesktopActions";
 
-const props = defineProps<{ platform: VideoPlatform; contents: string; disabled: boolean; saveFailed: boolean }>();
+const props = defineProps<{ platform: VideoPlatform; contents: string; disabled: boolean }>();
 const emit = defineEmits<{ close: []; change: [contents: string] }>();
 const {t} = useI18n({useScope: "global"});
 const desktop = useDesktopActions();
@@ -51,13 +51,11 @@ async function pasteContents() {
           t("download.cookie.paste")
         }}
       </ElButton>
-      <ElButton :disabled="disabled || (!text && !reading && !saveFailed)" class="clear-button" @click="editor.clear">
-        {{ t("download.cookie.clear") }}
-      </ElButton>
     </div>
-    <ElInput id="cookie-content" :aria-label="t('download.cookie.content')" :disabled="disabled" :model-value="text"
+    <ElInput id="cookie-content" :aria-label="t('download.cookie.content')" :clear-icon="CloseBold" :disabled="disabled"
+             :model-value="text"
              :placeholder="t('download.cookie.placeholder')" :rows="12"
-             autocomplete="off" spellcheck="false"
+             autocomplete="off" clearable spellcheck="false"
              type="textarea" @update:model-value="editor.setText"/>
   </section>
 </template>
@@ -116,12 +114,8 @@ async function pasteContents() {
   margin-left: 0;
 }
 
-.cookie-editor-actions .clear-button {
-  margin-left: auto;
-}
-
 .cookie-panel :deep(textarea) {
-  padding: 12px 14px;
+  padding: 12px 26px 12px 14px;
   font-family: Consolas, monospace;
   font-size: 12px;
   line-height: 1.7;

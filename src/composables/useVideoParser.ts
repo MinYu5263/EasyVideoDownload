@@ -38,6 +38,7 @@ interface PlatformState {
     link: string;
     resultLink: string;
     directory: string;
+    directoryEdited: boolean;
     video: VideoMetadata | null;
     phase: "idle" | "parsing" | "ready";
     error: ParseError | null;
@@ -60,7 +61,7 @@ function availableFrameRates(video: VideoMetadata | null, quality: string | null
 export function createVideoParser(bridge: ParserBridge) {
     const platform = ref<VideoPlatform>(platformIds[0]);
     const drafts = reactive(Object.fromEntries(platformIds.map(id => [id, {
-        link: "", resultLink: "", directory: "", video: null, phase: "idle", error: null,
+        link: "", resultLink: "", directory: "", directoryEdited: false, video: null, phase: "idle", error: null,
         quality: null, frameRate: null, version: 0,
     }]))) as Record<VideoPlatform, PlatformState>;
     const draft = computed(() => drafts[platform.value]);
@@ -126,7 +127,16 @@ export function createVideoParser(bridge: ParserBridge) {
     }
 
     function setDirectory(value: string) {
-        if (!busy.value) draft.value.directory = value;
+        if (!busy.value) {
+            draft.value.directory = value;
+            draft.value.directoryEdited = true;
+        }
+    }
+
+    function applyDefaultDirectories(directories: Record<VideoPlatform, string>) {
+        for (const id of platformIds) {
+            if (!drafts[id].directoryEdited) drafts[id].directory = directories[id];
+        }
     }
 
     async function pasteLink(read: () => Promise<string>) {
@@ -219,6 +229,7 @@ export function createVideoParser(bridge: ParserBridge) {
         selectPlatform,
         setLink,
         setDirectory,
+        applyDefaultDirectories,
         pasteLink,
         cancelPaste,
         setQuality,

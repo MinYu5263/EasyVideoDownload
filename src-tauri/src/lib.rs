@@ -29,6 +29,7 @@ pub fn run() {
             app.manage(required_tools::RequiredToolManager::new(storage.clone()));
             app.manage(storage);
             app.manage(cookies::CookieStore::new(&data_directory));
+            app.manage(video::download::DownloadManager::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -42,6 +43,9 @@ pub fn run() {
             video::parse_video,
             video::get_video_parse_command,
             video::get_video_download_command,
+            video::download::get_default_download_directories,
+            video::download::download_video,
+            video::download::cancel_video_download,
             required_tools::get_required_tools,
             required_tools::check_required_tool,
             required_tools::select_required_tool_path
