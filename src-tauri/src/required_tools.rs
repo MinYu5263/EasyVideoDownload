@@ -1,10 +1,11 @@
+use crate::database::{Storage, StorageError};
 use serde::{Deserialize, Serialize};
 mod process_tree;
 use std::{
     collections::BTreeMap,
-    io::Write,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri_plugin_dialog::DialogExt;
@@ -213,49 +214,12 @@ fn resolve_programs(
         .collect()
 }
 
-fn save_settings(path: &Path, settings: &RequiredToolSettings) -> Result<(), RequiredToolError> {
-    let write = || -> Result<(), Box<dyn std::error::Error>> {
-        let parent = path.parent().ok_or("missing configuration directory")?;
-        std::fs::create_dir_all(parent)?;
-        let mut file = tempfile::NamedTempFile::new_in(parent)?;
-        serde_json::to_writer_pretty(&mut file, settings)?;
-        file.flush()?;
-        file.as_file().sync_all()?;
-        file.persist(path)?;
-        Ok(())
-    };
-    write().map_err(|e| error("saveFailed", "", e))
-}
-
-fn load_settings(path: &Path) -> Result<RequiredToolSettings, RequiredToolError> {
+pub(crate) fn load_settings(path: &Path) -> Result<RequiredToolSettings, RequiredToolError> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let settings: RequiredToolSettings =
                 serde_json::from_slice(&bytes).map_err(|e| error("loadFailed", "", e))?;
-            for (id, config) in &settings.tools {
-                let names = id.names();
-                let valid = config.programs.len() == names.len()
-                    && config.programs.iter().zip(names).all(|(program, name)| {
-                        let header = match *name {
-                            "yt-dlp" => program.version.clone(),
-                            "deno" => format!("deno {}", program.version),
-                            _ => format!("{name} version {}", program.version),
-                        };
-                        program.name == *name
-                            && program.path.is_absolute()
-                            && parse_version(name, &header).is_ok()
-                    })
-                    && (config.source != RequiredToolSource::Manual
-                        || Path::new(&config.manual_path).is_absolute())
-                    && config.checked_at <= 8_640_000_000_000;
-                if !valid {
-                    return Err(error(
-                        "loadFailed",
-                        "",
-                        format!("invalid configuration for {id:?}"),
-                    ));
-                }
-            }
+            validate_settings(&settings)?;
             Ok(settings)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -271,6 +235,34 @@ fn load_settings(path: &Path) -> Result<RequiredToolSettings, RequiredToolError>
         }
         Err(e) => Err(error("loadFailed", "", e)),
     }
+}
+
+pub(crate) fn validate_settings(settings: &RequiredToolSettings) -> Result<(), RequiredToolError> {
+    for (id, config) in &settings.tools {
+        let names = id.names();
+        let valid = config.programs.len() == names.len()
+            && config.programs.iter().zip(names).all(|(program, name)| {
+                let header = match *name {
+                    "yt-dlp" => program.version.clone(),
+                    "deno" => format!("deno {}", program.version),
+                    _ => format!("{name} version {}", program.version),
+                };
+                program.name == *name
+                    && program.path.is_absolute()
+                    && parse_version(name, &header).is_ok()
+            })
+            && (config.source != RequiredToolSource::Manual
+                || Path::new(&config.manual_path).is_absolute())
+            && config.checked_at <= 8_640_000_000_000;
+        if !valid {
+            return Err(error(
+                "loadFailed",
+                "",
+                format!("invalid configuration for {id:?}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn read_bounded(stream: impl AsyncRead + Unpin) -> Result<Vec<u8>, RequiredToolError> {
@@ -344,13 +336,16 @@ fn apply_candidate(
     settings: &mut RequiredToolSettings,
     id: RequiredToolId,
     candidate: Result<RequiredToolConfig, RequiredToolError>,
-    path: &Path,
+    save: impl FnOnce(&RequiredToolConfig) -> Result<(), RequiredToolError>,
 ) -> Result<(), RequiredToolError> {
-    let mut next = settings.clone();
-    next.tools.insert(id, candidate?);
-    save_settings(path, &next)?;
-    *settings = next;
+    let candidate = candidate?;
+    save(&candidate)?;
+    settings.tools.insert(id, candidate);
     Ok(())
+}
+
+fn storage_error(e: StorageError) -> RequiredToolError {
+    error(&e.code, "", e.detail)
 }
 
 async fn detect(request: &RequiredToolRequest) -> Result<RequiredToolConfig, RequiredToolError> {
@@ -407,22 +402,26 @@ async fn detect(request: &RequiredToolRequest) -> Result<RequiredToolConfig, Req
 }
 
 pub struct RequiredToolManager {
-    settings: Mutex<RequiredToolSettings>,
+    settings: Arc<StdMutex<RequiredToolSettings>>,
     checks: [Mutex<()>; 3],
-    config_path: PathBuf,
+    storage: Storage,
     load_error: Option<RequiredToolError>,
 }
 
 impl RequiredToolManager {
-    pub fn new(config_path: PathBuf) -> Self {
-        let (settings, load_error) = match load_settings(&config_path) {
+    pub fn new(storage: Storage) -> Self {
+        let (settings, load_error) = match storage
+            .database()
+            .and_then(|db| db.tools())
+            .map_err(storage_error)
+        {
             Ok(settings) => (settings, None),
             Err(e) => (RequiredToolSettings::default(), Some(e)),
         };
         Self {
-            settings: Mutex::new(settings),
+            settings: Arc::new(StdMutex::new(settings)),
             checks: std::array::from_fn(|_| Mutex::new(())),
-            config_path,
+            storage,
             load_error,
         }
     }
@@ -446,10 +445,19 @@ pub struct CheckResult {
 pub async fn get_required_tools(
     state: tauri::State<'_, RequiredToolManager>,
 ) -> Result<RequiredToolSettingsSnapshot, RequiredToolError> {
-    Ok(RequiredToolSettingsSnapshot {
-        settings: state.settings.lock().await.clone(),
-        error: state.load_error.clone(),
+    let settings = state.settings.clone();
+    let load_error = state.load_error.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(RequiredToolSettingsSnapshot {
+            settings: settings
+                .lock()
+                .map_err(|e| error("loadFailed", "", e))?
+                .clone(),
+            error: load_error,
+        })
     })
+    .await
+    .map_err(|e| error("loadFailed", "", e))?
 }
 
 #[tauri::command]
@@ -465,19 +473,25 @@ pub async fn check_required_tool(
         return Err(e.clone());
     }
     let candidate = detect(&request).await;
-    // Serialize read-modify-save to prevent concurrent cards overwriting each other.
-    let mut settings = state.settings.lock().await;
-    let failure = apply_candidate(
-        &mut settings,
-        request.tool_id,
-        candidate,
-        &state.config_path,
-    )
-    .err();
-    Ok(CheckResult {
-        active: settings.tools.get(&request.tool_id).cloned(),
-        error: failure,
+    let settings = state.settings.clone();
+    let storage = state.storage.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Publish the new in-memory configuration only after SQLite commits.
+        let mut settings = settings.lock().map_err(|e| error("saveFailed", "", e))?;
+        let failure = apply_candidate(&mut settings, request.tool_id, candidate, |config| {
+            storage
+                .database()
+                .and_then(|db| db.save_tool(request.tool_id, config))
+                .map_err(storage_error)
+        })
+        .err();
+        Ok(CheckResult {
+            active: settings.tools.get(&request.tool_id).cloned(),
+            error: failure,
+        })
     })
+    .await
+    .map_err(|e| error("saveFailed", "", e))?
 }
 
 #[tauri::command]
@@ -598,7 +612,6 @@ mod tests {
 
     #[test]
     fn failed_candidate_keeps_previous_configuration() {
-        let dir = tempfile::tempdir().unwrap();
         let mut settings = RequiredToolSettings::default();
         settings.tools.insert(RequiredToolId::Ytdlp, config("old"));
         let before = settings.clone();
@@ -606,18 +619,14 @@ mod tests {
             &mut settings,
             RequiredToolId::Ytdlp,
             Err(error("timeout", "yt-dlp", "")),
-            &dir.path().join("tools.json")
+            |_| panic!("failed candidate must not write")
         )
         .is_err());
         assert_eq!(settings, before);
-        assert!(!dir.path().join("tools.json").exists());
     }
 
     #[test]
     fn failed_save_keeps_previous_configuration() {
-        let dir = tempfile::tempdir().unwrap();
-        let blocker = dir.path().join("file-not-directory");
-        std::fs::write(&blocker, "blocked").unwrap();
         let mut settings = RequiredToolSettings::default();
         settings.tools.insert(RequiredToolId::Ytdlp, config("old"));
         let before = settings.clone();
@@ -626,7 +635,7 @@ mod tests {
                 &mut settings,
                 RequiredToolId::Ytdlp,
                 Ok(config("new")),
-                &blocker.join("tools.json")
+                |_| Err(error("saveFailed", "", "read-only database"))
             )
             .unwrap_err()
             .code,
@@ -638,20 +647,31 @@ mod tests {
     #[test]
     fn saved_configuration_is_restored_without_running_programs() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("tools.json");
+        let db = crate::database::Database::open(
+            &dir.path().join("app.db"),
+            &dir.path().join("required-tools.json"),
+        )
+        .unwrap();
         let mut settings = RequiredToolSettings::default();
         apply_candidate(
             &mut settings,
             RequiredToolId::Ytdlp,
             Ok(config("2026.09.25")),
-            &file,
+            |candidate| {
+                db.save_tool(RequiredToolId::Ytdlp, candidate)
+                    .map_err(storage_error)
+            },
         )
         .unwrap();
-        assert_eq!(load_settings(&file).unwrap(), settings);
+        assert_eq!(db.tools().unwrap(), settings);
         let mut deno = config("2.5.0");
         deno.programs[0].name = "deno".into();
-        apply_candidate(&mut settings, RequiredToolId::Deno, Ok(deno), &file).unwrap();
-        assert_eq!(load_settings(&file).unwrap().tools.len(), 2);
+        apply_candidate(&mut settings, RequiredToolId::Deno, Ok(deno), |candidate| {
+            db.save_tool(RequiredToolId::Deno, candidate)
+                .map_err(storage_error)
+        })
+        .unwrap();
+        assert_eq!(db.tools().unwrap().tools.len(), 2);
     }
 
     #[test]
@@ -676,20 +696,12 @@ mod tests {
             "programs": [{"name": "deno", "path": std::env::temp_dir().join("deno.exe"), "version": "2.5.0"}], "checkedAt": 123
         }}}).to_string();
             std::fs::write(&legacy, &original).unwrap();
-            let mut settings = load_settings(&path).unwrap();
+            let settings = load_settings(&path).unwrap();
             assert!(
                 settings.tools.contains_key(&RequiredToolId::Deno),
                 "legacy settings were lost during rename"
             );
             assert!(!path.exists(), "reading must not write configuration");
-            apply_candidate(
-                &mut settings,
-                RequiredToolId::Ytdlp,
-                Ok(config("2026.08.19")),
-                &path,
-            )
-            .unwrap();
-            assert_eq!(load_settings(&path).unwrap().tools.len(), 2);
             assert_eq!(std::fs::read_to_string(&legacy).unwrap(), original);
         }
     }

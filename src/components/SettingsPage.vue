@@ -2,8 +2,7 @@
 import {ElButton, ElIcon} from "element-plus";
 import {Download, Refresh} from "@element-plus/icons-vue";
 import {useI18n} from "vue-i18n";
-import {version} from "../../package.json";
-import LanguageSettings from "./LanguageSettings.vue";
+import ApplicationSettings from "./ApplicationSettings.vue";
 import RequiredToolCard from "./RequiredToolCard.vue";
 import {toolIds, useRequiredTools} from "../composables/useRequiredTools";
 
@@ -13,7 +12,7 @@ const {desktop, ready, loadError, tools, busy, check, choose, changeSource, chec
 
 <template>
   <div class="settings-page">
-    <LanguageSettings/>
+    <ApplicationSettings/>
 
     <section class="required-tools-section" aria-labelledby="required-tools-title">
       <header class="section-heading">
@@ -26,7 +25,9 @@ const {desktop, ready, loadError, tools, busy, check, choose, changeSource, chec
       </header>
 
       <div class="required-tool-list">
-        <RequiredToolCard v-for="toolId in toolIds" :key="toolId" :tool-id="toolId" :state="tools[toolId]" :ready="ready" @check="check(toolId)" @choose="choose(toolId)" @source-change="changeSource(toolId, $event)"/>
+        <RequiredToolCard v-for="toolId in toolIds" :key="toolId" :ready="ready" :state="tools[toolId]"
+                          :tool-id="toolId" @check="check(toolId)" @choose="choose(toolId)"
+                          @source-change="changeSource(toolId, $event)"/>
       </div>
 
       <p v-if="!desktop" class="required-tool-notice">{{ t('settings.requiredTools.desktopOnly') }}</p>
@@ -109,8 +110,16 @@ const {desktop, ready, loadError, tools, busy, check, choose, changeSource, chec
   line-height: 1.7;
 }
 
-.load-error { color: #a1392e; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
-.load-error span { display: block; }
+.load-error {
+  color: #a1392e;
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.load-error span {
+  display: block;
+}
 
 .about-section > h2 {
   margin-bottom: 18px;

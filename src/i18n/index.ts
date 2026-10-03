@@ -4,8 +4,9 @@ import elementEn from "element-plus/es/locale/lang/en";
 import elementZhCN from "element-plus/es/locale/lang/zh-cn";
 import en from "./locales/en";
 import zhCN, {type MessageSchema} from "./locales/zh-CN";
+import type {AppLocale} from "../composables/useAppSettings";
 
-export type AppLocale = "zh-CN" | "en";
+export type {AppLocale} from "../composables/useAppSettings";
 
 const localeStorageKey = "easyvideodownload.locale";
 
@@ -49,15 +50,8 @@ export const elementPlusLocale = computed(() =>
 
 watch(
     i18n.global.locale,
-    (locale, previousLocale) => {
+    (locale) => {
         document.documentElement.lang = locale;
-        if (previousLocale === undefined) return;
-
-        try {
-            localStorage.setItem(localeStorageKey, locale);
-        } catch {
-            // Language switching still works when storage is unavailable.
-        }
     },
     {immediate: true},
 );
