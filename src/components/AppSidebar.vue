@@ -2,8 +2,8 @@
 import {ref, watch} from "vue";
 import {useI18n} from "vue-i18n";
 import {ElIcon, ElMenu, ElMenuItem} from "element-plus";
-import {Download} from "@element-plus/icons-vue";
-import {appPages, type AppPageId} from "../navigation";
+import {type AppPageId, appPages} from "../navigation";
+import appIcon from "../assets/app-icon.svg?no-inline";
 
 const props = withDefaults(
     defineProps<{
@@ -71,9 +71,7 @@ function handleMenuKeydown(event: KeyboardEvent) {
 <template>
   <aside class="app-sidebar" :aria-label="t('accessibility.sidebar')">
     <div class="brand">
-      <span class="brand-icon" aria-hidden="true">
-        <ElIcon :size="18"><Download/></ElIcon>
-      </span>
+      <img :src="appIcon" alt="" aria-hidden="true" class="brand-icon" height="32" width="32"/>
       <strong>EasyVideoDownload</strong>
     </div>
 
@@ -133,14 +131,10 @@ function handleMenuKeydown(event: KeyboardEvent) {
 }
 
 .brand-icon {
-  display: grid;
+  display: block;
   width: 32px;
   height: 32px;
   flex-shrink: 0;
-  place-items: center;
-  border-radius: 10px;
-  background: var(--app-accent);
-  color: #ffffff;
 }
 
 .brand strong {

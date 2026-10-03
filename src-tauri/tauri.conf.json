@@ -29,11 +29,11 @@
     "active": true,
     "targets": "all",
     "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico"
+      "target/generated-icons/32x32.png",
+      "target/generated-icons/128x128.png",
+      "target/generated-icons/128x128@2x.png",
+      "target/generated-icons/icon.icns",
+      "target/generated-icons/icon.ico"
     ]
   }
 }

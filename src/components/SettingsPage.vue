@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import {ElButton, ElIcon} from "element-plus";
-import {Download, Refresh} from "@element-plus/icons-vue";
+import {ElButton} from "element-plus";
+import {Refresh} from "@element-plus/icons-vue";
 import {useI18n} from "vue-i18n";
 import ApplicationSettings from "./ApplicationSettings.vue";
 import RequiredToolCard from "./RequiredToolCard.vue";
 import {toolIds, useRequiredTools} from "../composables/useRequiredTools";
+import appIcon from "../assets/app-icon.svg?no-inline";
 
 const {t} = useI18n({useScope: "global"});
 const {desktop, ready, loadError, tools, busy, check, choose, changeSource, checkAll} = useRequiredTools();
@@ -41,9 +42,7 @@ const {desktop, ready, loadError, tools, busy, check, choose, changeSource, chec
       <h2 id="about-title">{{ t("settings.about.title") }}</h2>
       <div class="about-card">
         <div class="about-brand">
-          <span class="about-icon" aria-hidden="true">
-            <ElIcon :size="19"><Download/></ElIcon>
-          </span>
+          <img :src="appIcon" alt="" aria-hidden="true" class="about-icon" height="36" width="36"/>
           <h3>EasyVideoDownload</h3>
         </div>
 
@@ -143,14 +142,10 @@ const {desktop, ready, loadError, tools, busy, check, choose, changeSource, chec
 }
 
 .about-icon {
-  display: grid;
+  display: block;
   width: 36px;
   height: 36px;
   flex-shrink: 0;
-  place-items: center;
-  border-radius: 11px;
-  background: var(--app-accent);
-  color: #ffffff;
 }
 
 .about-brand h3 {

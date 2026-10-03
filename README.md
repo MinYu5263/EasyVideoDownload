@@ -112,6 +112,41 @@ Videdown 的源码调查与待验证方案见[项目讨论稿](docs/project-disc
 
 截至交接时，项目尚未搭建，开发依赖尚未安装，也未执行 Git 初始化。Git 初始化、提交、推送、分支等改变状态的操作，需要先说明具体命令与影响，并取得用户明确确认。
 
+## 应用图标
+
+主图标只维护 `src/assets/app-icon.svg`。侧栏、关于区域和浏览器图标直接使用 SVG；桌面程序的系统图标使用从它生成的
+PNG、ICO、ICNS。生成文件位于 Git 忽略的 `src-tauri/target/generated-icons/`，无需手动修改或提交。
+
+### 日常调整与预览
+
+开发过程中直接编辑 `src/assets/app-icon.svg`，通过 Vite 热更新查看侧栏和关于区域的效果。保存 SVG 不会触发桌面程序重启，也不会自动更新系统图标。
+`pnpm dev`、`pnpm build` 和 Cargo 构建均不会自动生成桌面图标。
+
+### 手动更新桌面图标
+
+图标定稿后，在项目根目录执行：
+
+```powershell
+pnpm icons
+```
+
+随后在运行 `tauri dev` 的终端按 `Ctrl+C` 退出开发进程，再重新启动，让新图标编入程序并显示在窗口标题栏和任务栏：
+
+```powershell
+pnpm tauri dev
+```
+
+首次运行桌面应用或清理构建目录后，也需要先运行 `pnpm icons`。
+
+### 发布前更新
+
+发布时先手动生成最新桌面图标，再构建安装包：
+
+```powershell
+pnpm icons
+pnpm tauri build
+```
+
 ## 参考源码与官方文档
 
 - [yt-dlp 源码与参数说明](https://github.com/yt-dlp/yt-dlp)

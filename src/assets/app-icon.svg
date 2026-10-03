@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 256 256" fill="none" role="img">
+    <title>EasyVideoDownload</title>
+    <rect x="12" y="12" width="232" height="232" rx="24" fill="#14a36a"/>
+    <g fill="white">
+        <circle cx="44" cy="64" r="12"/>
+        <circle cx="44" cy="128" r="12"/>
+        <circle cx="44" cy="192" r="12"/>
+        <circle cx="212" cy="64" r="12"/>
+        <circle cx="212" cy="128" r="12"/>
+        <circle cx="212" cy="192" r="12"/>
+    </g>
+    <path d="M128 74v100m-34-34 34 34 34-34" stroke="white" stroke-width="16" stroke-linecap="round"
+          stroke-linejoin="round"/>
+</svg>

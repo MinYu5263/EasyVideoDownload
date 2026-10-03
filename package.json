@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "icons": "node scripts/generate-icons.mjs",
     "dev": "vite",
     "test": "node --test tests/*.test.mjs",
     "build": "vue-tsc --noEmit && vite build",
