@@ -2,19 +2,14 @@
 import {computed} from "vue";
 import {ElButton, ElIcon, ElInput, ElMessage, ElOption, ElSelect} from "element-plus";
 import {FolderOpened, TopRight} from "@element-plus/icons-vue";
-import {isTauri} from "@tauri-apps/api/core";
-import {openUrl} from "@tauri-apps/plugin-opener";
+import {toolWebsites, useDesktopActions} from "../composables/useDesktopActions";
 import {useI18n} from "vue-i18n";
 import type {RequiredToolId, RequiredToolSource, RequiredToolState} from "../composables/useRequiredTools";
 
 const props = defineProps<{ toolId: RequiredToolId; state: RequiredToolState; ready: boolean }>();
 const emit = defineEmits<{ check: []; choose: []; sourceChange: [source: RequiredToolSource] }>();
 const {t} = useI18n({useScope: "global"});
-const toolWebsites: Record<RequiredToolId, string> = {
-  ytdlp: "https://github.com/yt-dlp/yt-dlp",
-  ffmpeg: "https://ffmpeg.org/",
-  deno: "https://deno.com/",
-};
+const desktop = useDesktopActions();
 const isDirectory = computed(() => props.toolId === "ffmpeg");
 const locked = computed(() => !props.ready || props.state.operation !== null);
 const draft = computed(() => props.state.active && (props.state.source !== props.state.active.source || (props.state.source === "manual" && props.state.manualPath.trim() !== props.state.active.manualPath)));
@@ -25,10 +20,10 @@ function sourceChanged(value: unknown) {
 }
 
 async function openWebsite(event: MouseEvent) {
-  if (!isTauri()) return;
+  if (event.type === "auxclick" && event.button !== 1) return;
   event.preventDefault();
   try {
-    await openUrl(toolWebsites[props.toolId]);
+    await desktop.openToolWebsite(props.toolId);
   } catch {
     ElMessage.error(t("settings.requiredTools.websiteOpenFailed", {url: toolWebsites[props.toolId]}));
   }
@@ -42,15 +37,19 @@ async function openWebsite(event: MouseEvent) {
       <div class="required-tool-summary">
         <div class="required-tool-title-row">
           <h3 :id="`required-tool-title-${toolId}`">{{ t(`settings.requiredTools.${toolId}.name`) }}</h3>
-          <a
+          <button
+              :disabled="!desktop.desktop"
               class="tool-website"
-              :href="toolWebsites[toolId]"
-              target="_blank"
-              rel="noopener noreferrer"
+              type="button"
               :title="t('settings.requiredTools.officialWebsite', { program: t(`settings.requiredTools.${toolId}.name`) })"
               :aria-label="t('settings.requiredTools.officialWebsite', { program: t(`settings.requiredTools.${toolId}.name`) })"
               @click="openWebsite"
-          ><ElIcon :size="13" aria-hidden="true"><TopRight/></ElIcon></a>
+              @auxclick="openWebsite"
+          >
+            <ElIcon :size="13" aria-hidden="true">
+              <TopRight/>
+            </ElIcon>
+          </button>
           <span class="required-tool-status" :class="`status-${status}`" role="status">
             <span class="status-dot" aria-hidden="true"></span>
             {{ t(`settings.requiredTools.${status}`) }}
@@ -164,6 +163,10 @@ async function openWebsite(event: MouseEvent) {
 }
 
 .tool-website {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;

@@ -3,9 +3,10 @@ import {computed, ref} from "vue";
 import {ElConfigProvider, ElEmpty, ElIcon} from "element-plus";
 import {useI18n} from "vue-i18n";
 import AppSidebar from "./components/AppSidebar.vue";
+import DownloadPage from "./components/DownloadPage.vue";
 import SettingsPage from "./components/SettingsPage.vue";
 import {elementPlusLocale} from "./i18n";
-import {appPages, type AppPageId} from "./navigation";
+import {type AppPageId, appPages} from "./navigation";
 
 const activePageId = ref<AppPageId>("download");
 const {t} = useI18n({useScope: "global"});
@@ -28,9 +29,10 @@ const activePage = computed(
           <h1 id="page-title">{{ t(activePage.labelKey) }}</h1>
         </header>
 
+        <DownloadPage v-show="activePage.id === 'download'" :active="activePage.id === 'download'"/>
         <SettingsPage v-show="activePage.id === 'settings'"/>
         <section
-            v-if="activePage.id !== 'settings'"
+            v-if="activePage.id === 'history'"
             :key="activePage.id"
             class="page-placeholder"
             aria-labelledby="page-title"

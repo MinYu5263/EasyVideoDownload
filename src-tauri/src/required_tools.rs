@@ -1,7 +1,7 @@
 use crate::database::{Storage, StorageError};
 use crate::datetime;
 use serde::{Deserialize, Serialize};
-mod process_tree;
+pub(crate) mod process_tree;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -408,6 +408,15 @@ pub struct RequiredToolManager {
 }
 
 impl RequiredToolManager {
+    pub(crate) fn settings_snapshot(&self) -> Result<RequiredToolSettings, RequiredToolError> {
+        if let Some(error) = &self.load_error {
+            return Err(error.clone());
+        }
+        self.settings
+            .lock()
+            .map(|settings| settings.clone())
+            .map_err(|e| error("loadFailed", "", e))
+    }
     pub fn new(storage: Storage) -> Self {
         let (settings, load_error) = match storage
             .database()

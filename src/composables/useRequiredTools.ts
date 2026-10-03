@@ -4,6 +4,8 @@ import {invoke, isTauri} from "@tauri-apps/api/core";
 export const toolIds = ["ytdlp", "ffmpeg", "deno"] as const;
 export type RequiredToolId = (typeof toolIds)[number];
 export type RequiredToolSource = "path" | "manual";
+// Notify parsed-video caches only when an applied yt-dlp/Deno configuration changes.
+export const videoToolRevision = ref(0);
 
 export interface RequiredToolError {
     code: string;
@@ -29,6 +31,13 @@ export interface RequiredToolState {
 interface RequiredToolBridge {
     desktop: boolean;
     invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+}
+
+function configurationKey(config: RequiredToolConfig | null) {
+    return config && JSON.stringify({
+        source: config.source, manualPath: config.manualPath,
+        programs: config.programs.map(program => ({name: program.name, path: program.path, version: program.version}))
+    });
 }
 
 function bridgeError(value: unknown): RequiredToolError {
@@ -67,6 +76,7 @@ export function createRequiredTools(bridge: RequiredToolBridge) {
         if (!ready.value || tool.operation) return;
         tool.operation = "checking";
         tool.error = null;
+        const previous = configurationKey(tool.active);
         try {
             const result = await bridge.invoke<{
                 active: RequiredToolConfig | null;
@@ -77,6 +87,7 @@ export function createRequiredTools(bridge: RequiredToolBridge) {
             tool.active = result.active;
             tool.error = result.error;
             if (!result.error && result.active) tool.manualPath = result.active.manualPath;
+            if (id !== "ffmpeg" && !result.error && configurationKey(result.active) !== previous) videoToolRevision.value += 1;
         } catch (error) {
             tool.error = bridgeError(error);
         } finally {

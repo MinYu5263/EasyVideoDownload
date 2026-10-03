@@ -7,11 +7,16 @@ import "element-plus/es/components/icon/style/css";
 import "element-plus/es/components/menu/style/css";
 import "element-plus/es/components/menu-item/style/css";
 import "element-plus/es/components/message/style/css";
+import "element-plus/es/components/notification/style/css";
 import "element-plus/es/components/select/style/css";
 import "element-plus/es/components/option/style/css";
 import "element-plus/es/components/switch/style/css";
 import "element-plus/es/components/button/style/css";
 import "element-plus/es/components/input/style/css";
+import "element-plus/es/components/dialog/style/css";
+import "element-plus/es/components/tooltip/style/css";
+import "element-plus/es/components/skeleton/style/css";
+import "element-plus/es/components/skeleton-item/style/css";
 import "./styles/theme.css";
 
 async function bootstrap() {
