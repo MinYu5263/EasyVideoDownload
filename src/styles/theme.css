@@ -1,0 +1,77 @@
+:root {
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #23372b;
+  background: #f5f8f6;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  --app-accent: #2e6b50;
+  --app-accent-soft: #eaf3ec;
+  --app-background: #f5f8f6;
+  --app-sidebar-background: #f9fbfa;
+  --app-surface: #ffffff;
+  --app-text: #23372b;
+  --app-text-secondary: #6d8173;
+  --app-text-muted: #8c9c90;
+  --app-border: #e1e8e3;
+  --app-radius: 14px;
+  --app-sidebar-width: 236px;
+
+  --el-color-primary: var(--app-accent);
+  --el-color-primary-light-3: #6d9785;
+  --el-color-primary-light-5: #97b5a8;
+  --el-color-primary-light-7: #c0d3cb;
+  --el-color-primary-light-8: #d5e1dc;
+  --el-color-primary-light-9: var(--app-accent-soft);
+  --el-color-primary-dark-2: #255640;
+  --el-text-color-primary: var(--app-text);
+  --el-text-color-regular: var(--app-text-secondary);
+  --el-text-color-secondary: var(--app-text-muted);
+  --el-border-color: var(--app-border);
+  --el-border-color-light: #edf1ee;
+  --el-bg-color: var(--app-surface);
+  --el-bg-color-page: var(--app-background);
+  --el-border-radius-base: 8px;
+  --el-font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  min-width: 640px;
+}
+
+a {
+  color: var(--app-accent);
+  text-decoration: none;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+@media (max-width: 1000px) {
+  :root {
+    --app-sidebar-width: 216px;
+  }
+}

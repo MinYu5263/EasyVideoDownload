@@ -1,160 +1,147 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { computed, ref } from "vue";
+import { ElConfigProvider, ElEmpty, ElIcon } from "element-plus";
+import { useI18n } from "vue-i18n";
+import AppSidebar from "./components/AppSidebar.vue";
+import LanguageSettings from "./components/LanguageSettings.vue";
+import { elementPlusLocale } from "./i18n";
+import { appPages, type AppPageId } from "./navigation";
 
-const greetMsg = ref("");
-const name = ref("");
-
-async function greet() {
-  // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-  greetMsg.value = await invoke("greet", { name: name.value });
-}
+const activePageId = ref<AppPageId>("download");
+const { t } = useI18n({ useScope: "global" });
+const activePage = computed(
+  () => appPages.find((page) => page.id === activePageId.value) ?? appPages[0],
+);
 </script>
 
 <template>
-  <main class="container">
-    <h1>Welcome to Tauri + Vue</h1>
+  <ElConfigProvider :locale="elementPlusLocale">
+    <a class="skip-link" href="#main-content">
+      {{ t("accessibility.skipToContent") }}
+    </a>
 
-    <div class="row">
-      <a href="https://vite.dev" target="_blank">
-        <img src="/vite.svg" class="logo vite" alt="Vite logo" />
-      </a>
-      <a href="https://tauri.app" target="_blank">
-        <img src="/tauri.svg" class="logo tauri" alt="Tauri logo" />
-      </a>
-      <a href="https://vuejs.org/" target="_blank">
-        <img src="./assets/vue.svg" class="logo vue" alt="Vue logo" />
-      </a>
+    <div class="app-shell">
+      <AppSidebar v-model="activePageId" />
+
+      <main id="main-content" class="app-main" tabindex="-1">
+        <header class="page-heading">
+          <h1 id="page-title">{{ t(activePage.labelKey) }}</h1>
+        </header>
+
+        <LanguageSettings v-if="activePage.id === 'settings'" />
+        <section
+          v-else
+          :key="activePage.id"
+          class="page-placeholder"
+          aria-labelledby="page-title"
+        >
+          <ElEmpty :image-size="56">
+            <template #image>
+              <span class="placeholder-icon" aria-hidden="true">
+                <ElIcon :size="24">
+                  <component :is="activePage.icon" />
+                </ElIcon>
+              </span>
+            </template>
+            <template #description>
+              <h2>{{ t(activePage.emptyTitleKey) }}</h2>
+              <p>{{ t(activePage.emptyDescriptionKey) }}</p>
+            </template>
+          </ElEmpty>
+        </section>
+      </main>
     </div>
-    <p>Click on the Tauri, Vite, and Vue logos to learn more.</p>
-
-    <form class="row" @submit.prevent="greet">
-      <input id="greet-input" v-model="name" placeholder="Enter a name..." />
-      <button type="submit">Greet</button>
-    </form>
-    <p>{{ greetMsg }}</p>
-  </main>
+  </ElConfigProvider>
 </template>
 
 <style scoped>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.vue:hover {
-  filter: drop-shadow(0 0 2em #249b73);
-}
-
-</style>
-<style>
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
+.skip-link {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 10;
+  padding: 10px 16px;
   border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
+  background: var(--app-accent);
+  color: #ffffff;
+  transform: translateY(-160%);
 }
 
-button {
-  cursor: pointer;
+.skip-link:focus {
+  transform: translateY(0);
 }
 
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
+.app-shell {
+  display: grid;
+  grid-template-columns: var(--app-sidebar-width) minmax(0, 1fr);
+  height: 100%;
+  overflow: hidden;
 }
 
-input,
-button {
+.app-main {
+  min-width: 0;
+  overflow-y: auto;
+  padding: 30px 32px 26px;
+}
+
+.app-main:focus {
   outline: none;
 }
 
-#greet-input {
-  margin-right: 5px;
+.page-heading {
+  margin-bottom: 24px;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
-
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
+.page-heading h1 {
+  margin: 0;
+  color: var(--app-text);
+  font-size: 24px;
+  font-weight: 650;
+  line-height: 1.4;
+  letter-spacing: -0.6px;
 }
 
+.page-placeholder {
+  display: grid;
+  min-height: 280px;
+  place-items: center;
+  padding: 24px;
+  border: 1px dashed var(--app-border);
+  border-radius: var(--app-radius);
+}
+
+.placeholder-icon {
+  display: grid;
+  width: 56px;
+  height: 56px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--app-accent-soft);
+  color: var(--app-accent);
+}
+
+.placeholder-icon :deep(svg) {
+  color: var(--app-accent);
+}
+
+.page-placeholder h2 {
+  margin: 0 0 8px;
+  color: var(--app-text-secondary);
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.page-placeholder p {
+  max-width: 360px;
+  margin: 0;
+  color: var(--app-text-muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+@media (max-width: 1000px) {
+  .app-main {
+    padding: 27px 24px 24px;
+  }
+}
 </style>
