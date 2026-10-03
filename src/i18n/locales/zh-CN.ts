@@ -35,6 +35,8 @@ const zhCN = {
             checkAll: "检测全部",
             check: "检测",
             checkLabel: "检测 {program}",
+            officialWebsite: "访问 {program} 官网",
+            websiteOpenFailed: "无法打开官网，请在浏览器中访问：{url}",
             installed: "已安装",
             missing: "未找到",
             unavailable: "不可用",
@@ -87,10 +89,7 @@ const zhCN = {
         },
         about: {
             title: "关于",
-            tagline: "简单保存，一个视频一次。",
             version: "当前版本",
-            platforms: "目标平台",
-            links: "工具官方网站",
         },
     },
     languages: {

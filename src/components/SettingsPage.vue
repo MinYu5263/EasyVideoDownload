@@ -9,11 +9,6 @@ import {toolIds, useRequiredTools} from "../composables/useRequiredTools";
 
 const {t} = useI18n({useScope: "global"});
 const {desktop, ready, loadError, tools, busy, check, choose, changeSource, checkAll} = useRequiredTools();
-const requiredToolLinks = [
-  {name: "yt-dlp", url: "https://github.com/yt-dlp/yt-dlp"},
-  {name: "FFmpeg", url: "https://ffmpeg.org/"},
-  {name: "Deno", url: "https://deno.com/"},
-];
 </script>
 
 <template>
@@ -48,10 +43,7 @@ const requiredToolLinks = [
           <span class="about-icon" aria-hidden="true">
             <ElIcon :size="19"><Download/></ElIcon>
           </span>
-          <div>
-            <h3>EasyVideoDownload</h3>
-            <p>{{ t("settings.about.tagline") }}</p>
-          </div>
+          <h3>EasyVideoDownload</h3>
         </div>
 
         <dl class="about-details">
@@ -59,21 +51,7 @@ const requiredToolLinks = [
             <dt>{{ t("settings.about.version") }}</dt>
             <dd>v{{ version }}</dd>
           </div>
-          <div>
-            <dt>{{ t("settings.about.platforms") }}</dt>
-            <dd>Windows / macOS / Linux</dd>
-          </div>
         </dl>
-
-        <nav class="about-links" :aria-label="t('settings.about.links')">
-          <a
-              v-for="link in requiredToolLinks"
-              :key="link.name"
-              :href="link.url"
-              target="_blank"
-              rel="noopener noreferrer"
-          >{{ link.name }}</a>
-        </nav>
       </div>
     </section>
   </div>
@@ -139,6 +117,10 @@ const requiredToolLinks = [
 }
 
 .about-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
   padding: 22px;
   border: 1px solid var(--app-border);
   border-radius: var(--app-radius);
@@ -149,7 +131,6 @@ const requiredToolLinks = [
   display: flex;
   align-items: center;
   gap: 12px;
-  margin-bottom: 22px;
 }
 
 .about-icon {
@@ -169,12 +150,6 @@ const requiredToolLinks = [
   font-weight: 600;
 }
 
-.about-brand p {
-  margin: 4px 0 0;
-  color: var(--app-text-secondary);
-  font-size: 12px;
-}
-
 .about-details {
   margin: 0;
   font-size: 12px;
@@ -182,10 +157,8 @@ const requiredToolLinks = [
 
 .about-details > div {
   display: flex;
-  justify-content: space-between;
-  gap: 20px;
-  padding: 14px 0;
-  border-top: 1px solid var(--app-border);
+  align-items: baseline;
+  gap: 8px;
 }
 
 .about-details dt {
@@ -198,33 +171,15 @@ const requiredToolLinks = [
   text-align: right;
 }
 
-.about-links {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 20px;
-  margin-top: 16px;
-  font-size: 12px;
-}
-
-.about-links a:hover {
-  text-decoration: underline;
-}
-
-.about-links a:focus-visible {
-  outline: 2px solid var(--app-accent);
-  outline-offset: 4px;
-  border-radius: 2px;
-}
-
 @media (max-width: 800px) {
   .section-heading {
     flex-wrap: wrap;
     gap: 12px;
   }
 
-  .about-details > div {
+  .about-card {
     flex-wrap: wrap;
-    gap: 8px;
+    gap: 16px;
   }
 }
 </style>

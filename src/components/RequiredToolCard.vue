@@ -1,13 +1,20 @@
 <script setup lang="ts">
 import {computed} from "vue";
-import {ElButton, ElInput, ElOption, ElSelect} from "element-plus";
-import {FolderOpened} from "@element-plus/icons-vue";
+import {ElButton, ElIcon, ElInput, ElMessage, ElOption, ElSelect} from "element-plus";
+import {FolderOpened, TopRight} from "@element-plus/icons-vue";
+import {isTauri} from "@tauri-apps/api/core";
+import {openUrl} from "@tauri-apps/plugin-opener";
 import {useI18n} from "vue-i18n";
 import type {RequiredToolId, RequiredToolSource, RequiredToolState} from "../composables/useRequiredTools";
 
 const props = defineProps<{ toolId: RequiredToolId; state: RequiredToolState; ready: boolean }>();
 const emit = defineEmits<{ check: []; choose: []; sourceChange: [source: RequiredToolSource] }>();
 const {t} = useI18n({useScope: "global"});
+const toolWebsites: Record<RequiredToolId, string> = {
+  ytdlp: "https://github.com/yt-dlp/yt-dlp",
+  ffmpeg: "https://ffmpeg.org/",
+  deno: "https://deno.com/",
+};
 const isDirectory = computed(() => props.toolId === "ffmpeg");
 const locked = computed(() => !props.ready || props.state.operation !== null);
 const draft = computed(() => props.state.active && (props.state.source !== props.state.active.source || (props.state.source === "manual" && props.state.manualPath.trim() !== props.state.active.manualPath)));
@@ -15,6 +22,16 @@ const status = computed(() => props.state.operation === "checking" ? "checking" 
 
 function sourceChanged(value: unknown) {
   if (value === "path" || value === "manual") emit("sourceChange", value);
+}
+
+async function openWebsite(event: MouseEvent) {
+  if (!isTauri()) return;
+  event.preventDefault();
+  try {
+    await openUrl(toolWebsites[props.toolId]);
+  } catch {
+    ElMessage.error(t("settings.requiredTools.websiteOpenFailed", {url: toolWebsites[props.toolId]}));
+  }
 }
 </script>
 
@@ -25,6 +42,15 @@ function sourceChanged(value: unknown) {
       <div class="required-tool-summary">
         <div class="required-tool-title-row">
           <h3 :id="`required-tool-title-${toolId}`">{{ t(`settings.requiredTools.${toolId}.name`) }}</h3>
+          <a
+              class="tool-website"
+              :href="toolWebsites[toolId]"
+              target="_blank"
+              rel="noopener noreferrer"
+              :title="t('settings.requiredTools.officialWebsite', { program: t(`settings.requiredTools.${toolId}.name`) })"
+              :aria-label="t('settings.requiredTools.officialWebsite', { program: t(`settings.requiredTools.${toolId}.name`) })"
+              @click="openWebsite"
+          ><ElIcon :size="13" aria-hidden="true"><TopRight/></ElIcon></a>
           <span class="required-tool-status" :class="`status-${status}`" role="status">
             <span class="status-dot" aria-hidden="true"></span>
             {{ t(`settings.requiredTools.${status}`) }}
@@ -135,6 +161,27 @@ function sourceChanged(value: unknown) {
   font-size: 14px;
   font-weight: 600;
   line-height: 1.5;
+}
+
+.tool-website {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  border-radius: 4px;
+  color: var(--app-text-muted);
+}
+
+.tool-website:hover {
+  background: var(--app-accent-soft);
+  color: var(--app-accent);
+}
+
+.tool-website:focus-visible {
+  outline: 2px solid var(--app-accent);
+  outline-offset: 2px;
 }
 
 .required-tool-heading p {

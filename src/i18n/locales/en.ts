@@ -40,6 +40,8 @@ const en = {
             checkAll: "Check all",
             check: "Check",
             checkLabel: "Check {program}",
+            officialWebsite: "Visit the {program} website",
+            websiteOpenFailed: "Could not open the website. Visit it in your browser: {url}",
             installed: "Installed",
             missing: "Not found",
             unavailable: "Unavailable",
@@ -92,10 +94,7 @@ const en = {
         },
         about: {
             title: "About",
-            tagline: "Save simply, one video at a time.",
             version: "Current version",
-            platforms: "Target platforms",
-            links: "Official tool websites",
         },
     },
     languages: {

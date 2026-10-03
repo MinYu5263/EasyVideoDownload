@@ -5,6 +5,7 @@ import "element-plus/es/components/empty/style/css";
 import "element-plus/es/components/icon/style/css";
 import "element-plus/es/components/menu/style/css";
 import "element-plus/es/components/menu-item/style/css";
+import "element-plus/es/components/message/style/css";
 import "element-plus/es/components/select/style/css";
 import "element-plus/es/components/option/style/css";
 import "element-plus/es/components/button/style/css";
