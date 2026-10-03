@@ -1,18 +1,18 @@
 <script setup lang="ts">
 import {ElButton, ElIcon} from "element-plus";
-import {Download, InfoFilled, Refresh} from "@element-plus/icons-vue";
+import {Download, Refresh} from "@element-plus/icons-vue";
 import {useI18n} from "vue-i18n";
 import {version} from "../../package.json";
 import LanguageSettings from "./LanguageSettings.vue";
-import ToolSettingsCard from "./ToolSettingsCard.vue";
+import RequiredToolCard from "./RequiredToolCard.vue";
+import {toolIds, useRequiredTools} from "../composables/useRequiredTools";
 
 const {t} = useI18n({useScope: "global"});
-const toolIds = ["ytdlp", "ffmpeg", "runtime"] as const;
-const toolLinks = [
+const {desktop, ready, loadError, tools, busy, check, choose, changeSource, checkAll} = useRequiredTools();
+const requiredToolLinks = [
   {name: "yt-dlp", url: "https://github.com/yt-dlp/yt-dlp"},
   {name: "FFmpeg", url: "https://ffmpeg.org/"},
   {name: "Deno", url: "https://deno.com/"},
-  {name: "Node.js", url: "https://nodejs.org/"},
 ];
 </script>
 
@@ -20,26 +20,24 @@ const toolLinks = [
   <div class="settings-page">
     <LanguageSettings/>
 
-    <section class="tools-section" aria-labelledby="required-tools-title">
+    <section class="required-tools-section" aria-labelledby="required-tools-title">
       <header class="section-heading">
         <div>
-          <h2 id="required-tools-title">{{ t("settings.tools.title") }}</h2>
-          <p>{{ t("settings.tools.description") }}</p>
+          <h2 id="required-tools-title">{{ t("settings.requiredTools.title") }}</h2>
         </div>
-        <ElButton :icon="Refresh" disabled :title="t('settings.tools.previewNotice')">
-          {{ t("settings.tools.detectAll") }}
+        <ElButton :icon="Refresh" :disabled="!ready || busy" :loading="busy" @click="checkAll">
+          {{ t("settings.requiredTools.checkAll") }}
         </ElButton>
       </header>
 
-      <div class="tool-list">
-        <ToolSettingsCard v-for="toolId in toolIds" :key="toolId" :tool-id="toolId"/>
+      <div class="required-tool-list">
+        <RequiredToolCard v-for="toolId in toolIds" :key="toolId" :tool-id="toolId" :state="tools[toolId]" :ready="ready" @check="check(toolId)" @choose="choose(toolId)" @source-change="changeSource(toolId, $event)"/>
       </div>
 
-      <p class="tools-notice">
-        <ElIcon aria-hidden="true">
-          <InfoFilled/>
-        </ElIcon>
-        <span>{{ t("settings.tools.previewNotice") }}</span>
+      <p v-if="!desktop" class="required-tool-notice">{{ t('settings.requiredTools.desktopOnly') }}</p>
+      <p v-if="loadError" class="load-error" role="alert">
+        {{ t(`settings.requiredTools.errors.${loadError.code}`) }}
+        <span v-if="loadError.detail">{{ loadError.detail }}</span>
       </p>
     </section>
 
@@ -69,7 +67,7 @@ const toolLinks = [
 
         <nav class="about-links" :aria-label="t('settings.about.links')">
           <a
-              v-for="link in toolLinks"
+              v-for="link in requiredToolLinks"
               :key="link.name"
               :href="link.url"
               target="_blank"
@@ -117,13 +115,13 @@ const toolLinks = [
   font-size: 12px;
 }
 
-.tool-list {
+.required-tool-list {
   display: flex;
   flex-direction: column;
   gap: 16px;
 }
 
-.tools-notice {
+.required-tool-notice {
   display: flex;
   align-items: flex-start;
   gap: 7px;
@@ -133,11 +131,8 @@ const toolLinks = [
   line-height: 1.7;
 }
 
-.tools-notice .el-icon {
-  flex-shrink: 0;
-  margin-top: 3px;
-  color: var(--app-text-muted);
-}
+.load-error { color: #a1392e; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.load-error span { display: block; }
 
 .about-section > h2 {
   margin-bottom: 18px;
