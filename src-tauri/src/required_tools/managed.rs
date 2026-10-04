@@ -21,7 +21,7 @@ fn asset(os: &str, arch: &str) -> Result<&'static str, RequiredToolError> {
         ("windows", "x86_64") => Ok("yt-dlp.exe"),
         ("windows", "x86") => Ok("yt-dlp_x86.exe"),
         ("windows", "aarch64") => Ok("yt-dlp_arm64.exe"),
-        ("macos", "x86_64" | "aarch64") => Ok("yt-dlp_macos"),
+        ("macos", "x86_64" | "aarch64") => Ok("yt-dlp_macos.zip"),
         _ => Err(error("automaticUnsupported", "yt-dlp", "")),
     }
 }
@@ -538,7 +538,12 @@ async fn configure(
     // Recheck installed copies without downloading on a transient timeout.
     // Permanently invalid copies can still be repaired by automatic setup.
     let target = tool_directory(id, &state.storage)?;
-    if target.try_exists().map_err(|e| error("readFailed", "", e))? {
+    if *receiver.borrow() {
+        return apply_result(state, &request, Err(error("configureCancelled", "", ""))).await;
+    }
+    if target.try_exists().map_err(|e| error("readFailed", "", e))?
+        && downloads::reusable_layout(id, &target)
+    {
         match detect_path_with_cancel(id, &target, Some(receiver.clone())).await {
             Ok(existing) => {
                 cancellation.begin_commit(id, &receiver)?;
@@ -554,6 +559,14 @@ async fn configure(
     // Only complete, integrity-checked downloads enter this retry cache. Keep
     // them separate from active tools until native execution checks succeed.
     let pending = installation.target.with_extension("pending");
+    // Retire only an obsolete application-owned pending layout. The installed
+    // copy remains untouched until the replacement passes native validation.
+    if pending.try_exists().map_err(|e| error("readFailed", "", e))?
+        && !downloads::reusable_layout(id, &pending)
+    {
+        std::fs::rename(&pending, installation.directory.as_ref().unwrap().path().join("obsolete-pending"))
+            .map_err(|e| error("configureWriteFailed", "", e))?;
+    }
     let downloaded = if pending.try_exists().map_err(|e| error("readFailed", "", e))? {
         Ok(())
     } else {
@@ -724,7 +737,9 @@ mod tests {
         if !supported(id) { return; }
         let target = tool_directory(id, &storage).unwrap();
         let pending = target.with_extension("pending");
-        std::fs::create_dir_all(&pending).unwrap();
+        std::fs::create_dir_all(pending.join("_internal")).unwrap();
+        std::fs::write(pending.join("_internal/Python"), b"runtime fixture").unwrap();
+        std::fs::write(pending.join("_internal/base_library.zip"), b"stdlib fixture").unwrap();
         let program = pending.join("yt-dlp");
         std::fs::write(&program, "#!/bin/sh\nexit 7\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -744,6 +759,40 @@ mod tests {
         assert!(result.error.is_none(), "{:?}", result.error);
         assert!(result.active.unwrap().programs[0].path.is_file());
         assert!(!pending.exists());
+        root.close().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn old_single_file_is_replaced_by_a_validated_pending_bundle() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        eprintln!("bundle migration test: {}", root.path().display());
+        let storage = Storage::new(&root.path().join("app.db"), &root.path().join("legacy.json"));
+        let id = RequiredToolId::Ytdlp;
+        let target = tool_directory(id, &storage).unwrap();
+        let pending = target.with_extension("pending");
+        for (directory, version) in [(&target, "2024.01.01"), (&pending, "2026.09.25")] {
+            std::fs::create_dir_all(directory).unwrap();
+            let program = directory.join("yt-dlp");
+            std::fs::write(&program, format!("#!/bin/sh\ncase \"$2\" in\n--version) echo {version};;\n*) echo 'Usage: yt-dlp [OPTIONS] URL'; echo '--ignore-config --extractor-args';;\nesac\n")).unwrap();
+            std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::create_dir_all(pending.join("_internal")).unwrap();
+        std::fs::write(pending.join("_internal/Python"), b"runtime").unwrap();
+        std::fs::write(pending.join("_internal/base_library.zip"), b"stdlib").unwrap();
+        assert!(!downloads::reusable_layout(id, &target));
+        let state = RequiredToolManager::new(storage.clone());
+        let result = configure(id, &state, &ConfigureManager::default(), |p| {
+            assert_ne!(p.phase, "preparing", "must reuse complete pending bundle");
+        }).await.unwrap();
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(result.active.unwrap().programs[0].version, "2026.09.25");
+        assert_eq!(std::fs::read(target.join("_internal/Python")).unwrap(), b"runtime");
+        assert!(downloads::reusable_layout(id, &target));
+        assert!(!pending.exists());
+        let result = configure(id, &state, &ConfigureManager::default(), |p| assert_ne!(p.phase, "preparing")).await.unwrap();
+        assert!(result.error.is_none());
         root.close().unwrap();
     }
 
@@ -968,8 +1017,8 @@ mod tests {
         for (os, arch, expected) in [
             ("windows", "x86_64", "yt-dlp.exe"),
             ("windows", "aarch64", "yt-dlp_arm64.exe"),
-            ("macos", "x86_64", "yt-dlp_macos"),
-            ("macos", "aarch64", "yt-dlp_macos"),
+            ("macos", "x86_64", "yt-dlp_macos.zip"),
+            ("macos", "aarch64", "yt-dlp_macos.zip"),
         ] {
             assert_eq!(asset(os, arch).unwrap(), expected);
         }
@@ -1101,6 +1150,7 @@ mod tests {
             .env_remove("PYTHONHOME")
             .env_remove("PYTHONPATH")
             .args(["--ignore-config", "--version"]);
+        let startup = std::time::Instant::now();
         assert_eq!(
             collect_output(without_python, Duration::from_secs(10))
                 .await
@@ -1108,5 +1158,7 @@ mod tests {
                 .trim(),
             active.programs[0].version
         );
+        eprintln!("installed yt-dlp --version (without system Python): {:?}", startup.elapsed());
+        root.close().unwrap();
     }
 }

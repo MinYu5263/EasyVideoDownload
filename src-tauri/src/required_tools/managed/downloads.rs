@@ -1,5 +1,10 @@
 use super::*;
 use std::io::Read;
+mod macos_bundle;
+
+pub(super) fn reusable_layout(id: RequiredToolId, directory: &Path) -> bool {
+    !cfg!(target_os = "macos") || id != RequiredToolId::Ytdlp || macos_bundle::complete(directory)
+}
 
 const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 const MAX_EXECUTABLE: u64 = 256 * 1024 * 1024;
@@ -57,12 +62,23 @@ fn extract_zip(
     names: &[String],
     cancellation: &watch::Receiver<bool>,
 ) -> Result<(), RequiredToolError> {
+    extract_zip_layout(archive, destination, names, cancellation, false)
+}
+
+fn extract_zip_layout(
+    archive: &Path,
+    destination: &Path,
+    names: &[String],
+    cancellation: &watch::Receiver<bool>,
+    bundle: bool,
+) -> Result<(), RequiredToolError> {
     let file = std::fs::File::open(archive).map_err(|e| error("configureWriteFailed", "", e))?;
     let mut zip = zip::ZipArchive::new(file).map_err(invalid)?;
     if zip.len() > 4096 {
         return Err(invalid("too many archive entries"));
     }
     let mut found = std::collections::BTreeSet::new();
+    let mut expanded = 0u64;
     for index in 0..zip.len() {
         if *cancellation.borrow() {
             return Err(error("configureCancelled", "", ""));
@@ -81,18 +97,34 @@ fn extract_zip(
         let Some(name) = enclosed.file_name().and_then(|value| value.to_str()) else {
             continue;
         };
-        if !names.iter().any(|expected| expected == name) {
-            continue;
-        }
-        if !found.insert(name.to_owned()) {
+        let relative = if bundle {
+            if enclosed == Path::new("yt-dlp_macos") {
+                PathBuf::from("yt-dlp")
+            } else if enclosed.starts_with("_internal") {
+                enclosed.to_path_buf()
+            } else {
+                return Err(invalid("unexpected bundle entry"));
+            }
+        } else {
+            if !names.iter().any(|expected| expected == name) {
+                continue;
+            }
+            PathBuf::from(name)
+        };
+        if !found.insert(relative.clone()) {
             return Err(invalid("duplicate executable"));
         }
-        if entry.size() == 0 || entry.size() > MAX_EXECUTABLE {
+        expanded = expanded.saturating_add(entry.size());
+        if (!bundle && entry.size() == 0) || entry.size() > MAX_EXECUTABLE
+            || expanded > 512 * 1024 * 1024
+        {
             return Err(invalid("invalid executable size"));
         }
-        let path = destination.join(name);
-        let mut output =
-            std::fs::File::create(&path).map_err(|e| error("configureWriteFailed", "", e))?;
+        let path = destination.join(&relative);
+        std::fs::create_dir_all(path.parent().unwrap())
+            .map_err(|e| error("configureWriteFailed", "", e))?;
+        let mut output = std::fs::OpenOptions::new().write(true).create_new(true)
+            .open(&path).map_err(|e| error("configureWriteFailed", "", e))?;
         let mut copied = 0u64;
         let mut buffer = [0u8; 64 * 1024];
         loop {
@@ -104,7 +136,7 @@ fn extract_zip(
                 break;
             }
             copied += count as u64;
-            if copied > MAX_EXECUTABLE {
+            if copied > MAX_EXECUTABLE || copied > entry.size() {
                 return Err(invalid("executable too large"));
             }
             output
@@ -121,7 +153,11 @@ fn extract_zip(
                 .map_err(|e| error("configureWriteFailed", "", e))?;
         }
     }
-    if found.len() != names.len() {
+    if bundle {
+        if !macos_bundle::complete(destination) {
+            return Err(invalid("incomplete macOS yt-dlp bundle"));
+        }
+    } else if found.len() != names.len() {
         return Err(invalid("missing executable"));
     }
     Ok(())
@@ -356,6 +392,9 @@ pub(super) async fn download_tool(
         total: None,
     });
     match id {
+        RequiredToolId::Ytdlp if cfg!(target_os = "macos") => {
+            macos_bundle::download(client, destination, progress, cancellation).await
+        }
         RequiredToolId::Ytdlp => {
             download_ytdlp(
                 client,

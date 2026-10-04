@@ -35,7 +35,8 @@ const currentConfig = computed(() => {
 });
 const visibleError = computed(() => automatic.value && props.state.error?.code === "notFound" ? null : props.state.error);
 const managedReady = computed(() => currentConfig.value?.source === "automatic");
-const needsConfiguration = computed(() => automatic.value && !managedReady.value);
+// Automatic setup reuses current bundles and upgrades obsolete managed layouts.
+const needsConfiguration = computed(() => automatic.value);
 const status = computed(() => {
   if (props.state.operation === "configuring") return "configuring";
   if (props.state.operation === "checking") return "checking";
