@@ -471,7 +471,7 @@ const zhCN = {
                 denoTooOld: "Deno 版本过低，需要 2.3.0 或更高版本。",
                 spawnFailed: "无法启动 {program}，请检查路径、权限和程序依赖。",
                 exitFailed: "{program} 执行失败，请查看错误详情。",
-                timeout: "{program} 检测超过 10 秒，已终止本次检测。",
+                timeout: "{program} 运行检测超时，已终止本次检测。可重试；具体命令和时限见错误详情。",
                 outputTooLarge: "{program} 输出异常，超过 64 KiB 上限。",
                 readFailed: "无法读取 {program} 的检测结果。",
                 saveFailed: "配置保存失败，本次配置未应用。",

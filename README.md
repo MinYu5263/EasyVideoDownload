@@ -103,6 +103,8 @@ Tauri 构建会自动执行 `pnpm build`，安装包输出到 `src-tauri/target/
 
 主图标维护在 `src/assets/app-icon.svg`。`pnpm icons` 生成 PNG、ICO 和 ICNS，保存至被忽略的
 `src-tauri/target/generated-icons/`；首次构建、清理 Cargo 构建目录或更新 SVG 后需重新生成，Cargo 和 Vite 不会自动生成桌面图标。
+其中 ICNS 使用单独适配的 macOS 圆角和留白，`macos-icon.png` 可用于预览；界面 SVG 和其他平台图标保持原样。
+修改 SVG 的底板结构时，需要同步调整生成脚本中的 macOS 适配逻辑。预览图不包含系统效果，最终外观需在重新打包后的 Finder、Dock 中确认。
 
 ## 项目结构
 

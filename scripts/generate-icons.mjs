@@ -2,16 +2,32 @@ import {mkdir, mkdtemp, readFile, realpath, rm, writeFile} from "node:fs/promise
 import {dirname, isAbsolute, join, relative, resolve, sep} from "node:path";
 import {fileURLToPath} from "node:url";
 import {createHash} from "node:crypto";
-import {run} from "@tauri-apps/cli";
+import {spawn} from "node:child_process";
+import {createRequire} from "node:module";
+
+const tauriCli = createRequire(import.meta.url).resolve("@tauri-apps/cli/tauri.js");
+// The native CLI initializes a process-wide logger, so each invocation needs
+// its own process when generating both the standard and macOS icon sets.
+function generateIcons(source, output) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [tauriCli, "icon", source, "--output", output], {stdio: "inherit"});
+        child.once("error", reject);
+        child.once("close", (code, signal) => {
+            if (code === 0) resolve();
+            else reject(new Error(`Icon generation failed (${signal ?? code}): ${source}`));
+        });
+    });
+}
 
 const projectRoot = await realpath(resolve(dirname(fileURLToPath(import.meta.url)), ".."));
 const sourceIcon = join(projectRoot, "src", "assets", "app-icon.svg");
 const targetDirectory = join(projectRoot, "src-tauri", "target");
 const iconDirectory = join(targetDirectory, "generated-icons");
-const iconFiles = ["32x32.png", "128x128.png", "128x128@2x.png", "icon.png", "icon.ico", "icon.icns"];
+const iconFiles = ["32x32.png", "128x128.png", "128x128@2x.png", "icon.png", "icon.ico", "icon.icns", "macos-icon.png"];
+const sourceBytes = await readFile(sourceIcon);
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const sourceDigest = digest(Buffer.concat([
-    await readFile(sourceIcon),
+    sourceBytes,
     await readFile(fileURLToPath(import.meta.url)),
 ]));
 
@@ -44,16 +60,38 @@ if (upToDate) {
 }
 
 if (upToDate) {
-    console.log("Desktop icons match src/assets/app-icon.svg.");
+    console.log("Desktop icons, including the macOS variant, are up to date.");
 } else {
     const temporaryDirectory = await mkdtemp(join(resolvedTarget, "icon-generation-"));
     console.log(`Generating desktop icons from src/assets/app-icon.svg (temporary output: ${temporaryDirectory})`);
     try {
-        await run(["icon", sourceIcon, "--output", temporaryDirectory]);
+        // Derive a macOS-only tile: 824px artwork on a 1024px canvas, with
+        // 185px rounded corners. Keep the source SVG and other platforms intact.
+        // This adapts legacy ICNS geometry; Tahoe's final presentation must still
+        // be checked in Finder/Dock rather than inferred from this PNG preview.
+        const sourceSvg = sourceBytes.toString("utf8");
+        const background = /<rect\s+x="12"\s+y="12"\s+width="232"\s+height="232"\s+rx="24"\s+fill="([^"]+)"\s*\/>/g;
+        const matches = [...sourceSvg.matchAll(background)];
+        if (matches.length !== 1 || !sourceSvg.includes('viewBox="0 0 256 256"')) {
+            throw new Error("App icon geometry changed; update the macOS icon adaptation before generating icons.");
+        }
+        const scale = 206 / 232;
+        const macosSvg = sourceSvg.replace(background, (_, fill) =>
+            `<rect x="25" y="25" width="206" height="206" rx="46.25" fill="${fill}"/>\n` +
+            `<g transform="translate(128 128) scale(${scale}) translate(-128 -128)">`
+        ).replace("</svg>", "</g>\n</svg>");
+        const macosSource = join(temporaryDirectory, "macos.svg");
+        const macosOutput = join(temporaryDirectory, "macos");
+        await writeFile(macosSource, macosSvg);
+        await generateIcons(sourceIcon, temporaryDirectory);
+        await generateIcons(macosSource, macosOutput);
         await mkdir(iconDirectory, {recursive: true});
         const files = {};
         for (const name of iconFiles) {
-            const generated = await readFile(join(temporaryDirectory, name));
+            const generatedPath = name === "icon.icns" ? join(macosOutput, name)
+                : name === "macos-icon.png" ? join(macosOutput, "icon.png")
+                : join(temporaryDirectory, name);
+            const generated = await readFile(generatedPath);
             const destination = join(iconDirectory, name);
             let previous;
             try {

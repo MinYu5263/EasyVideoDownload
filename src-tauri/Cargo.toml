@@ -27,7 +27,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-notification = "2"
 url = "2"
-reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "socks"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "socks", "system-proxy"] }
 tokio = { version = "1", features = ["process", "io-util", "time", "sync", "macros"] }
 which = "8"
 tempfile = "3"

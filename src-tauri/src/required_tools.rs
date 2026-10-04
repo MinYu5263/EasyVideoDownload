@@ -370,6 +370,7 @@ async fn collect_output_with_cancel(
     {
         return Err(error("configureCancelled", "", ""));
     }
+    let diagnostic_command = format!("{:?}", command.as_std());
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -421,7 +422,11 @@ async fn collect_output_with_cancel(
             let _ = child.wait().await;
             Err(match failure {
                 Some(Ok(Err(e))) => e,
-                Some(Err(_)) => error("timeout", "", "10 seconds"),
+                Some(Err(_)) => error(
+                    "timeout",
+                    "",
+                    format!("Command: {diagnostic_command}\nTimeout: {} ms", limit.as_millis()),
+                ),
                 None => error("configureCancelled", "", ""),
                 _ => unreachable!(),
             })
@@ -454,6 +459,12 @@ async fn detect_with_cancel(
 ) -> Result<RequiredToolConfig, RequiredToolError> {
     let mut programs = Vec::new();
     for (name, path) in resolve_programs(request)? {
+        // The macOS standalone build may need substantially longer on startup.
+        let limit = Duration::from_secs(if cfg!(target_os = "macos") && name == "yt-dlp" {
+            60
+        } else {
+            10
+        });
         let mut command = tokio::process::Command::new(&path);
         if name == "yt-dlp" {
             command.arg("--ignore-config");
@@ -464,7 +475,7 @@ async fn detect_with_cancel(
             "--version"
         });
         let output =
-            collect_output_with_cancel(command, Duration::from_secs(10), cancellation.clone())
+            collect_output_with_cancel(command, limit, cancellation.clone())
                 .await
                 .map_err(|mut e| {
                     e.program = name.clone();
@@ -474,7 +485,7 @@ async fn detect_with_cancel(
         let identity_output = if name == "yt-dlp" {
             let mut help = tokio::process::Command::new(&path);
             help.args(["--ignore-config", "--help"]);
-            collect_output_with_cancel(help, Duration::from_secs(10), cancellation.clone())
+            collect_output_with_cancel(help, limit, cancellation.clone())
                 .await
                 .map_err(|mut e| {
                     e.program = name.clone();
@@ -1307,7 +1318,10 @@ mod tests {
         let mut command = fixture("sleep");
         command.env("EVD_TEST_MARKER", &marker);
         let result = collect_output(command, std::time::Duration::from_millis(150)).await;
-        assert_eq!(result.unwrap_err().code, "timeout");
+        let failure = result.unwrap_err();
+        assert_eq!(failure.code, "timeout");
+        assert!(failure.detail.contains("150 ms"), "{}", failure.detail);
+        assert!(failure.detail.contains("process_fixture"), "{}", failure.detail);
         tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
         assert!(!marker.exists(), "timed-out process was left running");
     }

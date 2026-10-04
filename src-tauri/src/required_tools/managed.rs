@@ -216,8 +216,9 @@ async fn client(
     };
     let saved = proxy::saved_proxy(storage).await.map_err(storage_error)?;
     let available = download_proxy(saved, target).await;
+    // With no usable app proxy, preserve the process environment and native
+    // system proxy settings. An explicit proxy below takes precedence.
     let mut builder = reqwest::Client::builder()
-        .no_proxy()
         .https_only(true)
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(300))
@@ -506,10 +507,6 @@ async fn configure(
         source: RequiredToolSource::Automatic,
         manual_path: String::new(),
     };
-    // A usable application-managed copy is reused without a network request.
-    if let Ok(existing) = detect_managed(id, &state.storage).await {
-        return apply_result(state, &request, Ok(existing)).await;
-    }
     let (sender, mut receiver) = watch::channel(false);
     {
         let mut cancel = cancellation.cancel[id.index()]
@@ -533,20 +530,52 @@ async fn configure(
         *cancel = Some(sender);
     }
     let _active = ActiveConfigure(cancellation, id);
-    let mut installation = Installation::new(tool_directory(id, &state.storage)?)?;
     progress(ConfigureProgress {
-        phase: "preparing",
+        phase: "checking",
         downloaded: 0,
         total: None,
     });
-    let download_cancel = receiver.clone();
-    let downloaded = tokio::select! {
-        biased;
-        _ = receiver.changed() => Err(error("configureCancelled", "yt-dlp", "")),
-        result = async {
-            let http = client(&state.storage, id).await?;
-            downloads::download_tool(id, &http, &installation.staged(), &progress, &download_cancel).await
-        } => result,
+    // Recheck installed copies without downloading on a transient timeout.
+    // Permanently invalid copies can still be repaired by automatic setup.
+    let target = tool_directory(id, &state.storage)?;
+    if target.try_exists().map_err(|e| error("readFailed", "", e))? {
+        match detect_path_with_cancel(id, &target, Some(receiver.clone())).await {
+            Ok(existing) => {
+                cancellation.begin_commit(id, &receiver)?;
+                return apply_result(state, &request, Ok(existing)).await;
+            }
+            Err(failure) if matches!(failure.code.as_str(), "timeout" | "configureCancelled" | "readFailed") => {
+                return apply_result(state, &request, Err(failure)).await;
+            }
+            Err(_) => {},
+        }
+    }
+    let mut installation = Installation::new(tool_directory(id, &state.storage)?)?;
+    // Only complete, integrity-checked downloads enter this retry cache. Keep
+    // them separate from active tools until native execution checks succeed.
+    let pending = installation.target.with_extension("pending");
+    let downloaded = if pending.try_exists().map_err(|e| error("readFailed", "", e))? {
+        Ok(())
+    } else {
+        progress(ConfigureProgress {
+            phase: "preparing",
+            downloaded: 0,
+            total: None,
+        });
+        let download_cancel = receiver.clone();
+        let result = tokio::select! {
+            biased;
+            _ = receiver.changed() => Err(error("configureCancelled", "", "")),
+            result = async {
+                let http = client(&state.storage, id).await?;
+                downloads::download_tool(id, &http, &installation.staged(), &progress, &download_cancel).await
+            } => result,
+        };
+        if result.is_ok() {
+            std::fs::rename(installation.staged(), &pending)
+                .map_err(|e| error("configureWriteFailed", "", e))?;
+        }
+        result
     };
     let candidate = match downloaded {
         Ok(()) => {
@@ -555,8 +584,9 @@ async fn configure(
                 downloaded: 0,
                 total: None,
             });
-            // The collector kills and waits before staging can be removed on Windows.
-            detect_path_with_cancel(id, &installation.staged(), Some(receiver.clone())).await
+            // Keep the path stable across retries and restarts. The collector kills
+            // and waits before the verified directory can be moved on Windows.
+            detect_path_with_cancel(id, &pending, Some(receiver.clone())).await
         }
         Err(failure) => Err(failure),
     };
@@ -577,6 +607,12 @@ async fn configure(
         total: None,
     });
     let _publication = state.usage.publication(&installation.target)?;
+    if installation.staged().exists() {
+        std::fs::remove_dir(installation.staged())
+            .map_err(|e| error("configureWriteFailed", "", e))?;
+    }
+    std::fs::rename(&pending, installation.staged())
+        .map_err(|e| error("configureWriteFailed", "", e))?;
     installation.publish()?;
     for program in &mut config.programs {
         program.path = installation.target.join(executable_name(&program.name));
@@ -636,6 +672,80 @@ mod tests {
         assert!(manager.begin_job().is_ok());
     }
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installed_tool_recheck_can_be_cancelled_without_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        eprintln!("cancel-recheck test directory: {}", root.path().display());
+        let storage = Storage::new(&root.path().join("app.db"), &root.path().join("legacy.json"));
+        let id = RequiredToolId::Ytdlp;
+        if !supported(id) { return; }
+        let target = tool_directory(id, &storage).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let program = target.join("yt-dlp");
+        let contents = b"#!/bin/sh\nsleep 60\n";
+        std::fs::write(&program, contents).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = RequiredToolManager::new(storage);
+        let cancellation = ConfigureManager::default();
+        let result = tokio::time::timeout(Duration::from_secs(3), configure(id, &state, &cancellation, |p| {
+            assert_eq!(p.phase, "checking");
+            assert!(cancellation.cancel(id).unwrap());
+        })).await.unwrap().unwrap();
+        assert_eq!(result.error.unwrap().code, "configureCancelled");
+        assert_eq!(std::fs::read(program).unwrap(), contents);
+        root.close().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_ytdlp_check_allows_slow_startup() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        eprintln!("slow-start test directory: {}", root.path().display());
+        let program = root.path().join("yt-dlp");
+        std::fs::write(&program, "#!/bin/sh\ncase \"$2\" in\n--version) sleep 11; echo 2026.09.25;;\n*) echo 'Usage: yt-dlp [OPTIONS] URL'; echo '--ignore-config --extractor-args';;\nesac\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = detect_path_with_cancel(RequiredToolId::Ytdlp, root.path(), None).await;
+        assert!(result.is_ok(), "{result:?}");
+        root.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_download_is_rechecked_after_failure_and_restart_without_network() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        eprintln!("retry test directory: {}", root.path().display());
+        let storage = Storage::new(&root.path().join("app.db"), &root.path().join("legacy.json"));
+        let id = RequiredToolId::Ytdlp;
+        if !supported(id) { return; }
+        let target = tool_directory(id, &storage).unwrap();
+        let pending = target.with_extension("pending");
+        std::fs::create_dir_all(&pending).unwrap();
+        let program = pending.join("yt-dlp");
+        std::fs::write(&program, "#!/bin/sh\nexit 7\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = RequiredToolManager::new(storage.clone());
+        let result = tokio::time::timeout(Duration::from_secs(3), configure(id, &state, &ConfigureManager::default(), |p| {
+            assert_ne!(p.phase, "preparing", "retry must not enter download preparation");
+        })).await.unwrap().unwrap();
+        assert_eq!(result.error.unwrap().code, "exitFailed");
+        assert!(program.is_file());
+        assert!(!target.exists());
+        assert!(state.settings_snapshot().unwrap().tools.is_empty());
+        std::fs::write(&program, "#!/bin/sh\ncase \"$2\" in\n--version) echo 2026.09.25;;\n*) echo 'Usage: yt-dlp [OPTIONS] URL'; echo '--ignore-config --extractor-args';;\nesac\n").unwrap();
+        let restarted = RequiredToolManager::new(storage);
+        let result = configure(id, &restarted, &ConfigureManager::default(), |p| {
+            assert_ne!(p.phase, "preparing");
+        }).await.unwrap();
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(result.active.unwrap().programs[0].path.is_file());
+        assert!(!pending.exists());
+        root.close().unwrap();
+    }
 
     #[tokio::test]
     async fn a_missing_managed_directory_or_program_is_not_an_invalid_manual_path() {
@@ -720,6 +830,50 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "child process fixture for isolated proxy environment"]
+    async fn environment_download_proxy_fixture() {
+        let root = tempfile::tempdir().unwrap();
+        eprintln!("environment proxy test directory: {}", root.path().display());
+        let storage = Storage::new(&root.path().join("app.db"), &root.path().join("legacy.json"));
+        if std::env::var("EVD_TEST_UNAVAILABLE_PROXY").is_ok() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let settings = proxy::ProxySettings {
+                protocol: "http".into(),
+                address: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+            };
+            drop(listener);
+            storage.database().unwrap().save_proxy_settings(Some(&settings)).unwrap();
+        }
+        let http = client(&storage, RequiredToolId::Ytdlp).await.unwrap();
+        // The test proxy deliberately rejects CONNECT, before any external TLS traffic.
+        assert!(http.get("https://download-source.invalid/release").send().await.is_err());
+        root.close().unwrap();
+    }
+
+    #[test]
+    fn missing_or_unavailable_app_proxy_preserves_environment_proxy() {
+        for unavailable in [false, true] {
+            let (settings, server) = proxy_response(502);
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "--exact",
+                "required_tools::managed::tests::environment_download_proxy_fixture",
+                "--ignored", "--nocapture",
+            ]);
+            for key in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"] {
+                child.env_remove(key);
+            }
+            child.env("HTTPS_PROXY", settings.url());
+            child.env_remove("EVD_TEST_UNAVAILABLE_PROXY");
+            if unavailable { child.env("EVD_TEST_UNAVAILABLE_PROXY", "1"); }
+            let output = child.output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(server.join().unwrap().starts_with("CONNECT download-source.invalid:443 HTTP/1.1\r\n"));
+        }
+    }
+
+    #[tokio::test]
     async fn automatic_downloads_use_only_a_working_configured_proxy() {
         for (status, accepted) in [(204, true), (302, true), (407, false), (503, false)] {
             let (settings, server) = proxy_response(status);
@@ -737,7 +891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_absent_or_unreachable_download_proxy_uses_direct_connection() {
+    async fn an_absent_or_unreachable_download_proxy_leaves_selection_to_the_environment() {
         assert!(
             download_proxy(None, "http://download-source.invalid/release")
                 .await

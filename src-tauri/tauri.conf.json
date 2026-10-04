@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "easyvideodownload",
+  "productName": "EasyVideoDownload",
   "version": "0.1.0",
   "identifier": "com.minyu.easyvideodownload",
   "build": {
@@ -31,6 +31,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "windows": {
+      "wix": {
+        "upgradeCode": "30a2acde-6f70-5b60-8293-d17ee28f83f7"
+      }
+    },
     "icon": [
       "target/generated-icons/32x32.png",
       "target/generated-icons/128x128.png",

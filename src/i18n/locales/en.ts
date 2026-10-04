@@ -488,7 +488,7 @@ const en = {
                 denoTooOld: "Deno 2.3.0 or later is required.",
                 spawnFailed: "Couldn't start {program}. Check its path, permissions, and dependencies.",
                 exitFailed: "{program} exited with an error. See the details below.",
-                timeout: "Checking {program} timed out after 10 seconds. Try again.",
+                timeout: "Checking {program} timed out and was stopped. Try again; see error details for the command and time limit.",
                 outputTooLarge: "{program} output exceeded the 64 KiB limit.",
                 readFailed: "Couldn't read the result from {program}. Try again.",
                 saveFailed: "Couldn't save the tool configuration. The new configuration wasn't applied.",
