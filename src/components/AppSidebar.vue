@@ -5,13 +5,7 @@ import {ElIcon, ElMenu, ElMenuItem} from "element-plus";
 import {type AppPageId, appPages} from "../navigation";
 import appIcon from "../assets/app-icon.svg?no-inline";
 
-const props = withDefaults(
-    defineProps<{
-      modelValue: AppPageId;
-      recordCount?: number;
-    }>(),
-    {recordCount: 0},
-);
+const props = defineProps<{ modelValue: AppPageId }>();
 
 const {t} = useI18n({useScope: "global"});
 
@@ -97,13 +91,6 @@ function handleMenuKeydown(event: KeyboardEvent) {
             <component :is="page.icon"/>
           </ElIcon>
           <span>{{ t(page.labelKey) }}</span>
-          <span
-              v-if="page.id === 'history'"
-              class="record-count"
-              :aria-label="t('navigation.recordCount', { count: recordCount }, recordCount)"
-          >
-            {{ recordCount }}
-          </span>
         </ElMenuItem>
       </ElMenu>
     </nav>
@@ -148,7 +135,7 @@ function handleMenuKeydown(event: KeyboardEvent) {
   --el-menu-bg-color: transparent;
   --el-menu-text-color: var(--app-text-secondary);
   --el-menu-active-color: var(--app-accent);
-  --el-menu-hover-bg-color: #f0f5f1;
+  --el-menu-hover-bg-color: var(--app-hover);
   --el-menu-item-height: 44px;
   --el-menu-base-level-padding: 14px;
 
@@ -176,19 +163,6 @@ function handleMenuKeydown(event: KeyboardEvent) {
 .sidebar-menu :deep(.el-menu-item:focus-visible) {
   outline: 2px solid var(--app-accent);
   outline-offset: -2px;
-}
-
-.record-count {
-  min-width: 22px;
-  margin-left: auto;
-  padding: 0 6px;
-  border-radius: 5px;
-  background: var(--app-surface);
-  color: var(--app-text-muted);
-  font-size: 11px;
-  font-weight: 400;
-  line-height: 20px;
-  text-align: center;
 }
 
 @media (max-width: 1000px) {

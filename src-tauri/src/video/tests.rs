@@ -73,6 +73,25 @@ fn missing_optional_metadata_is_not_fabricated() {
 }
 
 #[test]
+fn zero_duration_metadata_can_be_persisted_as_unknown() {
+    let mut source = sample();
+    source["duration"] = json!(0);
+    let video = parse_metadata(&serde_json::to_vec(&source).unwrap()).unwrap();
+    assert_eq!(video.duration, None);
+    let dir = tempfile::tempdir().unwrap();
+    eprintln!(
+        "temporary duration test directory: {}",
+        dir.path().display()
+    );
+    let db =
+        crate::database::Database::open(&dir.path().join("app.db"), &dir.path().join("legacy"))
+            .unwrap();
+    let mut page = crate::database::persistence_tests::page();
+    page.duration_seconds = video.duration;
+    db.save_download_page_state(&page).unwrap();
+}
+
+#[test]
 fn metadata_returns_exact_estimated_and_unknown_sizes_for_each_video_stream() {
     let mut source = sample();
     source["formats"] = json!([
@@ -296,10 +315,12 @@ fn command_preview_uses_shared_parser_options_and_managed_cookie_path_without_wr
         &store,
         CookiePlatform::Douyin,
         "分享 https://v.douyin.com/abc/，复制打开抖音",
+        None,
     )
     .unwrap();
     let path = store.path(CookiePlatform::Douyin);
-    let actual = parsing_command(&settings, "https://v.douyin.com/abc/", Some(&path)).unwrap();
+    let actual =
+        parsing_command(&settings, "https://v.douyin.com/abc/", Some(&path), None).unwrap();
     assert_eq!(
         preview.text,
         render_command(&actual, cfg!(windows)).unwrap().text
@@ -319,6 +340,7 @@ fn command_preview_uses_shared_parser_options_and_managed_cookie_path_without_wr
         &store,
         CookiePlatform::Youtube,
         "https://youtu.be/abc",
+        None,
     )
     .unwrap();
     assert!(!public.text.contains("--cookies"));
@@ -339,7 +361,8 @@ fn command_preview_rejects_invalid_links_missing_tools_and_unreadable_cookies() 
             &settings,
             &store,
             CookiePlatform::Youtube,
-            "https://douyin.com/video/1"
+            "https://douyin.com/video/1",
+            None
         )
         .unwrap_err()
         .code,
@@ -350,7 +373,8 @@ fn command_preview_rejects_invalid_links_missing_tools_and_unreadable_cookies() 
             &RequiredToolSettings::default(),
             &store,
             CookiePlatform::Youtube,
-            "https://youtu.be/abc"
+            "https://youtu.be/abc",
+            None
         )
         .unwrap_err()
         .code,
@@ -362,7 +386,8 @@ fn command_preview_rejects_invalid_links_missing_tools_and_unreadable_cookies() 
             &settings,
             &store,
             CookiePlatform::Youtube,
-            "https://youtu.be/abc"
+            "https://youtu.be/abc",
+            None
         )
         .unwrap_err()
         .code,
@@ -380,6 +405,87 @@ fn download_tools() -> RequiredToolSettings {
     ffmpeg.programs[0].path = "C:/Tools/ffmpeg.exe".into();
     settings.tools.insert(RequiredToolId::Ffmpeg, ffmpeg);
     settings
+}
+
+#[test]
+fn parsing_downloads_and_previews_share_explicit_proxy_settings() {
+    let directory = tempfile::tempdir().unwrap();
+    eprintln!(
+        "proxy command test directory: {}",
+        directory.path().display()
+    );
+    let store = CookieStore::new(directory.path());
+    let settings = download_tools();
+    let options: DownloadCommandOptions = serde_json::from_value(json!({
+        "directory": directory.path(), "formatId": "399"
+    }))
+        .unwrap();
+    let proxy = crate::proxy::ProxySettings {
+        protocol: "socks5".into(),
+        address: "::1".into(),
+        port: 7890,
+    };
+    for (proxy, expected) in [(Some(&proxy), "socks5h://[::1]:7890"), (None, "")] {
+        for command in [
+            parsing_command(&settings, "https://youtu.be/abc", None, proxy).unwrap(),
+            download_command(&settings, "https://youtu.be/abc", None, &options, proxy).unwrap(),
+        ] {
+            let args: Vec<_> = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy())
+                .collect();
+            assert_eq!(
+                args.iter().filter(|arg| arg.starts_with("--proxy")).count(),
+                usize::from(proxy.is_some())
+            );
+            if proxy.is_some() {
+                let position = args.iter().position(|arg| arg == "--proxy").unwrap();
+                assert_eq!(args[position + 1], expected);
+                assert!(position < args.iter().position(|arg| arg == "--").unwrap());
+                let env: std::collections::BTreeMap<_, _> = command.as_std().get_envs().collect();
+                assert_eq!(env.get(std::ffi::OsStr::new("NO_PROXY")), Some(&None));
+                assert_eq!(
+                    env.get(std::ffi::OsStr::new("HTTP_PROXY")),
+                    Some(&Some(std::ffi::OsStr::new(expected)))
+                );
+            } else {
+                assert_eq!(
+                    command.as_std().get_envs().count(),
+                    0,
+                    "disabling the app proxy must preserve the original network environment"
+                );
+            }
+        }
+        for preview in [
+            command_preview(
+                &settings,
+                &store,
+                CookiePlatform::Youtube,
+                "https://youtu.be/abc",
+                proxy,
+            )
+                .unwrap(),
+            download_command_preview(
+                &settings,
+                &store,
+                CookiePlatform::Youtube,
+                "https://youtu.be/abc",
+                &options,
+                proxy,
+            )
+                .unwrap(),
+        ] {
+            assert!(!preview.text.contains("SetEnvironmentVariable"));
+            assert!(!preview.text.contains("NO_PROXY"));
+            assert!(!preview.text.contains("ALL_PROXY"));
+            if proxy.is_some() {
+                assert!(preview.text.contains(&format!("'--proxy' '{expected}'")));
+            } else {
+                assert!(!preview.text.contains("--proxy"));
+            }
+        }
+    }
 }
 
 #[test]
@@ -401,6 +507,7 @@ fn public_download_preview_does_not_read_or_pass_cookies() {
         CookiePlatform::Youtube,
         "https://youtu.be/abc",
         &options,
+        None,
     )
     .unwrap();
     assert!(!preview.text.contains("--cookies"));
@@ -419,7 +526,8 @@ fn download_preview_uses_the_selected_native_format_without_conversion_or_writin
     }))
     .unwrap();
     let settings = download_tools();
-    let command = download_command(&settings, "https://youtu.be/abc", None, &options).unwrap();
+    let command =
+        download_command(&settings, "https://youtu.be/abc", None, &options, None).unwrap();
     let args: Vec<_> = command
         .as_std()
         .get_args()
@@ -458,6 +566,7 @@ fn download_preview_uses_the_selected_native_format_without_conversion_or_writin
         CookiePlatform::Youtube,
         "https://youtu.be/abc",
         &options,
+        None,
     )
     .unwrap();
     assert!(preview.text.contains("youtube_cookies.txt"));
@@ -474,15 +583,17 @@ fn download_command_preserves_mp4_without_overriding_automatic_audio_selection()
     let directory = tempfile::tempdir().unwrap();
     eprintln!("container test directory: {}", directory.path().display());
     let settings = download_tools();
-    for (container, selector) in [(
-        "mp4",
-        "bestvideo[format_id=\"616\"]+bestaudio/best*[format_id=\"616\"]",
-    )] {
+    {
+        let (container, selector) = (
+            "mp4",
+            "bestvideo[format_id=\"616\"]+bestaudio/best*[format_id=\"616\"]",
+        );
         let options: DownloadCommandOptions = serde_json::from_value(json!({
             "directory": directory.path(), "formatId": "616", "container": container
         }))
         .unwrap();
-        let command = download_command(&settings, "https://youtu.be/abc", None, &options).unwrap();
+        let command =
+            download_command(&settings, "https://youtu.be/abc", None, &options, None).unwrap();
         let args: Vec<_> = command
             .as_std()
             .get_args()
@@ -507,7 +618,7 @@ fn download_command_preserves_mp4_without_overriding_automatic_audio_selection()
         }))
         .unwrap();
         assert_eq!(
-            download_command(&settings, "https://youtu.be/abc", None, &invalid)
+            download_command(&settings, "https://youtu.be/abc", None, &invalid, None)
                 .unwrap_err()
                 .code,
             "invalidDownloadOptions"
@@ -527,7 +638,8 @@ fn download_preview_validates_native_format_id_and_directory() {
         "directory": directory.path(), "formatId": "dash-flv_1080"
     }))
     .unwrap();
-    let command = download_command(&settings, "https://youtu.be/abc", None, &options).unwrap();
+    let command =
+        download_command(&settings, "https://youtu.be/abc", None, &options, None).unwrap();
     let args: Vec<_> = command
         .as_std()
         .get_args()
@@ -546,7 +658,7 @@ fn download_preview_validates_native_format_id_and_directory() {
     }))
     .unwrap();
     assert_eq!(
-        download_command(&settings, "https://youtu.be/abc", None, &relative)
+        download_command(&settings, "https://youtu.be/abc", None, &relative, None)
             .unwrap_err()
             .code,
         "invalidDownloadDirectory"
@@ -557,7 +669,7 @@ fn download_preview_validates_native_format_id_and_directory() {
         }))
         .unwrap();
         assert_eq!(
-            download_command(&settings, "https://youtu.be/abc", None, &invalid)
+            download_command(&settings, "https://youtu.be/abc", None, &invalid, None)
                 .unwrap_err()
                 .code,
             "invalidDownloadOptions"
@@ -568,7 +680,8 @@ fn download_preview_validates_native_format_id_and_directory() {
             &tools("yt-dlp.exe".into(), None),
             "https://youtu.be/abc",
             None,
-            &options
+            &options,
+            None
         )
         .unwrap_err()
         .code,
@@ -583,7 +696,7 @@ fn parsing_uses_the_configured_program_and_runtime_and_never_downloads() {
         Some("/configured/deno".into()),
     );
     let cookie = Path::new("/selected/cookies.txt");
-    let command = parsing_command(&settings, "https://youtu.be/abc", Some(cookie)).unwrap();
+    let command = parsing_command(&settings, "https://youtu.be/abc", Some(cookie), None).unwrap();
     let command = command.as_std();
     assert_eq!(command.get_program(), "/configured/yt-dlp");
     let arguments: Vec<_> = command
@@ -614,6 +727,7 @@ fn parsing_uses_the_configured_program_and_runtime_and_never_downloads() {
         parsing_command(
             &RequiredToolSettings::default(),
             "https://youtu.be/abc",
+            None,
             None
         )
         .unwrap_err()
@@ -669,10 +783,117 @@ fn fixture(mode: &str) -> Command {
     command
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn parse_command_blocks_tool_publication_until_native_success_or_failure() {
+    let directory = tempfile::Builder::new()
+        .prefix("evd-parse-tool-usage-")
+        .tempdir()
+        .unwrap();
+    eprintln!(
+        "temporary parser usage directory: {}",
+        directory.path().display()
+    );
+    let mut command = fixture("toolUsage");
+    command.env("EVD_VIDEO_TEST_USAGE_DIRECTORY", directory.path());
+    collect_metadata(command, Duration::from_secs(10))
+        .await
+        .unwrap();
+    directory.close().unwrap();
+}
+
+#[cfg(windows)]
+async fn parse_command_tool_usage_fixture(directory: &Path) {
+    use tauri::Manager;
+    let parser = directory.join("yt-dlp.cmd");
+    std::fs::write(
+        &parser,
+        r#"@echo off
+echo ready > "%~dp0ready"
+:wait
+if not exist "%~dp0release" goto wait
+if exist "%~dp0failure" (
+  echo video unavailable 1>&2
+  exit /b 3
+)
+echo {"id":"123","title":"Native result","formats":[{"format_id":"video","vcodec":"h264"}]}
+"#,
+    )
+        .unwrap();
+    let storage = Storage::new(&directory.join("app.db"), &directory.join("legacy"));
+    let mut settings = tools(parser, None);
+    let config = settings.tools.get_mut(&RequiredToolId::Ytdlp).unwrap();
+    config.programs[0].version = "2026.10.04".into();
+    config.checked_at = crate::datetime::now();
+    storage
+        .database()
+        .unwrap()
+        .save_tool(RequiredToolId::Ytdlp, config)
+        .unwrap();
+    let mut context = tauri::generate_context!();
+    context.config_mut().app.windows.clear();
+    let app = tauri::Builder::default()
+        .any_thread()
+        .manage(RequiredToolManager::new(storage.clone()))
+        .manage(CookieStore::new(directory))
+        .manage(storage)
+        .build(context)
+        .unwrap();
+    for failure in [false, true] {
+        let ready = directory.join("ready");
+        let release = directory.join("release");
+        if failure {
+            std::fs::remove_file(&ready).unwrap();
+            std::fs::remove_file(&release).unwrap();
+            std::fs::write(directory.join("failure"), "fail").unwrap();
+        }
+        let tools = app.state::<RequiredToolManager>();
+        let observe_usage = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+                .await
+                .unwrap();
+            let blocked = tools.usage.publication(directory).is_err();
+            std::fs::write(&release, "finish").unwrap();
+            blocked
+        };
+        let (result, blocked) = tokio::join!(
+            parse_video(
+                CookiePlatform::Douyin,
+                "https://v.douyin.com/abc/".into(),
+                app.state(),
+                app.state(),
+                app.state()
+            ),
+            observe_usage
+        );
+        if failure {
+            assert_eq!(result.unwrap_err().code, "parseFailed");
+        } else {
+            assert_eq!(result.unwrap().metadata.title, "Native result");
+        }
+        assert!(blocked, "native parsing must prevent replacing its tools");
+        assert!(
+            tools.usage.publication(directory).is_ok(),
+            "finished parsing retained its tool lease"
+        );
+    }
+}
+
 #[test]
 #[ignore = "native child fixture, invoked only by process tests"]
 fn process_fixture() {
     match std::env::var("EVD_VIDEO_TEST_PROCESS").unwrap().as_str() {
+        #[cfg(windows)]
+        "toolUsage" => {
+            let directory = std::path::PathBuf::from(
+                std::env::var_os("EVD_VIDEO_TEST_USAGE_DIRECTORY").unwrap(),
+            );
+            tauri::async_runtime::block_on(parse_command_tool_usage_fixture(&directory));
+        }
         "sleep" => {
             std::thread::sleep(Duration::from_secs(2));
             std::fs::write(
@@ -793,7 +1014,8 @@ async fn live_parse() {
         if let Some(file) = &copy {
             eprintln!("temporary Cookie snapshot: {}", file.path().display());
         }
-        let base = parsing_command(&settings, &url, copy.as_ref().map(|file| file.path())).unwrap();
+        let base =
+            parsing_command(&settings, &url, copy.as_ref().map(|file| file.path()), None).unwrap();
         let args: Vec<_> = base
             .as_std()
             .get_args()
@@ -809,7 +1031,7 @@ async fn live_parse() {
             .await
             .and_then(|bytes| parse_metadata(&bytes))
     } else {
-        parse_with_tools(settings, store.clone(), platform, &input).await
+        parse_with_tools(settings, store.clone(), platform, &input, None).await
     };
     assert!(
         std::fs::read(store.path(platform)).ok() == original_cookie,

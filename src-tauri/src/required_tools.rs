@@ -1,6 +1,64 @@
 use crate::database::{Storage, StorageError};
 use crate::datetime;
 use serde::{Deserialize, Serialize};
+pub(crate) mod managed;
+pub(crate) mod usage;
+
+#[cfg(test)]
+mod usage_contract_tests {
+    #[test]
+    #[cfg(windows)]
+    fn differently_cased_tool_paths_share_the_same_usage_guard() {
+        let root = tempfile::tempdir().unwrap();
+        eprintln!(
+            "temporary tool path guard directory: {}",
+            root.path().display()
+        );
+        let file = root.path().join("yt-dlp.exe");
+        std::fs::write(&file, b"tool").unwrap();
+        let registry = super::usage::ToolUsageRegistry::default();
+        let lease = registry.acquire(&[file]).unwrap();
+        let alternate = std::path::PathBuf::from(root.path().to_string_lossy().to_uppercase());
+        assert!(registry.publication(&alternate).is_err());
+        drop(lease);
+        assert!(registry.publication(&alternate).is_ok());
+    }
+    #[test]
+    fn review_configuration_lock_covers_the_usage_capture_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        eprintln!(
+            "temporary atomic settings capture directory: {}",
+            root.path().display()
+        );
+        let storage =
+            crate::database::Storage::new(&root.path().join("app.db"), &root.path().join("legacy"));
+        let tools = super::RequiredToolManager::new(storage);
+        let (_settings, _lease) = tools
+            .settings_and_usage_at(|| {
+                assert!(
+                    tools.settings.try_lock().is_err(),
+                    "tool publication must not update settings between clone and usage acquisition"
+                )
+            })
+            .unwrap();
+    }
+    #[test]
+    fn managed_publication_cannot_replace_a_queued_tasks_tool() {
+        let registry = super::usage::ToolUsageRegistry::default();
+        let root = std::path::PathBuf::from("managed");
+        let path = root.join("yt-dlp.exe");
+        let lease = registry.acquire(std::slice::from_ref(&path)).unwrap();
+        assert!(registry.publication(&root).is_err());
+        assert!(registry
+            .publication(&std::path::PathBuf::from("other"))
+            .is_ok());
+        drop(lease);
+        let publish = registry.publication(&root).unwrap();
+        assert!(registry.acquire(std::slice::from_ref(&path)).is_err());
+        drop(publish);
+        assert!(registry.acquire(&[path]).is_ok());
+    }
+}
 pub(crate) mod process_tree;
 use std::{
     collections::BTreeMap,
@@ -29,6 +87,7 @@ pub enum RequiredToolId {
 pub enum RequiredToolSource {
     Path,
     Manual,
+    Automatic,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +122,14 @@ pub struct RequiredToolError {
     pub code: String,
     pub program: String,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequiredToolCheckState {
+    pub source: RequiredToolSource,
+    pub manual_path: String,
+    pub error: Option<RequiredToolError>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +265,9 @@ fn resolve_programs(
                         (*name).into()
                     }),
                 RequiredToolSource::Manual => manual.to_path_buf(),
+                RequiredToolSource::Automatic => {
+                    return Err(error("automaticUnsupported", name, ""))
+                }
             };
             if !path.is_file() {
                 return Err(error("notFound", name, path.display()));
@@ -281,10 +351,25 @@ async fn read_bounded(stream: impl AsyncRead + Unpin) -> Result<Vec<u8>, Require
     Ok(bytes)
 }
 
+#[cfg(test)]
 async fn collect_output(
-    mut command: tokio::process::Command,
+    command: tokio::process::Command,
     limit: Duration,
 ) -> Result<String, RequiredToolError> {
+    collect_output_with_cancel(command, limit, None).await
+}
+
+async fn collect_output_with_cancel(
+    mut command: tokio::process::Command,
+    limit: Duration,
+    mut cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<String, RequiredToolError> {
+    if cancellation
+        .as_ref()
+        .is_some_and(|receiver| *receiver.borrow())
+    {
+        return Err(error("configureCancelled", "", ""));
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -295,16 +380,24 @@ async fn collect_output(
         .map_err(|e| error("spawnFailed", "", e))?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let result = tokio::time::timeout(limit, async {
+    let result = tokio::select! {
+        biased;
+        _ = async {
+            match cancellation.as_mut() {
+                Some(receiver) => { let _ = receiver.changed().await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => None,
+        result = tokio::time::timeout(limit, async {
         tokio::try_join!(
             async { child.wait().await.map_err(|e| error("readFailed", "", e)) },
             read_bounded(stdout),
             read_bounded(stderr)
         )
-    })
-    .await;
+        }) => Some(result),
+    };
     match result {
-        Ok(Ok((status, stdout, stderr))) => {
+        Some(Ok(Ok((status, stdout, stderr)))) => {
             if !status.success() {
                 return Err(error(
                     "exitFailed",
@@ -327,8 +420,9 @@ async fn collect_output(
             let _ = child.start_kill();
             let _ = child.wait().await;
             Err(match failure {
-                Ok(Err(e)) => e,
-                Err(_) => error("timeout", "", "10 seconds"),
+                Some(Ok(Err(e))) => e,
+                Some(Err(_)) => error("timeout", "", "10 seconds"),
+                None => error("configureCancelled", "", ""),
                 _ => unreachable!(),
             })
         }
@@ -351,6 +445,13 @@ fn storage_error(e: StorageError) -> RequiredToolError {
 }
 
 async fn detect(request: &RequiredToolRequest) -> Result<RequiredToolConfig, RequiredToolError> {
+    detect_with_cancel(request, None).await
+}
+
+async fn detect_with_cancel(
+    request: &RequiredToolRequest,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<RequiredToolConfig, RequiredToolError> {
     let mut programs = Vec::new();
     for (name, path) in resolve_programs(request)? {
         let mut command = tokio::process::Command::new(&path);
@@ -362,17 +463,18 @@ async fn detect(request: &RequiredToolRequest) -> Result<RequiredToolConfig, Req
         } else {
             "--version"
         });
-        let output = collect_output(command, Duration::from_secs(10))
-            .await
-            .map_err(|mut e| {
-                e.program = name.clone();
-                e
-            })?;
+        let output =
+            collect_output_with_cancel(command, Duration::from_secs(10), cancellation.clone())
+                .await
+                .map_err(|mut e| {
+                    e.program = name.clone();
+                    e
+                })?;
         let version = parse_version(&name, &output)?;
         let identity_output = if name == "yt-dlp" {
             let mut help = tokio::process::Command::new(&path);
             help.args(["--ignore-config", "--help"]);
-            collect_output(help, Duration::from_secs(10))
+            collect_output_with_cancel(help, Duration::from_secs(10), cancellation.clone())
                 .await
                 .map_err(|mut e| {
                     e.program = name.clone();
@@ -401,13 +503,71 @@ async fn detect(request: &RequiredToolRequest) -> Result<RequiredToolConfig, Req
 }
 
 pub struct RequiredToolManager {
+    pub(crate) usage: usage::ToolUsageRegistry,
     settings: Arc<StdMutex<RequiredToolSettings>>,
     checks: [Mutex<()>; 3],
     storage: Storage,
     load_error: Option<RequiredToolError>,
 }
 
+pub(crate) fn validate_program_files(
+    id: RequiredToolId,
+    config: &RequiredToolConfig,
+) -> Result<(), RequiredToolError> {
+    for name in id.names() {
+        let program = config
+            .programs
+            .iter()
+            .find(|program| program.name == *name)
+            .ok_or_else(|| error("notFound", name, ""))?;
+        match std::fs::metadata(&program.path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Err(error("notFound", name, program.path.display())),
+            Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {
+                return Err(error("notFound", name, program.path.display()));
+            }
+            Err(failure) => return Err(error("readFailed", name, failure)),
+        }
+    }
+    Ok(())
+}
+
 impl RequiredToolManager {
+    pub(crate) fn acquire_usage(
+        &self,
+        settings: &RequiredToolSettings,
+    ) -> Result<usage::ToolUsageLease, RequiredToolError> {
+        self.usage.acquire(
+            &settings
+                .tools
+                .values()
+                .flat_map(|c| c.programs.iter().map(|p| p.path.clone()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    pub(crate) fn settings_and_usage(
+        &self,
+    ) -> Result<(RequiredToolSettings, usage::ToolUsageLease), RequiredToolError> {
+        self.settings_and_usage_at(|| {})
+    }
+    fn settings_and_usage_at(
+        &self,
+        boundary: impl FnOnce(),
+    ) -> Result<(RequiredToolSettings, usage::ToolUsageLease), RequiredToolError> {
+        if let Some(error) = &self.load_error {
+            return Err(error.clone());
+        }
+        let guard = self
+            .settings
+            .lock()
+            .map_err(|e| error("loadFailed", "", e))?;
+        let settings = guard.clone();
+        boundary();
+        let lease = self.acquire_usage(&settings)?;
+        drop(guard);
+        Ok((settings, lease))
+    }
     pub(crate) fn settings_snapshot(&self) -> Result<RequiredToolSettings, RequiredToolError> {
         if let Some(error) = &self.load_error {
             return Err(error.clone());
@@ -427,6 +587,7 @@ impl RequiredToolManager {
             Err(e) => (RequiredToolSettings::default(), Some(e)),
         };
         Self {
+            usage: usage::ToolUsageRegistry::default(),
             settings: Arc::new(StdMutex::new(settings)),
             checks: std::array::from_fn(|_| Mutex::new(())),
             storage,
@@ -439,7 +600,10 @@ impl RequiredToolManager {
 #[serde(rename_all = "camelCase")]
 pub struct RequiredToolSettingsSnapshot {
     settings: RequiredToolSettings,
+    last_checks: BTreeMap<RequiredToolId, RequiredToolCheckState>,
     error: Option<RequiredToolError>,
+    automatic_supported: BTreeMap<RequiredToolId, bool>,
+    automatic_ffmpeg_requires_rosetta: bool,
 }
 
 #[derive(Serialize)]
@@ -455,23 +619,81 @@ pub async fn get_required_tools(
 ) -> Result<RequiredToolSettingsSnapshot, RequiredToolError> {
     let settings = state.settings.clone();
     let load_error = state.load_error.clone();
+    let storage = state.storage.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        Ok(RequiredToolSettingsSnapshot {
-            settings: settings
-                .lock()
-                .map_err(|e| error("loadFailed", "", e))?
-                .clone(),
-            error: load_error,
-        })
+        settings_view_snapshot(&settings, &storage, load_error)
     })
-    .await
-    .map_err(|e| error("loadFailed", "", e))?
+        .await
+        .map_err(|e| error("loadFailed", "", e))?
+}
+
+fn settings_view_snapshot(
+    settings: &StdMutex<RequiredToolSettings>,
+    storage: &Storage,
+    load_error: Option<RequiredToolError>,
+) -> Result<RequiredToolSettingsSnapshot, RequiredToolError> {
+    // Hold the same lock used for publishing successful checks while reading both.
+    let settings = settings.lock().map_err(|e| error("loadFailed", "", e))?;
+    let mut last_checks = if load_error.is_none() {
+        storage
+            .database()
+            .and_then(|db| db.tool_checks())
+            .map_err(storage_error)?
+    } else {
+        BTreeMap::new()
+    };
+    if load_error.is_none() {
+        for (id, config) in &settings.tools {
+            // Preserve an unsuccessful newer selection. Only refresh the applied
+            // selection's file availability; never launch programs while loading.
+            if last_checks.get(id).is_some_and(|check| {
+                check.source != config.source
+                    || check.manual_path != config.manual_path
+                    || check.error.is_some()
+            }) {
+                continue;
+            }
+            if let Err(failure) = validate_program_files(*id, config) {
+                let check = RequiredToolCheckState {
+                    source: config.source,
+                    manual_path: config.manual_path.clone(),
+                    error: Some(failure),
+                };
+                storage
+                    .database()
+                    .and_then(|db| db.save_tool_check(*id, &check, None))
+                    .map_err(storage_error)?;
+                last_checks.insert(*id, check);
+            }
+        }
+    }
+    Ok(RequiredToolSettingsSnapshot {
+        settings: settings.clone(),
+        last_checks,
+        error: load_error,
+        automatic_supported: [
+            RequiredToolId::Ytdlp,
+            RequiredToolId::Ffmpeg,
+            RequiredToolId::Deno,
+        ]
+            .into_iter()
+            .map(|id| (id, managed::supported(id)))
+            .collect(),
+        automatic_ffmpeg_requires_rosetta: cfg!(all(target_os = "macos", target_arch = "aarch64")),
+    })
 }
 
 #[tauri::command]
 pub async fn check_required_tool(
     request: RequiredToolRequest,
     state: tauri::State<'_, RequiredToolManager>,
+) -> Result<CheckResult, RequiredToolError> {
+    check_tool(&request, &state).await
+}
+
+async fn check_tool(
+    request: &RequiredToolRequest,
+    state: &RequiredToolManager,
 ) -> Result<CheckResult, RequiredToolError> {
     let _checking = state.checks[request.tool_id.index()]
         .try_lock()
@@ -480,21 +702,56 @@ pub async fn check_required_tool(
     if let Some(e) = &state.load_error {
         return Err(e.clone());
     }
-    let candidate = detect(&request).await;
+    let candidate = if request.source == RequiredToolSource::Automatic {
+        managed::detect_managed(request.tool_id, &state.storage).await
+    } else {
+        detect(request).await
+    };
+    apply_result(state, request, candidate).await
+}
+
+async fn apply_result(
+    state: &RequiredToolManager,
+    request: &RequiredToolRequest,
+    candidate: Result<RequiredToolConfig, RequiredToolError>,
+) -> Result<CheckResult, RequiredToolError> {
     let settings = state.settings.clone();
     let storage = state.storage.clone();
+    let tool_id = request.tool_id;
+    let last_check = match &candidate {
+        Ok(config) => RequiredToolCheckState {
+            source: config.source,
+            manual_path: config.manual_path.clone(),
+            error: None,
+        },
+        Err(failure) => RequiredToolCheckState {
+            source: request.source,
+            manual_path: if request.source == RequiredToolSource::Manual {
+                request.manual_path.trim().into()
+            } else {
+                String::new()
+            },
+            error: Some(failure.clone()),
+        },
+    };
     tauri::async_runtime::spawn_blocking(move || {
         // Publish the new in-memory configuration only after SQLite commits.
         let mut settings = settings.lock().map_err(|e| error("saveFailed", "", e))?;
-        let failure = apply_candidate(&mut settings, request.tool_id, candidate, |config| {
-            storage
-                .database()
-                .and_then(|db| db.save_tool(request.tool_id, config))
-                .map_err(storage_error)
-        })
-        .err();
+        let database = storage.database().map_err(storage_error)?;
+        let failure = match candidate {
+            Ok(config) => apply_candidate(&mut settings, tool_id, Ok(config), |config| {
+                database
+                    .save_tool_check(tool_id, &last_check, Some(config))
+                    .map_err(storage_error)
+            })
+                .err(),
+            Err(failure) => Some(match database.save_tool_check(tool_id, &last_check, None) {
+                Ok(()) => failure,
+                Err(error) => storage_error(error),
+            }),
+        };
         Ok(CheckResult {
-            active: settings.tools.get(&request.tool_id).cloned(),
+            active: settings.tools.get(&tool_id).cloned(),
             error: failure,
         })
     })
@@ -631,6 +888,197 @@ mod tests {
         )
         .is_err());
         assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn opening_tool_settings_marks_deleted_ffmpeg_files_as_missing() {
+        let root = tempfile::tempdir().unwrap();
+        eprintln!(
+            "deleted-tool settings test directory: {}",
+            root.path().display()
+        );
+        let storage = Storage::new(
+            &root.path().join("app.db"),
+            &root.path().join("legacy.json"),
+        );
+        for source in [
+            RequiredToolSource::Path,
+            RequiredToolSource::Automatic,
+            RequiredToolSource::Manual,
+        ] {
+            for missing in ["ffmpeg", "ffprobe"] {
+                let config = RequiredToolConfig {
+                    source,
+                    manual_path: if source == RequiredToolSource::Manual {
+                        root.path().to_string_lossy().into()
+                    } else {
+                        String::new()
+                    },
+                    checked_at: datetime::now(),
+                    programs: ["ffmpeg", "ffprobe"]
+                        .into_iter()
+                        .map(|name| {
+                            let path = root.path().join(if cfg!(windows) {
+                                format!("{name}.exe")
+                            } else {
+                                name.into()
+                            });
+                            std::fs::write(&path, b"file metadata fixture; never executed")
+                                .unwrap();
+                            Program {
+                                name: name.into(),
+                                path,
+                                version: "9.0.2".into(),
+                            }
+                        })
+                        .collect(),
+                };
+                storage
+                    .database()
+                    .unwrap()
+                    .save_tool_check(
+                        RequiredToolId::Ffmpeg,
+                        &RequiredToolCheckState {
+                            source,
+                            manual_path: config.manual_path.clone(),
+                            error: None,
+                        },
+                        Some(&config),
+                    )
+                    .unwrap();
+                let manager = RequiredToolManager::new(storage.clone());
+                assert!(settings_view_snapshot(&manager.settings, &storage, None)
+                    .unwrap()
+                    .last_checks[&RequiredToolId::Ffmpeg]
+                    .error
+                    .is_none());
+                let path = &config
+                    .programs
+                    .iter()
+                    .find(|p| p.name == missing)
+                    .unwrap()
+                    .path;
+                std::fs::remove_file(path).unwrap();
+                let snapshot = settings_view_snapshot(&manager.settings, &storage, None).unwrap();
+                let check = &snapshot.last_checks[&RequiredToolId::Ffmpeg];
+                assert_eq!(check.source, source);
+                let failure = check
+                    .error
+                    .as_ref()
+                    .expect("deleted executable must not remain installed");
+                assert_eq!(failure.code, "notFound");
+                assert_eq!(failure.program, missing);
+                assert_eq!(snapshot.settings.tools[&RequiredToolId::Ffmpeg], config);
+                let reopened = RequiredToolManager::new(storage.clone());
+                assert_eq!(
+                    settings_view_snapshot(&reopened.settings, &storage, None)
+                        .unwrap()
+                        .last_checks[&RequiredToolId::Ffmpeg],
+                    *check
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_tool_checks_restore_their_selection_and_status_after_reopening() {
+        let root = tempfile::tempdir().unwrap();
+        eprintln!(
+            "tool-check restart test directory: {}",
+            root.path().display()
+        );
+        let path = root.path().join("app.db");
+        let legacy = root.path().join("legacy.json");
+        let storage = Storage::new(&path, &legacy);
+        let ids = [
+            RequiredToolId::Ytdlp,
+            RequiredToolId::Ffmpeg,
+            RequiredToolId::Deno,
+        ];
+        let mut previous = BTreeMap::new();
+        for id in ids.into_iter().filter(|id| managed::supported(*id)) {
+            let config = RequiredToolConfig {
+                source: RequiredToolSource::Path,
+                manual_path: String::new(),
+                checked_at: datetime::now(),
+                programs: id
+                    .names()
+                    .iter()
+                    .map(|name| Program {
+                        name: (*name).into(),
+                        path: root.path().join(format!("old-{name}.exe")),
+                        version: if id == RequiredToolId::Ytdlp {
+                            "2026.09.25"
+                        } else {
+                            "9.0.2"
+                        }
+                            .into(),
+                    })
+                    .collect(),
+            };
+            storage.database().unwrap().save_tool(id, &config).unwrap();
+            previous.insert(id, config);
+        }
+        let manager = RequiredToolManager::new(storage);
+        for id in previous.keys() {
+            let request = RequiredToolRequest {
+                tool_id: *id,
+                source: RequiredToolSource::Automatic,
+                manual_path: String::new(),
+            };
+            let result = check_tool(&request, &manager).await.unwrap();
+            assert_eq!(result.error.unwrap().code, "notFound");
+            assert_eq!(result.active.as_ref(), previous.get(id));
+        }
+        drop(manager);
+        let restarted = RequiredToolManager::new(Storage::new(&path, &legacy));
+        let snapshot = settings_view_snapshot(
+            &restarted.settings,
+            &restarted.storage,
+            restarted.load_error.clone(),
+        )
+            .unwrap();
+        for id in previous.keys() {
+            let check = &snapshot.last_checks[id];
+            assert_eq!(check.source, RequiredToolSource::Automatic);
+            assert_eq!(check.manual_path, "");
+            assert_eq!(check.error.as_ref().unwrap().code, "notFound");
+        }
+        if let Some(config) = previous.get(&RequiredToolId::Ytdlp) {
+            // This leg tests persistence only; the restored program must also
+            // exist for the settings page's file-availability check.
+            std::fs::write(
+                &config.programs[0].path,
+                b"available fixture; never executed",
+            )
+                .unwrap();
+            let configured = RequiredToolConfig {
+                source: RequiredToolSource::Automatic,
+                ..config.clone()
+            };
+            let request = RequiredToolRequest {
+                tool_id: RequiredToolId::Ytdlp,
+                source: RequiredToolSource::Automatic,
+                manual_path: String::new(),
+            };
+            let result = apply_result(&restarted, &request, Ok(configured))
+                .await
+                .unwrap();
+            assert!(result.error.is_none());
+            drop(restarted);
+            let configured = RequiredToolManager::new(Storage::new(&path, &legacy));
+            let snapshot = settings_view_snapshot(
+                &configured.settings,
+                &configured.storage,
+                configured.load_error.clone(),
+            )
+                .unwrap();
+            assert!(snapshot.last_checks[&RequiredToolId::Ytdlp].error.is_none());
+            assert_eq!(
+                snapshot.settings.tools[&RequiredToolId::Ytdlp].source,
+                RequiredToolSource::Automatic
+            );
+        }
     }
 
     #[test]
@@ -816,6 +1264,40 @@ mod tests {
             }
             _ => panic!("unknown fixture"),
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_validation_process_before_removing_its_executable() {
+        let directory = tempfile::tempdir().unwrap();
+        let staged = directory.path().join(if cfg!(windows) {
+            "validation.exe"
+        } else {
+            "validation"
+        });
+        std::fs::copy(std::env::current_exe().unwrap(), &staged).unwrap();
+        let mut command = tokio::process::Command::new(&staged);
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "required_tools::tests::process_fixture",
+                "--nocapture",
+            ])
+            .env("EVD_TEST_PROCESS", "sleep")
+            .env("EVD_TEST_MARKER", directory.path().join("alive"));
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let cancellation = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            sender.send(true).unwrap();
+        });
+        let failure = collect_output_with_cancel(command, Duration::from_secs(10), Some(receiver))
+            .await
+            .unwrap_err();
+        cancellation.await.unwrap();
+        assert_eq!(failure.code, "configureCancelled");
+        std::fs::remove_file(&staged)
+            .expect("validation process must release its executable before cleanup");
+        directory.close().unwrap();
     }
 
     #[tokio::test]

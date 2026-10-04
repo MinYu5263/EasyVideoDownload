@@ -4,7 +4,11 @@ use super::{
 };
 use crate::{
     cookies::{CookiePlatform, CookieStore},
-    required_tools::{process_tree, RequiredToolManager},
+    database::Storage,
+    required_tools::{
+        process_tree, validate_program_files, RequiredToolId, RequiredToolManager,
+        RequiredToolSettings,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -14,13 +18,16 @@ use std::{
     sync::Mutex,
     time::Duration,
 };
-use tauri::{ipc::Channel, Manager};
+use tauri::Manager;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::Command,
     sync::watch,
 };
+mod failure;
+pub(crate) mod history;
 mod progress;
+use history::DownloadRecordSession;
 use progress::ProgressTracker;
 
 #[derive(Clone, Debug, Serialize)]
@@ -30,54 +37,31 @@ pub struct DownloadProgress {
     speed: Option<f64>,
     eta: Option<f64>,
 }
-impl DownloadProgress {
-    fn phase(phase: &'static str) -> Self {
-        Self {
-            phase,
-            percent: None,
-            speed: None,
-            eta: None,
-        }
-    }
-}
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadResult {
     path: String,
     already_downloaded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_error: Option<crate::database::StorageError>,
 }
 
-#[derive(Default)]
-pub struct DownloadManager {
-    active: Mutex<Option<(String, watch::Sender<bool>)>>,
-}
-struct ActiveDownload<'a>(&'a DownloadManager);
-impl Drop for ActiveDownload<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut active) = self.0.active.lock() {
-            active.take();
-        }
-    }
-}
-impl DownloadManager {
-    fn begin(&self, id: String) -> Result<(ActiveDownload<'_>, watch::Receiver<bool>), VideoError> {
-        let mut active = self.active.lock().map_err(|e| error("bridgeFailed", e))?;
-        if active.is_some() {
-            return Err(error("downloadBusy", "A download is already running"));
-        }
-        let (sender, receiver) = watch::channel(false);
-        *active = Some((id, sender));
-        Ok((ActiveDownload(self), receiver))
-    }
-    fn cancel(&self, id: &str) -> Result<(), VideoError> {
-        let active = self.active.lock().map_err(|e| error("bridgeFailed", e))?;
-        if let Some((current, sender)) = active.as_ref() {
-            if current == id {
-                let _ = sender.send(true);
-            }
-        }
+pub(super) mod task_snapshot;
+pub(crate) mod tasks;
+pub use tasks::DownloadManager;
+
+async fn prepare_download_directory(directory: PathBuf) -> Result<(), VideoError> {
+    tauri::async_runtime::spawn_blocking(move || -> std::io::Result<()> {
+        std::fs::create_dir_all(&directory)?;
+        let probe = tempfile::Builder::new()
+            .prefix(".easyvideo-write-check-")
+            .tempfile_in(&directory)?;
+        probe.close()?;
         Ok(())
-    }
+    })
+        .await
+        .map_err(|e| error("downloadDirectoryFailed", e))?
+        .map_err(|e| error("downloadDirectoryFailed", e))
 }
 
 fn default_directories(
@@ -113,14 +97,6 @@ pub fn get_default_download_directories(
 ) -> Result<BTreeMap<&'static str, String>, VideoError> {
     default_directories(app.path().video_dir().ok(), app.path().home_dir().ok())
 }
-#[tauri::command]
-pub fn cancel_video_download(
-    request_id: String,
-    downloads: tauri::State<'_, DownloadManager>,
-) -> Result<(), VideoError> {
-    downloads.cancel(&request_id)
-}
-
 struct StreamOutput {
     path: Option<PathBuf>,
     already_downloaded: bool,
@@ -136,6 +112,7 @@ async fn read_stream(
     stream: impl AsyncRead + Unpin,
     tracker: &Mutex<ProgressTracker>,
     notify: &(impl Fn(DownloadProgress) -> Result<(), VideoError> + Sync),
+    history: Option<&DownloadRecordSession>,
 ) -> Result<StreamOutput, VideoError> {
     let mut reader = BufReader::new(stream);
     let mut output = StreamOutput {
@@ -161,6 +138,9 @@ async fn read_stream(
         }
         let line = String::from_utf8_lossy(&bytes);
         let line = line.trim();
+        if let Some(history) = history {
+            history.observe(line).await;
+        }
         if let Some(path) = line.strip_prefix("__EVD_FILE__") {
             let report: FileReport =
                 serde_json::from_str(path).map_err(|e| error("downloadResultMissing", e))?;
@@ -193,7 +173,7 @@ async fn read_stream(
             .update(line);
         if let Some(update) = update {
             notify(update)?;
-        } else if !line.is_empty() {
+        } else if !line.is_empty() && !line.starts_with("[debug]") {
             output.diagnostic.push_str(line);
             output.diagnostic.push('\n');
             // Keep a bounded tail while continuously draining long-running downloads.
@@ -209,26 +189,84 @@ async fn read_stream(
     Ok(output)
 }
 fn download_failure(detail: &str) -> VideoError {
-    let lower = detail.to_ascii_lowercase();
-    let detail = if lower.contains("cookie") || lower.contains("traceback") {
-        "yt-dlp failed; check the platform Cookie file and tool version".to_owned()
-    } else {
-        detail.chars().take(4096).collect()
-    };
-    error(
+    let kind = failure::failure_kind("downloadFailed", detail, "unknown");
+    let detail = failure::sanitize_diagnostic(detail);
+    let mut failure = error(
         "downloadFailed",
         if detail.trim().is_empty() {
             "yt-dlp exited unsuccessfully".into()
         } else {
             detail
         },
+    );
+    failure.failure_kind = (kind != "unknown").then_some(kind);
+    failure
+}
+
+fn ensure_download_tools(
+    settings: &RequiredToolSettings,
+    platform: CookiePlatform,
+) -> Result<(), VideoError> {
+    for id in [
+        RequiredToolId::Ytdlp,
+        RequiredToolId::Ffmpeg,
+        RequiredToolId::Deno,
+    ] {
+        // Deno is only needed for YouTube's JavaScript challenges. Keep the
+        // existing optional runtime behavior when no Deno has been configured.
+        if id == RequiredToolId::Deno
+            && (!matches!(platform, CookiePlatform::Youtube) || !settings.tools.contains_key(&id))
+        {
+            continue;
+        }
+        let missing_code = match id {
+            RequiredToolId::Ytdlp => "toolMissing",
+            RequiredToolId::Ffmpeg => "ffmpegMissing",
+            RequiredToolId::Deno => "denoMissing",
+        };
+        let config = settings
+            .tools
+            .get(&id)
+            .ok_or_else(|| error(missing_code, ""))?;
+        validate_program_files(id, config).map_err(|failure| {
+            error(
+                if failure.code == "notFound" {
+                    missing_code
+                } else {
+                    "toolSettingsFailed"
+                },
+                format!("{}\n{}", failure.program, failure.detail),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+async fn check_download_tool_files(
+    settings: &RequiredToolSettings,
+    platform: CookiePlatform,
+) -> Result<(), VideoError> {
+    let settings = settings.clone();
+    tauri::async_runtime::spawn_blocking(move || ensure_download_tools(&settings, platform))
+        .await
+        .map_err(|failure| error("toolSettingsFailed", failure))?
+}
+
+fn output_access_failure(failure: std::io::Error) -> VideoError {
+    error(
+        if failure::file_is_occupied(&failure) {
+            "historyFileOccupied"
+        } else {
+            "downloadResultMissing"
+        },
+        failure,
     )
 }
+
 fn confirmed_file(path: &Path, directory: &Path) -> Result<DownloadResult, VideoError> {
-    let file = std::fs::canonicalize(path).map_err(|e| error("downloadResultMissing", e))?;
-    let directory =
-        std::fs::canonicalize(directory).map_err(|e| error("downloadResultMissing", e))?;
-    let metadata = std::fs::metadata(&file).map_err(|e| error("downloadResultMissing", e))?;
+    let file = std::fs::canonicalize(path).map_err(output_access_failure)?;
+    let directory = std::fs::canonicalize(directory).map_err(output_access_failure)?;
+    let metadata = std::fs::metadata(&file).map_err(output_access_failure)?;
     if !file.starts_with(directory) || !metadata.is_file() || metadata.len() == 0 {
         return Err(error(
             "downloadResultMissing",
@@ -248,14 +286,26 @@ fn confirmed_file(path: &Path, directory: &Path) -> Result<DownloadResult, Video
     Ok(DownloadResult {
         path,
         already_downloaded: false,
+        storage_error: None,
     })
 }
+#[cfg(test)]
 async fn run_download(
+    command: Command,
+    directory: &Path,
+    cancel: watch::Receiver<bool>,
+    limit: Duration,
+    notify: impl Fn(DownloadProgress) -> Result<(), VideoError> + Sync,
+) -> Result<DownloadResult, VideoError> {
+    run_download_with_history(command, directory, cancel, limit, notify, None).await
+}
+async fn run_download_with_history(
     mut command: Command,
     directory: &Path,
     mut cancel: watch::Receiver<bool>,
     limit: Duration,
     notify: impl Fn(DownloadProgress) -> Result<(), VideoError> + Sync,
+    history: Option<&DownloadRecordSession>,
 ) -> Result<DownloadResult, VideoError> {
     if *cancel.borrow() {
         return Err(error("downloadCancelled", ""));
@@ -271,14 +321,29 @@ async fn run_download(
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let tracker = Mutex::new(ProgressTracker::default());
-    let result = tokio::select! {
-        biased;
-        _ = async { if !*cancel.borrow() { let _ = cancel.changed().await; } } => Err(error("downloadCancelled", "")),
-        result = tokio::time::timeout(limit, async {
-            tokio::try_join!(async {child.wait().await.map_err(|e| error("readFailed", e))}, read_stream(stdout, &tracker, &notify), read_stream(stderr, &tracker, &notify))
-        }) => match result { Ok(result) => result, Err(_) => Err(error("downloadTimeout", "Download exceeded six hours")) },
+    let result = {
+        let mut processing = Box::pin(async {
+            tokio::try_join!(
+                async { child.wait().await.map_err(|e| error("readFailed", e)) },
+                read_stream(stdout, &tracker, &notify, history),
+                read_stream(stderr, &tracker, &notify, history)
+            )
+        });
+        let result = tokio::select! {
+            biased;
+            _ = async { if !*cancel.borrow() { let _ = cancel.changed().await; } } => Err(error("downloadCancelled", "")),
+            result = tokio::time::timeout(limit, &mut processing) => match result { Ok(result) => Ok(result), Err(_) => Err(error("downloadTimeout", "Download exceeded six hours")) },
+        };
+        // Kill the process tree, then consume its buffered start evidence before settlement.
+        drop(tree);
+        match result {
+            Ok(result) => result,
+            Err(failure) => {
+                let _ = tokio::time::timeout(Duration::from_secs(10), &mut processing).await;
+                Err(failure)
+            }
+        }
     };
-    drop(tree);
     let (status, stdout, stderr) = match result {
         Ok(output) => output,
         Err(failure) => {
@@ -315,62 +380,8 @@ async fn run_download(
 }
 
 #[tauri::command]
-pub async fn download_video(
-    platform: CookiePlatform,
-    input: String,
-    options: DownloadCommandOptions,
-    request_id: String,
-    on_progress: Channel<DownloadProgress>,
-    tools: tauri::State<'_, RequiredToolManager>,
-    cookies: tauri::State<'_, CookieStore>,
-    downloads: tauri::State<'_, DownloadManager>,
-) -> Result<DownloadResult, VideoError> {
-    let (_active, cancel) = downloads.begin(request_id)?;
-    let notify = |update| {
-        on_progress
-            .send(update)
-            .map_err(|e| error("bridgeFailed", e))
-    };
-    notify(DownloadProgress::phase("preparing"))?;
-    let url = normalize_link(&input, platform)?;
-    let settings = tools
-        .settings_snapshot()
-        .map_err(|e| error("toolSettingsFailed", e.detail))?;
-    let store = cookies.inner().clone();
-    let fallback = options.cookie_fallback;
-    let copy = tauri::async_runtime::spawn_blocking(move || {
-        if fallback {
-            Ok(None)
-        } else {
-            cookie_snapshot(&store, platform)
-        }
-    })
-    .await
-    .map_err(|e| error("cookieReadFailed", e))??;
-    let command = download_command(
-        &settings,
-        &url,
-        copy.as_ref().map(|file| file.path()),
-        &options,
-    )?;
-    if *cancel.borrow() {
-        return Err(error("downloadCancelled", ""));
-    }
-    let directory = PathBuf::from(&options.directory);
-    let output = directory.clone();
-    tauri::async_runtime::spawn_blocking(move || std::fs::create_dir_all(output))
-        .await
-        .map_err(|e| error("downloadDirectoryFailed", e))?
-        .map_err(|e| error("downloadDirectoryFailed", e))?;
-    // Retain the Cookie snapshot until yt-dlp and FFmpeg have both stopped.
-    run_download(
-        command,
-        &directory,
-        cancel,
-        Duration::from_secs(6 * 60 * 60),
-        notify,
-    )
-    .await
+pub fn create_download_request_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 #[cfg(test)]

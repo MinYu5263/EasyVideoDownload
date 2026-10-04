@@ -1,4 +1,6 @@
 use crate::cookies::{CookiePlatform, CookieStore};
+use crate::database::Storage;
+use crate::proxy::{platform_proxy, ProxySettings};
 #[cfg(test)]
 use crate::required_tools::RequiredToolId;
 use crate::required_tools::{process_tree, RequiredToolManager, RequiredToolSettings};
@@ -7,7 +9,7 @@ pub mod download;
 #[cfg(test)]
 use commands::{command_preview, download_command, download_command_preview, render_command};
 use commands::{parsing_command, DownloadCommandOptions, VideoCommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(test)]
 use std::path::Path;
@@ -17,42 +19,56 @@ use tokio::{
     process::Command,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoMetadata {
-    id: String,
-    title: String,
-    thumbnail: Option<String>,
-    duration: Option<f64>,
-    extension: Option<String>,
-    formats: Vec<VideoFormat>,
-    cookie_fallback: bool,
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) thumbnail: Option<String>,
+    pub(crate) duration: Option<f64>,
+    pub(crate) extension: Option<String>,
+    pub(crate) formats: Vec<VideoFormat>,
+    pub(crate) cookie_fallback: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoFormat {
-    format_id: String,
-    height: Option<u32>,
-    fps: Option<f64>,
-    extension: Option<String>,
-    size_bytes: Option<u64>,
-    size_approximate: bool,
+    pub(crate) format_id: String,
+    pub(crate) height: Option<u32>,
+    pub(crate) fps: Option<f64>,
+    pub(crate) extension: Option<String>,
+    pub(crate) size_bytes: Option<u64>,
+    pub(crate) size_approximate: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct VideoError {
     code: String,
     detail: String,
+    #[serde(rename = "storageError", skip_serializing_if = "Option::is_none")]
+    storage_error: Option<crate::database::StorageError>,
+    #[serde(skip)]
+    failure_kind: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedVideo {
+    metadata: VideoMetadata,
+    parsed_at: String,
+    parser_fingerprint: String,
 }
 fn error(code: &str, detail: impl ToString) -> VideoError {
     VideoError {
         code: code.into(),
         detail: detail.to_string(),
+        storage_error: None,
+        failure_kind: None,
     }
 }
 
-fn normalize_link(input: &str, platform: CookiePlatform) -> Result<String, VideoError> {
+pub(crate) fn normalize_link(input: &str, platform: CookiePlatform) -> Result<String, VideoError> {
     let text = if matches!(platform, CookiePlatform::Douyin) {
         let lower = input.to_ascii_lowercase();
         let start = [lower.find("https://"), lower.find("http://")]
@@ -175,7 +191,7 @@ fn parse_metadata(bytes: &[u8]) -> Result<VideoMetadata, VideoError> {
         thumbnail,
         duration: value["duration"]
             .as_f64()
-            .filter(|n| n.is_finite() && *n >= 0.0),
+            .filter(|n| n.is_finite() && *n > 0.0),
         extension: value["ext"]
             .as_str()
             .filter(|text| !text.is_empty())
@@ -326,6 +342,7 @@ async fn parse_with_tools(
     store: CookieStore,
     platform: CookiePlatform,
     input: &str,
+    proxy: Option<ProxySettings>,
 ) -> Result<VideoMetadata, VideoError> {
     let url = normalize_link(input, platform)?;
     let copy = tauri::async_runtime::spawn_blocking(move || cookie_snapshot(&store, platform))
@@ -339,7 +356,7 @@ async fn parse_with_tools(
         } else {
             None
         };
-        let command = parsing_command(&settings, &url, cookie);
+        let command = parsing_command(&settings, &url, cookie, proxy.as_ref());
         async move {
             let bytes = collect_metadata(
                 command?,
@@ -358,11 +375,23 @@ pub async fn parse_video(
     input: String,
     tools: tauri::State<'_, RequiredToolManager>,
     cookies: tauri::State<'_, CookieStore>,
-) -> Result<VideoMetadata, VideoError> {
-    let settings = tools
-        .settings_snapshot()
+    storage: tauri::State<'_, Storage>,
+) -> Result<ParsedVideo, VideoError> {
+    let (settings, _tool_usage) = tools
+        .settings_and_usage()
         .map_err(|e| error("toolSettingsFailed", e.detail))?;
-    parse_with_tools(settings, cookies.inner().clone(), platform, &input).await
+    let proxy = platform_proxy(storage.inner(), platform)
+        .await
+        .map_err(|e| error("proxySettingsFailed", e.detail))?;
+    let parser_fingerprint = crate::database::page_states::parser_fingerprint(&settings)
+        .map_err(|e| error("toolSettingsFailed", e.detail))?;
+    let metadata =
+        parse_with_tools(settings, cookies.inner().clone(), platform, &input, proxy).await?;
+    Ok(ParsedVideo {
+        metadata,
+        parsed_at: crate::datetime::now(),
+        parser_fingerprint,
+    })
 }
 
 #[tauri::command]
@@ -371,13 +400,17 @@ pub async fn get_video_parse_command(
     input: String,
     tools: tauri::State<'_, RequiredToolManager>,
     cookies: tauri::State<'_, CookieStore>,
+    storage: tauri::State<'_, Storage>,
 ) -> Result<VideoCommand, VideoError> {
     let settings = tools
         .settings_snapshot()
         .map_err(|e| error("toolSettingsFailed", e.detail))?;
     let store = cookies.inner().clone();
+    let proxy = platform_proxy(storage.inner(), platform)
+        .await
+        .map_err(|e| error("proxySettingsFailed", e.detail))?;
     tauri::async_runtime::spawn_blocking(move || {
-        commands::command_preview(&settings, &store, platform, &input)
+        commands::command_preview(&settings, &store, platform, &input, proxy.as_ref())
     })
     .await
     .map_err(|e| error("commandUnavailable", e))?
@@ -390,13 +423,24 @@ pub async fn get_video_download_command(
     options: DownloadCommandOptions,
     tools: tauri::State<'_, RequiredToolManager>,
     cookies: tauri::State<'_, CookieStore>,
+    storage: tauri::State<'_, Storage>,
 ) -> Result<VideoCommand, VideoError> {
     let settings = tools
         .settings_snapshot()
         .map_err(|e| error("toolSettingsFailed", e.detail))?;
     let store = cookies.inner().clone();
+    let proxy = platform_proxy(storage.inner(), platform)
+        .await
+        .map_err(|e| error("proxySettingsFailed", e.detail))?;
     tauri::async_runtime::spawn_blocking(move || {
-        commands::download_command_preview(&settings, &store, platform, &input, &options)
+        commands::download_command_preview(
+            &settings,
+            &store,
+            platform,
+            &input,
+            &options,
+            proxy.as_ref(),
+        )
     })
     .await
     .map_err(|e| error("commandUnavailable", e))?
@@ -404,3 +448,6 @@ pub async fn get_video_download_command(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod proxy_live_tests;

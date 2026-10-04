@@ -1,8 +1,6 @@
 <script lang="ts" setup>
-import {computed, ref} from "vue";
-import {ElButton, ElMessage, ElOption, ElSelect, ElSwitch} from "element-plus";
-import {FolderOpened} from "@element-plus/icons-vue";
-import {invoke} from "@tauri-apps/api/core";
+import {computed} from "vue";
+import {ElOption, ElSelect, ElSwitch} from "element-plus";
 import {useI18n} from "vue-i18n";
 import {languageOptions} from "../i18n";
 import {useAppSettings} from "../composables/useAppSettings";
@@ -13,19 +11,6 @@ const locked = computed(() => !ready.value);
 const error = computed(() => loadError.value ?? saveError.value);
 const themeOptions = ["system", "light", "dark"] as const;
 const closeOptions = ["ask", "tray", "exit"] as const;
-const openingDataDirectory = ref(false);
-
-async function openDataDirectory() {
-  if (!desktop || openingDataDirectory.value) return;
-  openingDataDirectory.value = true;
-  try {
-    await invoke("open_app_data_directory");
-  } catch {
-    ElMessage.error(t("settings.dataDirectory.openFailed"));
-  } finally {
-    openingDataDirectory.value = false;
-  }
-}
 
 function changeLocale(value: unknown) {
   if (value === "zh-CN" || value === "en") void update({locale: value});
@@ -41,10 +26,7 @@ function changeCloseAction(value: unknown) {
 </script>
 
 <template>
-  <section :aria-busy="loading || saving" aria-labelledby="application-settings-title" class="settings-card">
-    <header class="settings-heading">
-      <h2 id="application-settings-title">{{ t("settings.application") }}</h2>
-    </header>
+  <section :aria-busy="loading || saving" :aria-label="t('settings.application')" class="settings-card">
 
     <div aria-describedby="interface-language-description" aria-labelledby="interface-language-label" class="setting-row"
          role="group">
@@ -58,8 +40,6 @@ function changeCloseAction(value: unknown) {
                   :value="option.value"/>
       </ElSelect>
     </div>
-
-    <p class="preferences-notice">{{ t("settings.preferencesNotice") }}</p>
 
     <div aria-describedby="interface-theme-description" aria-labelledby="interface-theme-label" class="setting-row"
          role="group">
@@ -80,7 +60,8 @@ function changeCloseAction(value: unknown) {
                for="completion-notification">{{ t("settings.notifications.completion") }}</label>
         <p id="completion-notification-description">{{ t("settings.notifications.completionDescription") }}</p>
       </div>
-      <ElSwitch id="completion-notification" :aria-label="t('settings.notifications.completion')" :disabled="locked"
+      <ElSwitch id="completion-notification" :aria-label="t('settings.notifications.completion')"
+                :disabled="locked || !desktop"
                 :model-value="settings.notifyOnCompletion"
                 @update:model-value="update({notifyOnCompletion: Boolean($event)})"/>
     </div>
@@ -93,7 +74,8 @@ function changeCloseAction(value: unknown) {
           }}</label>
         <p id="failure-notification-description">{{ t("settings.notifications.failureDescription") }}</p>
       </div>
-      <ElSwitch id="failure-notification" :aria-label="t('settings.notifications.failure')" :disabled="locked"
+      <ElSwitch id="failure-notification" :aria-label="t('settings.notifications.failure')"
+                :disabled="locked || !desktop"
                 :model-value="settings.notifyOnFailure"
                 @update:model-value="update({notifyOnFailure: Boolean($event)})"/>
     </div>
@@ -104,23 +86,12 @@ function changeCloseAction(value: unknown) {
         <label id="close-action-label" for="close-action">{{ t("settings.closeAction.title") }}</label>
         <p id="close-action-description">{{ t("settings.closeAction.description") }}</p>
       </div>
-      <ElSelect id="close-action" :aria-label="t('settings.closeAction.title')" :disabled="locked" :model-value="settings.closeAction"
+      <ElSelect id="close-action" :aria-label="t('settings.closeAction.title')" :disabled="locked || !desktop"
+                :model-value="settings.closeAction"
                 class="setting-select" @update:model-value="changeCloseAction">
         <ElOption v-for="option in closeOptions" :key="option" :label="t(`settings.closeAction.${option}`)"
                   :value="option"/>
       </ElSelect>
-    </div>
-
-    <div aria-describedby="data-directory-description" aria-labelledby="data-directory-label" class="setting-row"
-         role="group">
-      <div class="setting-description">
-        <span id="data-directory-label" class="setting-label">{{ t("settings.dataDirectory.title") }}</span>
-        <p id="data-directory-description">{{ t("settings.dataDirectory.description") }}</p>
-      </div>
-      <ElButton :disabled="!desktop || openingDataDirectory" :icon="FolderOpened" :loading="openingDataDirectory"
-                @click="openDataDirectory">
-        {{ t("settings.dataDirectory.open") }}
-      </ElButton>
     </div>
 
     <p v-if="!desktop" class="preview-notice">{{ t("settings.persistence.desktopOnly") }}</p>
@@ -142,21 +113,6 @@ function changeCloseAction(value: unknown) {
   background: var(--app-surface);
 }
 
-.settings-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 20px;
-}
-
-.settings-heading h2 {
-  margin: 0;
-  color: var(--app-text);
-  font-size: 14px;
-  font-weight: 600;
-}
-
 .setting-row {
   display: flex;
   align-items: center;
@@ -169,8 +125,11 @@ function changeCloseAction(value: unknown) {
   border-top: 1px solid var(--app-border);
 }
 
-.settings-heading + .setting-row {
+.setting-row:first-child {
   padding-top: 0;
+}
+
+.setting-row:last-of-type {
   padding-bottom: 0;
 }
 
@@ -178,8 +137,7 @@ function changeCloseAction(value: unknown) {
   min-width: 0;
 }
 
-.setting-description label,
-.setting-label {
+.setting-description label {
   color: var(--app-text);
   font-size: 13px;
   font-weight: 500;
@@ -197,30 +155,15 @@ function changeCloseAction(value: unknown) {
   flex-shrink: 0;
 }
 
-.setting-row :deep(.el-button) {
-  flex-shrink: 0;
-  font-size: 12px;
-}
-
-.preferences-notice {
-  margin: 20px 0 0;
-  padding: 10px 12px;
-  border-radius: 8px;
-  color: var(--app-text-secondary);
-  background: var(--app-accent-soft);
-  font-size: 12px;
-  line-height: 1.7;
-}
-
 .preview-notice {
-  margin: 0;
+  margin: 16px 0 0;
   color: var(--app-text-secondary);
   font-size: 12px;
   line-height: 1.7;
 }
 
 .settings-error {
-  color: #a1392e;
+  color: var(--app-danger);
   font-size: 12px;
   line-height: 1.7;
   overflow-wrap: anywhere;

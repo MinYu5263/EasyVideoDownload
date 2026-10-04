@@ -1,0 +1,222 @@
+import {computed, ref} from 'vue';
+import {invoke, isTauri} from '@tauri-apps/api/core';
+import {listen} from '@tauri-apps/api/event';
+import type {DownloadRecord} from './useDownloadHistory.ts';
+import type {VideoPlatform} from './videoPlatforms.ts';
+import {
+    taskIsActive,
+    type DownloadTaskSnapshot,
+    type SubmitDownloadRequest,
+    type SubmitDownloadResult
+} from './downloadTaskTypes.ts';
+import {useCookieSettings} from './useCookieSettings.ts';
+import {usePlatformSettings} from './usePlatformSettings.ts';
+
+export interface DownloadTaskBridge {
+    desktop: boolean;
+    invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+    listen: (event: string, handler: (snapshot: DownloadTaskSnapshot) => void) => Promise<() => void>;
+    beforeRedownload?: (platform: VideoPlatform) => Promise<void>
+}
+
+export function createDownloadTasks(bridge: DownloadTaskBridge) {
+    const tasks = ref<Record<number, DownloadTaskSnapshot>>({}),
+        error = ref<{ code: string; detail?: string } | null>(null);
+    const knownRecords = ref<Record<string, DownloadRecord>>({}), recordsRevision = ref(0);
+    const lookups = new Map<string, number>();
+    const redownloadErrors = ref<Record<number, { code: string; detail?: string }>>({}),
+        submitting = ref<Record<number, boolean>>({});
+    const restarts = new Map<number, Promise<SubmitDownloadResult>>();
+    const busy = computed(() => Object.values(tasks.value).some(t => taskIsActive(t.phase)));
+    let unlisten: (() => void) | undefined, unlistenRecords: (() => void) | undefined,
+        connecting: Promise<void> | undefined, disposed = false, generation = 0;
+
+    function apply(update: DownloadTaskSnapshot) {
+        if (disposed || !update?.record || !Number.isSafeInteger(update.revision) || !Number.isSafeInteger(update.record.id)) return;
+        const old = tasks.value[update.record.id];
+        if (old && old.revision >= update.revision) return;
+        const valid = (value: number | null) => value != null && Number.isFinite(value) && value >= 0 ? value : null;
+        const next = {...update, percent: valid(update.percent), speed: valid(update.speed), eta: valid(update.eta)};
+        tasks.value = {...tasks.value, [update.record.id]: next};
+        if (taskIsActive(next.phase) && old?.record.requestId !== next.record.requestId) {
+            const errors = {...redownloadErrors.value};
+            delete errors[update.record.id];
+            redownloadErrors.value = errors;
+        }
+        knownRecords.value = {
+            ...knownRecords.value,
+            [`${update.record.platform}:${update.record.videoId}`]: update.record
+        };
+    }
+
+    function connect(): Promise<void> {
+        if (connecting) return connecting;
+        if (!bridge.desktop) return Promise.resolve();
+        disposed = false;
+        const current = ++generation;
+        connecting = (async () => {
+            try {
+                if (!unlisten) {
+                    const stop = await bridge.listen('download-task-changed', apply);
+                    if (disposed || current !== generation) {
+                        stop();
+                        return;
+                    }
+                    unlisten = stop;
+                }
+                if (!unlistenRecords) {
+                    const stop = await bridge.listen('download-records-changed', () => {
+                        if (!disposed) recordsRevision.value++;
+                    });
+                    if (disposed || current !== generation) {
+                        stop();
+                        return;
+                    }
+                    unlistenRecords = stop;
+                }
+                const snapshots = await bridge.invoke<DownloadTaskSnapshot[]>('list_download_tasks');
+                if (disposed || current !== generation) return;
+                for (const snapshot of snapshots) apply(snapshot);
+                error.value = null;
+            } catch (e) {
+                if (!disposed) error.value = typeof e === 'object' && e !== null && 'code' in e ? e as {
+                    code: string
+                } : {code: 'bridgeFailed', detail: String(e)};
+            } finally {
+                connecting = undefined;
+            }
+        })();
+        return connecting;
+    }
+
+    async function submit(request: SubmitDownloadRequest) {
+        if (!bridge.desktop) throw {code: 'desktopOnly'};
+        await connect();
+        const response = await bridge.invoke<SubmitDownloadResult>('enqueue_video_download', {request});
+        if (response.task) apply(response.task);
+        const record = taskFor(response.record.id)?.record ?? response.record;
+        knownRecords.value = {...knownRecords.value, [`${record.platform}:${record.videoId}`]: record};
+        return response;
+    }
+
+    async function cancel(requestId: string) {
+        try {
+            await bridge.invoke('cancel_video_download', {requestId});
+            return true;
+        } catch (e) {
+            error.value = {code: 'cancelFailed', detail: String(e)};
+            return false;
+        }
+    }
+
+    function redownload(record: Pick<DownloadRecord, 'id' | 'requestId' | 'platform'>): Promise<SubmitDownloadResult> {
+        const pending = restarts.get(record.id);
+        if (pending) return pending;
+        submitting.value = {...submitting.value, [record.id]: true};
+        const errors = {...redownloadErrors.value};
+        delete errors[record.id];
+        redownloadErrors.value = errors;
+        const restart = Promise.resolve().then(async () => {
+            try {
+                if (!bridge.desktop) throw {code: 'desktopOnly'};
+                await connect();
+                await bridge.beforeRedownload?.(record.platform);
+                const response = await bridge.invoke<SubmitDownloadResult>('redownload_record', {
+                    id: record.id,
+                    requestId: record.requestId
+                });
+                if (response.task) apply(response.task);
+                const latest = taskFor(response.record.id)?.record ?? response.record;
+                knownRecords.value = {...knownRecords.value, [`${latest.platform}:${latest.videoId}`]: latest};
+                return response;
+            } catch (e) {
+                redownloadErrors.value = {
+                    ...redownloadErrors.value,
+                    [record.id]: typeof e === 'object' && e !== null && 'code' in e ? e as {
+                        code: string;
+                        detail?: string
+                    } : {code: 'bridgeFailed', detail: String(e)}
+                };
+                throw e;
+            } finally {
+                const next = {...submitting.value};
+                delete next[record.id];
+                submitting.value = next;
+                restarts.delete(record.id);
+            }
+        });
+        restarts.set(record.id, restart);
+        return restart;
+    }
+
+    function isSubmitting(id: number) {
+        return Boolean(submitting.value[id]);
+    }
+
+    async function lookupRecord(platform: VideoPlatform, videoId: string) {
+        if (!bridge.desktop) return null;
+        const key = `${platform}:${videoId}`, token = (lookups.get(key) ?? 0) + 1,
+            recordRevision = recordsRevision.value;
+        lookups.set(key, token);
+        const before = Object.values(tasks.value).find(t => t.record.platform === platform && t.record.videoId === videoId)?.revision ?? 0;
+        const record = await bridge.invoke<DownloadRecord | null>('find_download_record', {platform, videoId});
+        if (lookups.get(key) !== token || recordsRevision.value !== recordRevision) return knownRecords.value[key] ?? null;
+        const live = record ? taskFor(record.id) : Object.values(tasks.value).find(task => task.record.platform === platform && task.record.videoId === videoId) ?? null;
+        const latest = live && (taskIsActive(live.phase) || live.revision > before) ? live.record : record;
+        if (latest) knownRecords.value = {...knownRecords.value, [key]: latest}; else {
+            const next = {...knownRecords.value};
+            delete next[key];
+            knownRecords.value = next;
+        }
+        return latest;
+    }
+
+    function taskFor(id: number) {
+        return tasks.value[id] ?? null;
+    }
+
+    function mergeRecord(record: DownloadRecord) {
+        const task = taskFor(record.id);
+        return task && (taskIsActive(task.phase) || (task.record.requestId === record.requestId && (record.status === 'queued' || record.status === 'running'))) ? task.record : record;
+    }
+
+    function dispose() {
+        disposed = true;
+        ++generation;
+        unlisten?.();
+        unlisten = undefined;
+        unlistenRecords?.();
+        unlistenRecords = undefined;
+    }
+
+    return {
+        tasks,
+        knownRecords,
+        recordsRevision,
+        busy,
+        error,
+        redownloadErrors,
+        isSubmitting,
+        connect,
+        submit,
+        redownload,
+        cancel,
+        lookupRecord,
+        taskFor,
+        mergeRecord,
+        dispose
+    };
+}
+
+let controller: ReturnType<typeof createDownloadTasks> | undefined;
+
+export function useDownloadTasks() {
+    return controller ??= createDownloadTasks({
+        desktop: isTauri(), invoke,
+        listen: async (name, handler) => listen<DownloadTaskSnapshot>(name, event => handler(event.payload)),
+        beforeRedownload: async platform => {
+            if (!await usePlatformSettings().whenIdle(platform)) throw {code: 'proxySettingsFailed'};
+            if (!await useCookieSettings().whenIdle(platform)) throw {code: 'cookieSaveFailed'};
+        },
+    });
+}

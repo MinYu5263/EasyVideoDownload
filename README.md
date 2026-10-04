@@ -1,158 +1,80 @@
----
-updated: "2026-10-03"
-tags:
-  - EasyVideoDownload
-  - Tauri
-  - yt-dlp
-  - 项目规划
----
+# EasyVideoDownload
 
-## 项目定位
+桌面端视频下载工具，使用 Tauri 2、Rust、Vue 3、TypeScript、Element Plus 和 SQLite。视频解析与下载由 Rust 调用
+yt-dlp，FFmpeg/FFprobe 负责音视频处理，Deno 用于网站解析所需的 JavaScript 运行时。
 
-项目名称：**EasyVideoDownload**  
-项目目录：`C:\Users\minyu\Projects\EasyVideoDownload`  
-目标平台：Windows、macOS、Linux 桌面端。  
-框架：使用 **Tauri 2 + Rust**，前端采用 **Vue 3 + TypeScript + Vite + Element Plus**。
+## 使用方式
 
-希望做一个简洁、好用、界面精致的视频下载器，让用户轻松下载视频。核心价值是减少下载所需的操作，同时取得当前账号能够访问的高画质资源。界面围绕用户的下载任务设计，避免堆砌 yt-dlp 的全部参数。
+1. 在设置中检测必备工具，可使用系统 PATH、手动选择或支持平台上的自动配置。
+2. 选择抖音、Bilibili 或 YouTube，粘贴视频链接或包含链接的分享文本。
+3. 解析真实视频信息，选择画质、帧率和保存目录，再开始下载。
+4. 在下载卡片和历史记录中查看进度、取消任务、重新下载或打开保存的文件。
 
-本文保留项目能力基线与早期讨论背景。界面与交互已有 v0.6 定稿，随后确认跨平台目标、两种工具来源与前端技术；最新范围、技术清单及待办见 [项目讨论稿](docs/project-discussion.md)。当前只有文档与模拟原型，尚未搭建正式应用。
+每条链接只处理一个视频；最多同时执行两个下载，其余按提交顺序排队。下载格式使用所选视频流的精确 ID，有独立音频时交给 FFmpeg
+合并。画质和可访问内容取决于网站、Cookie 及账号权限。
 
-## 已确定的需求与取舍
+Cookie 支持导入 Netscape 格式 UTF-8 文件、原生剪贴板粘贴及直接编辑，按平台独立保存在本机。修改内容自动保存，解析和下载使用临时副本，不让
+yt-dlp 回写用户维护的文件。具体行为见 [Cookie 说明](docs/cookies.md)。
 
-- 从零开发，使用 Tauri；已有客户端的界面与任务流程没有满足需求。
-- 主要关注抖音、Bilibili、YouTube，同时利用 yt-dlp 扩展其他平台的下载支持。
-- 保留必要的下载步骤，重视布局、交互反馈与使用体验。
-- 希望能够方便地下载最高可用画质，尤其是登录后的 B 站大会员资源。
-- 复用电脑上已经安装的工具，仅提供系统 PATH 检测和手动选择两种来源；应用不负责下载、安装或更新工具。
-- 下载失败应给出可以理解的原因与下一步操作，下载完成应明确提示实际保存位置。
-- 原先考虑过 f2 和 VideoCaptioner；当前重点已经转为视频下载器。用户更认可 yt-dlp，首版以它为下载核心。
+设置、页面状态和下载历史由 Rust 写入 SQLite；实时进度来自下载进程。应用提供浅色/深色/系统主题、下载通知、关闭询问与系统托盘功能。剪贴板、目录选择、文件操作、外部链接和通知均通过桌面原生接口执行。
 
-## 首版主流程
+## 开发与构建
 
-1. **粘贴链接**：输入视频网址；抖音分享文本中的链接可作为需要支持的输入形式。
-2. **解析视频**：显示标题及可用画质，让用户知道即将下载什么。解析期间有明确状态，失败或超时可重试。
-3. **确认下载**：默认选择最高可用画质，提供简洁的画质选择与保存目录选择，并记住上次使用的目录。
-4. **执行下载**：显示下载、合并等实际阶段，以及能够取得的进度、速度；允许取消和失败后重试。
-5. **完成提示**：显示最终文件与保存路径，提供打开文件、打开文件夹的入口。
+需要 Node.js、pnpm 和 Rust。Windows 还需要 C++ 构建工具及
+WebView2；其他平台需要对应系统构建依赖，参见 [Tauri 环境要求](https://v2.tauri.app/start/prerequisites/)。
 
-手动选择平台后执行以上流程，一次下载一个视频。Cookie 从当前平台工具栏展开导入；工具路径放在设置页。默认容器、文件命名和历史保存策略仍需确定，详细交互以项目讨论稿与原型为准。
-
-## 画质选择与已验证的命令
-
-用户已经使用 B 站大会员 Cookie，通过以下命令成功下载了约 **1.7 GB** 的视频。这是后续开发应保留的能力基线：
+首次准备项目：
 
 ```powershell
-yt-dlp --cookies "C:\Users\minyu\Downloads\www.bilibili.com_cookies.txt" --no-playlist -f "bv*+ba/b" -S "res,br,fps" --format-sort-force --merge-output-format mkv -P "C:\Users\minyu\Videos\BiliBili\yt-dlp" "https://www.bilibili.com/bangumi/play/ep785561"
-```
-
-当前命令优先分辨率，再按码率、帧率排序；选择视频和音频，并交给 FFmpeg 合并。MKV 是这次成功验证使用的容器，应用的默认容器仍需讨论。
-
-开发时需要注意：
-
-- “最高画质”受平台实际提供的格式、Cookie 有效性、账号权限等条件限制。
-- 同分辨率下可以优先高码率，但跨编码比较时不能仅靠码率判断画质。
-- 高画质资源可能是独立视频流和音频流，需要下载后合并。
-- 显示文件大小或码率时，应区分真实数据和估算值，不能把估算当作实测。
-- 解析得到的高画质格式应真正用于下载，不能只在界面中显示标签而最终下载较低规格。
-- 首版建议默认下载单个视频，合集或播放列表下载作为后续范围讨论。
-
-## Cookie 与后续登录方案
-
-首版采用 Netscape 格式 Cookie 文件导入与文本粘贴，按平台独立保存到应用数据目录；通过 Tauri 的跨平台路径 API 获取目录，再把文件路径交给 yt-dlp。
-
-早期曾希望应用内打开平台页面，通过扫码等登录方式取得 Cookie。统一扫码登录已暂缓；若后续实现，需要逐平台验证 Tauri WebView 登录、Cookie 读取及登录状态复用。
-
-Cookie 属于账号凭据，应保存在本机适当位置，日志与错误信息应脱敏，不能写入源码或示例文档。本文只记录 Cookie 文件路径，没有记录 Cookie 内容。
-
-## 技术方向与已知问题
-
-由 Tauri 的 Rust 后端负责调用下载工具、管理子进程与任务状态，Vue 3 + TypeScript 前端负责输入、选择和反馈，Vite 负责前端构建，Element Plus 提供基础交互组件。配套技术建议清单见项目讨论稿，尚未安装依赖。
-
-- 以 yt-dlp 为核心，FFmpeg 负责合并，FFprobe 可用于验证最终视频规格。
-- 调用外部工具时使用结构化参数，避免把用户输入拼接为 shell 命令。
-- 解析和下载放在后台运行，提供取消、超时与错误处理，保持界面可操作。
-- 区分解析失败、登录失效、下载失败、合并失败、保存路径不可写等情况。
-- 工具检测应说明使用的是哪一个可执行文件；缺失时提供手动配置与官方安装说明入口。
-- 用户反馈当前 yt-dlp 命令下载的抖音画质仍不足；已完成 Videdown 源码调查，下一步比较同一视频的候选资源与实际文件，再决定专用解析适配方案。
-- Tauri 的 Windows Cookie 读取存在同步调用死锁的文档提示；实现前核对所用版本的官方文档，在异步命令或合适线程中处理。
-
-Videdown 的源码调查与待验证方案见[项目讨论稿](docs/project-discussion.md#videdown-抖音源码调查2026-10-03)。本次仅检查源码，没有执行抖音解析或下载，尚未证实它能获得更高画质。
-
-用户试用过的部分客户端出现启动白屏、按钮错位、解析失败、卡死、缺少保存反馈等问题。新项目应把这些问题作为体验验证重点。
-
-## 本机环境
-
-以下可执行文件在 2026-10-02 已通过命令查找确认存在：
-
-| 工具 | 当前路径 |
-| --- | --- |
-| yt-dlp | `C:\Users\minyu\scoop\apps\python312\current\Scripts\yt-dlp.exe` |
-| FFmpeg | `C:\Users\minyu\scoop\shims\ffmpeg.exe` |
-| FFprobe | `C:\Users\minyu\scoop\shims\ffprobe.exe` |
-| Node.js | `C:\Program Files\nodejs\node.exe` |
-| pnpm | `C:\Users\minyu\scoop\shims\pnpm.exe` |
-| VideoCaptioner | `C:\Users\minyu\scoop\apps\python312\current\Scripts\videocaptioner.exe` |
-
-本机 yt-dlp 是 Python 3.12 环境下的命令行程序，此前随 VideoCaptioner 依赖安装。还有客户端管理的另一份 yt-dlp；后续应明确实际使用的路径，避免版本混淆。
-
-当前 `cargo`、`rustc` 未在 PATH 中找到。正式开发前还需检查 Rust、Windows C++ 构建工具和 WebView2，按需准备 Tauri 开发环境。
-
-用户已验证 VideoCaptioner 可以将本地视频转为文字。转写功能可以后续讨论，目前不把转写、翻译、字幕编辑加入首版下载流程。
-
-## 下一步工作建议
-
-1. 复核项目讨论稿中的技术清单，确定存储、状态管理与任务实现细节。
-2. 检查开发环境，并通过抖音、B 站、YouTube 的实际样例验证解析、格式选择和下载能力。
-3. 完成界面与技术设计，形成用户可审阅的实施方案，再搭建 Tauri 项目。
-4. 先跑通链接解析、最高可用画质下载、音视频合并、保存完成提示这一条完整流程。
-5. 验证失败、取消、重试、重复文件与不可写目录等场景，并检查窗口缩放和启动显示。
-
-验收应以实际文件为依据：视频可以播放且有声音，规格符合选中的资源，保存位置明确，错误发生后界面仍能继续使用。各平台是否可用、高画质是否保留，需要记录真实测试结果。
-
-截至交接时，项目尚未搭建，开发依赖尚未安装，也未执行 Git 初始化。Git 初始化、提交、推送、分支等改变状态的操作，需要先说明具体命令与影响，并取得用户明确确认。
-
-## 应用图标
-
-主图标只维护 `src/assets/app-icon.svg`。侧栏、关于区域和浏览器图标直接使用 SVG；桌面程序的系统图标使用从它生成的
-PNG、ICO、ICNS。生成文件位于 Git 忽略的 `src-tauri/target/generated-icons/`，无需手动修改或提交。
-
-### 日常调整与预览
-
-开发过程中直接编辑 `src/assets/app-icon.svg`，通过 Vite 热更新查看侧栏和关于区域的效果。保存 SVG 不会触发桌面程序重启，也不会自动更新系统图标。
-`pnpm dev`、`pnpm build` 和 Cargo 构建均不会自动生成桌面图标。
-
-### 手动更新桌面图标
-
-图标定稿后，在项目根目录执行：
-
-```powershell
+pnpm install --frozen-lockfile
 pnpm icons
-```
-
-随后在运行 `tauri dev` 的终端按 `Ctrl+C` 退出开发进程，再重新启动，让新图标编入程序并显示在窗口标题栏和任务栏：
-
-```powershell
 pnpm tauri dev
 ```
 
-首次运行桌面应用或清理构建目录后，也需要先运行 `pnpm icons`。
+常用检查：
 
-### 发布前更新
+```powershell
+pnpm exec vue-tsc --noEmit
+pnpm build
+cargo check --manifest-path src-tauri/Cargo.toml --locked
+cargo test --manifest-path src-tauri/Cargo.toml --locked
+```
 
-发布时先手动生成最新桌面图标，再构建安装包：
+`pnpm dev` 和 `pnpm preview` 用于界面预览，浏览器中不能执行真实解析、下载和系统功能。本地前端回归通过 `pnpm test` 执行；
+`tests/` 为 Git 忽略的本地验证内容，不随仓库分发。Rust 测试随业务代码维护，默认跳过需要真实窗口、通知、系统回收站或外部网络的手动烟测。
+
+发布安装包：
 
 ```powershell
 pnpm icons
 pnpm tauri build
 ```
 
-## 参考源码与官方文档
+安装包生成在 `src-tauri/target/release/bundle/`。请在目标操作系统上构建和验证；构建成功不能替代真实网站下载、文件播放、系统通知及安装后的桌面验证。
 
-- [yt-dlp 源码与参数说明](https://github.com/yt-dlp/yt-dlp)
-- [VideoCaptioner 源码](https://github.com/WEIFENG2333/VideoCaptioner)
-- [Videdown 源码：抖音解析思路参考](https://github.com/cshuangyy/videdown)
-- [imsyy 的 yt-dlp-gui：Tauri 调用方式参考](https://github.com/imsyy/yt-dlp-gui)
-- [Tauri 开发环境要求](https://v2.tauri.app/start/prerequisites/)
-- [Tauri 外部程序集成](https://v2.tauri.app/develop/sidecar/)
-- [Tauri WebView Cookie API](https://docs.rs/tauri/latest/tauri/webview/struct.WebviewWindow.html#method.cookies_for_url)
+## 图标与目录
+
+主图标维护在 `src/assets/app-icon.svg`，界面直接使用 SVG。`pnpm icons` 生成系统 PNG、ICO 和 ICNS，保存在忽略的
+`src-tauri/target/generated-icons/`。首次构建、清理 Cargo 目录或更新 SVG 后应重新生成；Cargo、Vite 不会自动生成图标。
+
+| 路径                         | 用途                                       |
+|------------------------------|--------------------------------------------|
+| `src/`                       | Vue 页面、共享状态、IPC 调用和本地化       |
+| `src-tauri/src/`             | 原生命令、任务调度、文件安全检查和数据存储 |
+| `src-tauri/migrations/`      | 数据库升级脚本，必须保留已有版本           |
+| `src-tauri/capabilities/`    | 桌面权限配置                               |
+| `scripts/generate-icons.mjs` | 桌面图标生成                               |
+| `docs/`                      | Cookie 与数据库正式说明                    |
+
+Windows 用户数据位于 `%LOCALAPPDATA%\EasyVideoDownload\`；其他系统通过 Tauri 的 `local_data_dir()` 定位。数据包括 `app.db`
+、Cookie、封面缓存及托管工具。设置中的“打开文件夹”可打开数据目录。迁移和历史文件安全规则见 [数据库说明](docs/database.md)。
+
+## 平台与功能限制
+
+- 工具自动配置支持 Windows、macOS 的相应架构；Linux 使用系统 PATH 或手动路径。yt-dlp、Deno 使用官方发布源，FFmpeg 使用
+  Gyan（Windows）和 Evermeet（macOS）。Apple 芯片上的自动 FFmpeg 需要 Rosetta 2。工具更新管理尚未接入。
+- 当前支持取消和重新下载，未提供暂停/恢复、合集或播放列表下载。
+- 系统回收站与安全永久删除仅在 Windows 接入。macOS/Linux 可以移除或恢复历史记录，存在旧输出文件的重新下载会因安全删除暂不支持而报错。
+- 同一视频复用历史记录；重新下载在入队后、实际任务准备时安全删除旧输出。取消排队任务会保留旧文件。文件占用、身份变化或被其他记录引用时拒绝删除。
+- 历史记录的应用回收站与系统回收站相互独立；恢复记录不会恢复已删除的视频文件。
+- 平台解析能力由网站和 yt-dlp 决定，需以实际生成的视频、音轨和所选规格验收。

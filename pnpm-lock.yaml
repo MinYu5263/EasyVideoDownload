@@ -14,9 +14,6 @@ importers:
       '@tauri-apps/api':
         specifier: ^2
         version: 2.12.1
-      '@tauri-apps/plugin-opener':
-        specifier: ^2
-        version: 2.7.0
       element-plus:
         specifier: ^2.14.7
         version: 2.14.7(vue@3.5.43(typescript@6.0.3))
@@ -282,9 +279,6 @@ packages:
     resolution: {integrity: sha512-kEDEiGzG+yAc5FeLxtXpES/VN+F2C8H0r4gDVtfRLKxT9np9101d9REG/Kgo2lr0hKi0IpDsODiHnU3+naOmLg==}
     engines: {node: '>= 10'}
     hasBin: true
-
-  '@tauri-apps/plugin-opener@2.7.0':
-    resolution: {integrity: sha512-mBorYfVKh9Lt7s4ZFtKbMUTxBw+Y/sVmSlKCtkkoBgMTC/DIbt/kaPm67L/2djAUqDI1wbixy5OHHVmipjuGMw==}
 
   '@types/lodash-es@4.17.12':
     resolution: {integrity: sha512-0NgftHUcV4v34VhXm8QBSftKVXtbkBG3ViCjs6+eJ5a6y6Mi/jiFGPc1sC7QK+9BFhWrURE3EOggmWaSxL9OzQ==}
@@ -767,10 +761,6 @@ snapshots:
       '@tauri-apps/cli-win32-arm64-msvc': 2.12.1
       '@tauri-apps/cli-win32-ia32-msvc': 2.12.1
       '@tauri-apps/cli-win32-x64-msvc': 2.12.1
-
-  '@tauri-apps/plugin-opener@2.7.0':
-    dependencies:
-      '@tauri-apps/api': 2.12.1
 
   '@types/lodash-es@4.17.12':
     dependencies:

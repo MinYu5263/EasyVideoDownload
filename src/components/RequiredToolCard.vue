@@ -6,17 +6,58 @@ import {toolWebsites, useDesktopActions} from "../composables/useDesktopActions"
 import {useI18n} from "vue-i18n";
 import type {RequiredToolId, RequiredToolSource, RequiredToolState} from "../composables/useRequiredTools";
 
-const props = defineProps<{ toolId: RequiredToolId; state: RequiredToolState; ready: boolean }>();
-const emit = defineEmits<{ check: []; choose: []; sourceChange: [source: RequiredToolSource] }>();
+const props = defineProps<{
+  toolId: RequiredToolId;
+  state: RequiredToolState;
+  ready: boolean;
+  automaticSupported: boolean;
+  requiresRosetta?: boolean
+}>();
+const emit = defineEmits<{
+  check: [];
+  choose: [];
+  configure: [];
+  cancel: [];
+  sourceChange: [source: RequiredToolSource]
+}>();
 const {t} = useI18n({useScope: "global"});
 const desktop = useDesktopActions();
 const isDirectory = computed(() => props.toolId === "ffmpeg");
 const locked = computed(() => !props.ready || props.state.operation !== null);
-const draft = computed(() => props.state.active && (props.state.source !== props.state.active.source || (props.state.source === "manual" && props.state.manualPath.trim() !== props.state.active.manualPath)));
-const status = computed(() => props.state.operation === "checking" ? "checking" : props.state.active ? "installed" : props.state.error?.code === "notFound" ? "missing" : props.state.error ? "unavailable" : "pending");
+const automatic = computed(() => props.state.source === "automatic");
+// Saved configuration can survive a failed check; show only the current selection.
+const currentConfig = computed(() => {
+  const {active, source, manualPath, operation, error} = props.state;
+  if (!active || operation === "checking" || operation === "configuring") return null;
+  if (error && error.code !== "configureCleanupFailed") return null;
+  if (active.source !== source || (source === "manual" && active.manualPath !== manualPath.trim())) return null;
+  return active;
+});
+const visibleError = computed(() => automatic.value && props.state.error?.code === "notFound" ? null : props.state.error);
+const managedReady = computed(() => currentConfig.value?.source === "automatic");
+const needsConfiguration = computed(() => automatic.value && !managedReady.value);
+const status = computed(() => {
+  if (props.state.operation === "configuring") return "configuring";
+  if (props.state.operation === "checking") return "checking";
+  if (automatic.value) {
+    if (managedReady.value) return "installed";
+    if (props.state.error && !["notFound", "configureCancelled"].includes(props.state.error.code)) return "unavailable";
+    return "notConfigured";
+  }
+  return currentConfig.value ? "installed" : props.state.error?.code === "notFound" ? "missing" : visibleError.value ? "unavailable" : "pending";
+});
+const progressText = computed(() => {
+  const progress = props.state.progress;
+  if (props.state.cancelling) return t("settings.requiredTools.cancelling");
+  if (!progress) return t("settings.requiredTools.configuring");
+  if (progress.phase === "downloading" && progress.total && progress.total > 0) {
+    return t("settings.requiredTools.downloadProgress", {percent: Math.min(100, Math.floor(progress.downloaded / progress.total * 100))});
+  }
+  return t(`settings.requiredTools.configurePhases.${progress.phase}`);
+});
 
 function sourceChanged(value: unknown) {
-  if (value === "path" || value === "manual") emit("sourceChange", value);
+  if (value === "path" || value === "manual" || (value === "automatic" && props.automaticSupported)) emit("sourceChange", value);
 }
 
 async function openWebsite(event: MouseEvent) {
@@ -32,7 +73,7 @@ async function openWebsite(event: MouseEvent) {
 
 <template>
   <section class="required-tool-card" :aria-labelledby="`required-tool-title-${toolId}`"
-           :aria-busy="state.operation === 'checking'">
+           :aria-busy="state.operation !== null">
     <header class="required-tool-heading">
       <div class="required-tool-summary">
         <div class="required-tool-title-row">
@@ -68,17 +109,28 @@ async function openWebsite(event: MouseEvent) {
             @change="sourceChanged"
         >
           <ElOption value="path" :label="t('settings.requiredTools.systemPath')"/>
+          <ElOption v-if="automaticSupported" :label="t('settings.requiredTools.automatic')" value="automatic"/>
           <ElOption value="manual" :label="t('settings.requiredTools.manual')"/>
         </ElSelect>
         <ElButton
             :disabled="locked"
-            :loading="state.operation === 'checking'"
-            :aria-label="t('settings.requiredTools.checkLabel', { program: t(`settings.requiredTools.${toolId}.name`) })"
-            @click="emit('check')"
-        >{{ t("settings.requiredTools.check") }}
+            :aria-label="t(needsConfiguration ? 'settings.requiredTools.configureLabel' : 'settings.requiredTools.checkLabel', { program: t(`settings.requiredTools.${toolId}.name`) })"
+            :loading="state.operation === 'checking' || state.operation === 'configuring'"
+            @click="needsConfiguration ? emit('configure') : emit('check')"
+        >{{
+            t(needsConfiguration || state.operation === 'configuring' ? "settings.requiredTools.configure" : "settings.requiredTools.check")
+          }}
+        </ElButton>
+        <ElButton v-if="state.operation === 'configuring'"
+                  :disabled="!state.progress || state.progress.phase === 'saving' || state.cancelling"
+                  @click="emit('cancel')">
+          {{ t("settings.requiredTools.cancel") }}
         </ElButton>
       </div>
     </header>
+
+    <p v-if="automatic && requiresRosetta" class="draft-note">{{ t("settings.requiredTools.ffmpegRosetta") }}</p>
+    <p v-if="state.operation === 'configuring'" class="draft-note" role="status">{{ progressText }}</p>
 
     <div v-if="state.source === 'manual'" class="manual-panel">
       <label class="field-label" :for="`required-tool-manual-path-${toolId}`">
@@ -101,20 +153,20 @@ async function openWebsite(event: MouseEvent) {
       </div>
     </div>
 
-    <div v-if="state.error" class="required-tool-error" role="alert">
+    <p v-if="state.error?.code === 'configureCancelled'" class="draft-note" role="status">
+      {{ t("settings.requiredTools.errors.configureCancelled") }}</p>
+    <div v-else-if="visibleError" class="required-tool-error" role="alert">
       <p>{{
-          t(`settings.requiredTools.errors.${state.error.code}`, {program: state.error.program || t(`settings.requiredTools.${toolId}.name`)})
+          t(`settings.requiredTools.errors.${visibleError.code}`, {program: visibleError.program || t(`settings.requiredTools.${toolId}.name`)})
         }}</p>
-      <p v-if="state.active">{{ t("settings.requiredTools.keepPrevious") }}</p>
-      <details v-if="state.error.detail">
+      <details v-if="visibleError.detail">
         <summary>{{ t("settings.requiredTools.errorDetails") }}</summary>
-        <pre>{{ state.error.detail }}</pre>
+        <pre>{{ visibleError.detail }}</pre>
       </details>
     </div>
-    <p v-else-if="draft" class="draft-note">{{ t("settings.requiredTools.draftNotice") }}</p>
 
-    <dl v-if="state.active" class="required-tool-details">
-      <template v-for="program in state.active.programs" :key="program.name">
+    <dl v-if="currentConfig" class="required-tool-details">
+      <template v-for="program in currentConfig.programs" :key="program.name">
         <div>
           <dt>{{ isDirectory ? program.name + ' ' : '' }}{{ t("settings.requiredTools.version") }}</dt>
           <dd>{{ program.version }}</dd>
@@ -231,17 +283,17 @@ async function openWebsite(event: MouseEvent) {
   color: var(--app-accent);
 }
 
-.status-installed .status-dot, .status-checking .status-dot {
+.status-installed .status-dot, .status-checking .status-dot, .status-configuring .status-dot {
   background: var(--app-accent);
 }
 
 .status-unavailable, .status-missing {
-  background: #fff1ef;
-  color: #a1392e;
+  background: var(--app-danger-soft);
+  color: var(--app-danger);
 }
 
 .status-unavailable .status-dot, .status-missing .status-dot {
-  background: #a1392e;
+  background: var(--app-danger);
 }
 
 .manual-panel {
@@ -303,8 +355,8 @@ async function openWebsite(event: MouseEvent) {
   margin-top: 14px;
   padding: 12px;
   border-radius: 8px;
-  background: #fff1ef;
-  color: #a1392e;
+  background: var(--app-danger-soft);
+  color: var(--app-danger);
   font-size: 12px;
   line-height: 1.7;
 }

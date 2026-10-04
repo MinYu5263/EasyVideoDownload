@@ -1,5 +1,6 @@
 import {computed, reactive, ref} from "vue";
 import {extractVideoLink, platformIds, validateVideoLink, type VideoPlatform} from "./videoPlatforms.ts";
+import type {DownloadPageState} from "./useDownloadPageState.ts";
 
 export {platformIds} from "./videoPlatforms.ts";
 
@@ -27,6 +28,14 @@ interface ParserBridge {
     invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
     beforeParse: (platform: VideoPlatform) => Promise<boolean>;
     saveCookie: (platform: VideoPlatform, contents: string) => Promise<boolean>;
+    onChange?: (platform: VideoPlatform) => void;
+    cacheThumbnail?: (url: string) => Promise<string | null>;
+}
+
+interface ParsedVideo {
+    metadata: VideoMetadata;
+    parsedAt: string;
+    parserFingerprint: string
 }
 
 interface ParseError {
@@ -34,17 +43,27 @@ interface ParseError {
     detail?: string
 }
 
+interface ResultPreview {
+    video: VideoMetadata;
+    format: VideoFormat | null;
+    thumbnailCachePath: string | null;
+}
+
 interface PlatformState {
     link: string;
-    resultLink: string;
     directory: string;
     directoryEdited: boolean;
     video: VideoMetadata | null;
+    previousResult: ResultPreview | null;
     phase: "idle" | "parsing" | "ready";
     error: ParseError | null;
     quality: string | null;
     frameRate: string | null;
     version: number;
+    selectedFormatId: string | null;
+    thumbnailCachePath: string | null;
+    parsedAt: string | null;
+    parserFingerprint: string | null;
 }
 
 function availableQualities(video: VideoMetadata | null) {
@@ -61,12 +80,24 @@ function availableFrameRates(video: VideoMetadata | null, quality: string | null
 export function createVideoParser(bridge: ParserBridge) {
     const platform = ref<VideoPlatform>(platformIds[0]);
     const drafts = reactive(Object.fromEntries(platformIds.map(id => [id, {
-        link: "", resultLink: "", directory: "", directoryEdited: false, video: null, phase: "idle", error: null,
-        quality: null, frameRate: null, version: 0,
+        link: "",
+        directory: "",
+        directoryEdited: false,
+        video: null,
+        previousResult: null,
+        phase: "idle",
+        error: null,
+        quality: null,
+        frameRate: null,
+        version: 0,
+        selectedFormatId: null,
+        thumbnailCachePath: null,
+        parsedAt: null,
+        parserFingerprint: null,
     }]))) as Record<VideoPlatform, PlatformState>;
     const draft = computed(() => drafts[platform.value]);
     const video = computed(() => draft.value.video);
-    const resultLink = computed(() => draft.value.resultLink);
+    const resultLink = computed(() => draft.value.video ? draft.value.link : "");
     const phase = computed(() => draft.value.phase);
     const error = computed(() => draft.value.error);
     const quality = computed(() => draft.value.quality);
@@ -75,34 +106,111 @@ export function createVideoParser(bridge: ParserBridge) {
     const qualities = computed(() => availableQualities(video.value));
     const frameRates = computed(() => availableFrameRates(video.value, quality.value));
     // yt-dlp returns formats in increasing preference order. Keep that order for ties.
-    const selectedFormat = computed(() => {
-        const formats = video.value?.formats.filter(format =>
-            (quality.value === null || String(format.height) === quality.value) &&
-            (frameRate.value === null || String(format.fps) === frameRate.value)) ?? [];
-        return formats[formats.length - 1] ?? null;
-    });
+    function formatFor(state: PlatformState) {
+        const formats = state.video?.formats.filter(format =>
+            (state.quality === null || String(format.height) === state.quality) &&
+            (state.frameRate === null || String(format.fps) === state.frameRate)) ?? [];
+        return formats.find(format => format.formatId === state.selectedFormatId) ?? formats[formats.length - 1] ?? null;
+    }
+
+    const selectedFormat = computed(() => formatFor(draft.value));
+    const displayVideo = computed(() => video.value ?? draft.value.previousResult?.video ?? null);
+    const displayFormat = computed(() => video.value ? selectedFormat.value : draft.value.previousResult?.format ?? null);
+    const displayThumbnailCachePath = computed(() => video.value ? draft.value.thumbnailCachePath : draft.value.previousResult?.thumbnailCachePath ?? null);
     const pasting = ref(false);
     let pasteVersion = 0;
     let disposed = false;
+
+    function changed(id: VideoPlatform = platform.value) {
+        if (!disposed) bridge.onChange?.(id);
+    }
+
+    function snapshot(id: VideoPlatform = platform.value): DownloadPageState {
+        const state = drafts[id], metadata = state.video, format = formatFor(state);
+        return {
+            platform: id,
+            inputLink: state.link,
+            videoId: metadata?.id ?? null,
+            title: metadata?.title ?? null,
+            thumbnailUrl: metadata?.thumbnail ?? null,
+            thumbnailCachePath: state.thumbnailCachePath,
+            durationSeconds: metadata?.duration ?? null,
+            extension: metadata?.extension ?? null,
+            formats: metadata?.formats ?? [],
+            selectedFormatId: format?.formatId ?? null,
+            selectedHeight: format?.height ?? null,
+            selectedFps: format?.fps ?? null,
+            cookieFallback: metadata?.cookieFallback ?? false,
+            downloadDirectory: state.directory,
+            directoryCustomized: state.directoryEdited,
+            parserFingerprint: state.parserFingerprint,
+            parsedAt: state.parsedAt,
+            updatedAt: ""
+        };
+    }
+
+    function restore(states: DownloadPageState[]) {
+        for (const saved of states) {
+            const state = drafts[saved.platform];
+            if (!state) throw {code: "loadFailed", detail: "Unknown persisted platform"};
+            const format = saved.formats.find(item => item.formatId === saved.selectedFormatId);
+            if (saved.videoId !== null && (!format || format.height !== saved.selectedHeight || format.fps !== saved.selectedFps)) throw {
+                code: "loadFailed",
+                detail: "Invalid persisted format selection"
+            };
+            state.previousResult = null;
+            state.link = saved.inputLink;
+            state.directory = saved.downloadDirectory;
+            state.directoryEdited = saved.directoryCustomized;
+            state.video = saved.videoId !== null ? {
+                id: saved.videoId!,
+                title: saved.title!,
+                thumbnail: saved.thumbnailUrl,
+                duration: saved.durationSeconds,
+                extension: saved.extension,
+                cookieFallback: saved.cookieFallback,
+                formats: saved.formats
+            } : null;
+            state.quality = saved.selectedHeight === null ? null : String(saved.selectedHeight);
+            state.frameRate = saved.selectedFps === null ? null : String(saved.selectedFps);
+            state.selectedFormatId = saved.selectedFormatId;
+            state.thumbnailCachePath = saved.thumbnailCachePath;
+            state.parsedAt = saved.parsedAt;
+            state.parserFingerprint = saved.parserFingerprint;
+            state.phase = state.video ? "ready" : "idle";
+            state.error = null;
+            state.version++;
+        }
+    }
 
     function cancelPaste() {
         pasteVersion += 1;
         pasting.value = false;
     }
 
-    function reset(selected: VideoPlatform = platform.value) {
+    function reset(selected: VideoPlatform = platform.value, retainPreview = false) {
         cancelPaste();
         const state = drafts[selected];
+        if (retainPreview && state.video) {
+            state.previousResult = {
+                video: state.video,
+                format: formatFor(state),
+                thumbnailCachePath: state.thumbnailCachePath
+            };
+        } else if (!retainPreview) {
+            state.previousResult = null;
+        }
         state.version += 1;
         state.video = null;
-        state.resultLink = "";
         state.phase = "idle";
         state.error = null;
         state.quality = state.frameRate = null;
+        state.selectedFormatId = state.thumbnailCachePath = state.parsedAt = state.parserFingerprint = null;
+        changed(selected);
     }
 
     function resetAll() {
-        platformIds.forEach(reset);
+        platformIds.forEach(id => reset(id));
     }
 
     function dispose() {
@@ -117,25 +225,35 @@ export function createVideoParser(bridge: ParserBridge) {
     }
 
     function setLink(value: string) {
-        if (busy.value) return;
+        if (busy.value || disposed) return;
         cancelPaste();
         if (draft.value.link !== value) {
             draft.value.link = value;
-            draft.value.version += 1;
-            draft.value.error = null;
+            reset(platform.value, true);
         }
     }
 
     function setDirectory(value: string) {
-        if (!busy.value) {
+        if (!busy.value && !disposed) {
             draft.value.directory = value;
             draft.value.directoryEdited = true;
+            changed();
         }
+    }
+
+    function resetDirectory(directory: string) {
+        if (busy.value || disposed) return;
+        draft.value.directory = directory;
+        draft.value.directoryEdited = false;
+        changed();
     }
 
     function applyDefaultDirectories(directories: Record<VideoPlatform, string>) {
         for (const id of platformIds) {
-            if (!drafts[id].directoryEdited) drafts[id].directory = directories[id];
+            if (!drafts[id].directoryEdited && drafts[id].directory !== directories[id]) {
+                drafts[id].directory = directories[id];
+                changed(id);
+            }
         }
     }
 
@@ -160,10 +278,27 @@ export function createVideoParser(bridge: ParserBridge) {
         if (busy.value || quality.value === value || !qualities.value.includes(value)) return;
         draft.value.quality = value;
         draft.value.frameRate = frameRates.value[0] ?? null;
+        draft.value.selectedFormatId = null;
+        changed();
     }
 
     function setFrameRate(value: string) {
-        if (!busy.value && frameRates.value.includes(value)) draft.value.frameRate = value;
+        if (!busy.value && frameRates.value.includes(value)) {
+            draft.value.frameRate = value;
+            draft.value.selectedFormatId = null;
+            changed();
+        }
+    }
+
+    function selectFormat(formatId: string) {
+        if (busy.value || disposed) return false;
+        const format = video.value?.formats.find(item => item.formatId === formatId);
+        if (!format) return false;
+        draft.value.quality = format.height === null ? null : String(format.height);
+        draft.value.frameRate = format.fps === null ? null : String(format.fps);
+        draft.value.selectedFormatId = format.formatId;
+        changed();
+        return true;
     }
 
     function updateCookie(contents: string) {
@@ -187,22 +322,33 @@ export function createVideoParser(bridge: ParserBridge) {
             state.error = {code: "desktopOnly"};
             return state.error;
         }
-        state.link = validated.url;
+        if (state.link !== validated.url) {
+            state.link = validated.url;
+            changed(selected);
+        }
         state.phase = "parsing";
         try {
             const saved = await bridge.beforeParse(selected);
             if (current !== state.version || disposed) return;
             if (!saved) throw {code: "cookieSaveFailed"};
-            const result = await bridge.invoke<VideoMetadata>("parse_video", {
+            const response = await bridge.invoke<ParsedVideo | VideoMetadata>("parse_video", {
                 platform: selected,
                 input: validated.url
             });
             if (current !== state.version || disposed) return;
+            const result = "metadata" in response ? response.metadata : response;
+            let cachePath: string | null = null;
+            if (result.thumbnail && bridge.cacheThumbnail) cachePath = await bridge.cacheThumbnail(result.thumbnail);
+            if (current !== state.version || disposed) return;
             state.video = result;
-            state.resultLink = validated.url;
             state.quality = availableQualities(result)[0] ?? null;
             state.frameRate = availableFrameRates(result, state.quality)[0] ?? null;
+            state.selectedFormatId = null;
+            state.thumbnailCachePath = cachePath;
+            state.parsedAt = "metadata" in response ? response.parsedAt : null;
+            state.parserFingerprint = "metadata" in response ? response.parserFingerprint : null;
             state.phase = "ready";
+            changed(selected);
         } catch (failure) {
             if (current !== state.version || disposed) return;
             state.error = typeof failure === "object" && failure !== null && "code" in failure
@@ -216,6 +362,9 @@ export function createVideoParser(bridge: ParserBridge) {
         platform,
         draft,
         video,
+        displayVideo,
+        displayFormat,
+        displayThumbnailCachePath,
         resultLink,
         phase,
         error,
@@ -229,15 +378,19 @@ export function createVideoParser(bridge: ParserBridge) {
         selectPlatform,
         setLink,
         setDirectory,
+        resetDirectory,
         applyDefaultDirectories,
         pasteLink,
         cancelPaste,
         setQuality,
         setFrameRate,
+        selectFormat,
         updateCookie,
         parse,
         reset,
         resetAll,
-        dispose
+        dispose,
+        restore,
+        snapshot
     };
 }

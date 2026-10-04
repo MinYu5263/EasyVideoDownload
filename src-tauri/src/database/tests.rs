@@ -1,6 +1,309 @@
 use super::*;
 use crate::required_tools::{Program, RequiredToolSource};
 
+fn version_six_for_single_input_upgrade(path: &Path) -> Connection {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(concat!(
+        include_str!("../../migrations/001_settings.sql"),
+        include_str!("../../migrations/002_settings_key_value.sql"),
+        include_str!("../../migrations/003_beijing_datetime.sql"),
+        include_str!("../../migrations/004_automatic_ytdlp.sql"),
+        include_str!("../../migrations/005_persistence.sql"),
+        include_str!("../../migrations/006_automatic_tools.sql"),
+        "PRAGMA user_version=6;"
+        ))
+        .unwrap();
+    connection
+}
+
+#[test]
+fn single_input_link_upgrade_keeps_current_results_and_history_but_clears_stale_results() {
+    let (dir, path, legacy) = paths();
+    eprintln!(
+        "temporary single input upgrade directory: {}",
+        dir.path().display()
+    );
+    let connection = version_six_for_single_input_upgrade(&path);
+    let formats = r#"[{"formatId":"video","height":1080,"fps":59.94,"extension":"mp4","sizeBytes":100,"sizeApproximate":false}]"#;
+    for (platform, input, parsed) in [
+        ("youtube", "https://youtu.be/new", "https://youtu.be/old"),
+        (
+            "douyin",
+            "https://douyin.com/video/1",
+            "https://douyin.com/video/1",
+        ),
+    ] {
+        connection.execute("INSERT INTO download_page_states(platform,input_link,parsed_link,video_id,title,formats_json,selected_format_id,selected_height,selected_fps,cookie_fallback,download_directory,directory_customized,parser_fingerprint,parsed_at) VALUES(?1,?2,?3,'old','Saved title',?4,'video',1080,59.94,1,?5,1,'fingerprint','2026-10-04 10:00:00')", params![platform,input,parsed,formats,dir.path().to_string_lossy()]).unwrap();
+    }
+    connection.execute("INSERT INTO download_records(request_id,platform,video_id,source_link,title,format_id,download_directory,status,started_at,finished_at,output_path,file_size_bytes) VALUES('old-request','youtube','old','https://youtu.be/old','History title','video',?1,'completed','2026-10-04 10:00:00','2026-10-04 10:01:00',?2,100)", params![dir.path().to_string_lossy(),dir.path().join("old.mp4").to_string_lossy()]).unwrap();
+    drop(connection);
+    let database = Database::open(&path, &legacy).unwrap();
+    let connection = database.connection("test").unwrap();
+    let parsed_columns: i64 = connection.query_row("SELECT count(*) FROM pragma_table_info('download_page_states') WHERE name='parsed_link'", [], |r| r.get(0)).unwrap();
+    assert_eq!(parsed_columns, 0);
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        11
+    );
+    drop(connection);
+    let states = database.download_page_states().unwrap();
+    let stale = states.iter().find(|s| s.platform == "youtube").unwrap();
+    assert_eq!(stale.input_link, "https://youtu.be/new");
+    assert_eq!(stale.video_id, None);
+    assert!(stale.formats.is_empty());
+    assert_eq!(stale.selected_format_id, None);
+    assert_eq!(stale.parser_fingerprint, None);
+    assert_eq!(stale.parsed_at, None);
+    assert!(!stale.cookie_fallback);
+    assert_eq!(stale.download_directory, dir.path().to_string_lossy());
+    assert!(stale.directory_customized);
+    let current = states.iter().find(|s| s.platform == "douyin").unwrap();
+    assert_eq!(current.video_id.as_deref(), Some("old"));
+    assert_eq!(current.selected_fps, Some(59.94));
+    let history = database.list_download_records(None, 50).unwrap();
+    assert_eq!(history.total_count, 1);
+    assert_eq!(history.records[0].source_link, "https://youtu.be/old");
+    drop(database);
+    let reopened = Database::open(&path, &legacy).unwrap();
+    assert_eq!(reopened.download_page_states().unwrap(), states);
+}
+
+#[test]
+fn failed_single_input_upgrade_rolls_back_result_cleanup_column_and_version() {
+    let (dir, path, legacy) = paths();
+    eprintln!(
+        "temporary single input rollback directory: {}",
+        dir.path().display()
+    );
+    let connection = version_six_for_single_input_upgrade(&path);
+    connection.execute_batch("INSERT INTO download_page_states(platform,input_link,parsed_link,video_id,title) VALUES('youtube','https://youtu.be/new','https://youtu.be/old','old','Old result'); CREATE TRIGGER legacy_page_reference AFTER UPDATE ON download_page_states WHEN NEW.parsed_link IS NOT NULL BEGIN SELECT 1; END;").unwrap();
+    drop(connection);
+    assert!(Database::open(&path, &legacy).is_err());
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        6
+    );
+    let old: (String, String, String) = connection
+        .query_row(
+            "SELECT input_link,parsed_link,title FROM download_page_states",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        old,
+        (
+            "https://youtu.be/new".into(),
+            "https://youtu.be/old".into(),
+            "Old result".into()
+        )
+    );
+    connection
+        .execute_batch("DROP TRIGGER legacy_page_reference;")
+        .unwrap();
+    drop(connection);
+    let repaired = Database::open(&path, &legacy).unwrap();
+    assert_eq!(repaired.download_page_states().unwrap()[0].video_id, None);
+}
+
+#[test]
+fn persistence_migration_preserves_existing_data_and_can_roll_back() {
+    let (_dir, path, legacy) = paths();
+    let db = Database::open(&path, &legacy).unwrap();
+    db.app_settings("en").unwrap();
+    let c = db.connection("test").unwrap();
+    assert_eq!(
+        c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        11
+    );
+    assert_eq!(c.query_row("SELECT count(*) FROM sqlite_schema WHERE name IN ('download_page_states','download_records','idx_download_records_started','idx_download_records_platform_started')", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
+    c.execute_batch("DROP TABLE download_records; DROP TABLE download_page_states; PRAGMA user_version=4; CREATE TABLE download_records (sentinel TEXT);").unwrap();
+    drop(c);
+    drop(db);
+    assert!(Database::open(&path, &legacy).is_err());
+    let c = Connection::open(&path).unwrap();
+    assert_eq!(
+        c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        c.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name='download_page_states'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+            .unwrap(),
+        0
+    );
+    c.execute_batch("DROP TABLE download_records;").unwrap();
+    drop(c);
+    let db = Database::open(&path, &legacy).unwrap();
+    assert_eq!(db.app_settings("zh-CN").unwrap().locale, "en");
+}
+
+#[test]
+fn version_five_upgrade_preserves_tools_and_preferences() {
+    let (_dir, path, legacy) = paths();
+    let db = Database::open(&path, &legacy).unwrap();
+    let settings = db.app_settings("en").unwrap();
+    let mut ytdlp = config(RequiredToolId::Ytdlp, "2026.09.25");
+    ytdlp.source = RequiredToolSource::Automatic;
+    ytdlp.manual_path.clear();
+    db.save_tool(RequiredToolId::Ytdlp, &ytdlp).unwrap();
+    db.save_tool(
+        RequiredToolId::Ffmpeg,
+        &config(RequiredToolId::Ffmpeg, "9.0.2"),
+    )
+        .unwrap();
+    let tools = db.tools().unwrap();
+    {
+        let connection = db.connection("test").unwrap();
+        connection
+            .execute_batch(include_str!("../../migrations/004_automatic_ytdlp.sql"))
+            .unwrap();
+        // Recreate the schema present at version 5 before testing its upgrade.
+        connection
+            .execute_batch(
+                "ALTER TABLE download_page_states ADD COLUMN parsed_link TEXT;
+                ALTER TABLE download_records DROP COLUMN error_stage;
+                ALTER TABLE download_records DROP COLUMN failure_kind;
+                DROP INDEX idx_download_records_normal_started;
+                DROP INDEX idx_download_records_trash_started;
+                ALTER TABLE download_records DROP COLUMN deleted_at;
+                ALTER TABLE download_records DROP COLUMN file_deleted_at;
+                DROP INDEX idx_download_records_status_started;",
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
+    }
+    drop(db);
+    let upgraded = Database::open(&path, &legacy).unwrap();
+    assert_eq!(upgraded.tools().unwrap(), tools);
+    assert_eq!(upgraded.app_settings("zh-CN").unwrap(), settings);
+    let mut deno = config(RequiredToolId::Deno, "2.9.7");
+    deno.source = RequiredToolSource::Automatic;
+    deno.manual_path.clear();
+    upgraded.save_tool(RequiredToolId::Deno, &deno).unwrap();
+}
+
+#[test]
+fn automatic_ffmpeg_and_deno_configurations_restore_as_complete_groups() {
+    let (_dir, path, legacy) = paths();
+    let db = Database::open(&path, &legacy).unwrap();
+    let mut expected = Vec::new();
+    for (id, version) in [
+        (RequiredToolId::Ffmpeg, "9.0.2"),
+        (RequiredToolId::Deno, "2.9.7"),
+    ] {
+        let mut configured = config(id, version);
+        configured.source = RequiredToolSource::Automatic;
+        configured.manual_path.clear();
+        db.save_tool(id, &configured).unwrap();
+        expected.push((id, configured));
+    }
+    drop(db);
+    let reopened = Database::open(&path, &legacy).unwrap();
+    for (id, configured) in expected {
+        assert_eq!(reopened.tools().unwrap().tools[&id], configured);
+    }
+}
+
+#[test]
+fn automatic_ytdlp_configuration_restores_after_reopening() {
+    let (_dir, path, legacy) = paths();
+    let db = Database::open(&path, &legacy).unwrap();
+    let mut configured = config(RequiredToolId::Ytdlp, "2026.09.25");
+    configured.source = serde_json::from_str("\"automatic\"")
+        .expect("yt-dlp should support application-managed configuration");
+    configured.manual_path.clear();
+    db.save_tool(RequiredToolId::Ytdlp, &configured).unwrap();
+    drop(db);
+    let reopened = Database::open(&path, &legacy).unwrap();
+    assert_eq!(
+        reopened.tools().unwrap().tools[&RequiredToolId::Ytdlp],
+        configured
+    );
+    assert_eq!(reopened.tools().unwrap().tools.len(), 1);
+}
+
+#[test]
+fn proxy_settings_are_saved_as_one_record_and_restore_after_reopening() {
+    let (_dir, path, legacy) = paths();
+    let db = Database::open(&path, &legacy).unwrap();
+    assert_eq!(db.proxy_settings().unwrap(), None);
+    let proxy = crate::proxy::ProxySettings {
+        protocol: "socks5".into(),
+        address: "127.0.0.1".into(),
+        port: 7890,
+    };
+    db.save_proxy_settings(Some(&proxy)).unwrap();
+    db.save_app_settings(&db.app_settings("zh-CN").unwrap())
+        .unwrap();
+    drop(db);
+    let reopened = Database::open(&path, &legacy).unwrap();
+    assert_eq!(reopened.proxy_settings().unwrap(), Some(proxy));
+    reopened.save_proxy_settings(None).unwrap();
+    assert_eq!(reopened.proxy_settings().unwrap(), None);
+}
+
+#[test]
+fn invalid_proxy_and_failed_writes_keep_the_applied_configuration() {
+    let (_dir, path, legacy) = paths();
+    let db = Database::open(&path, &legacy).unwrap();
+    let saved = crate::proxy::ProxySettings {
+        protocol: "http".into(),
+        address: "127.0.0.1".into(),
+        port: 7890,
+    };
+    db.save_proxy_settings(Some(&saved)).unwrap();
+    let invalid = crate::proxy::ProxySettings {
+        port: 0,
+        ..saved.clone()
+    };
+    assert_eq!(
+        db.save_proxy_settings(Some(&invalid)).unwrap_err().code,
+        "invalidSettings"
+    );
+    db.connection("test").unwrap().execute_batch(
+        "CREATE TRIGGER reject_proxy BEFORE UPDATE ON app_settings WHEN NEW.setting_key = 'proxy'
+         BEGIN SELECT RAISE(ABORT, 'test failure'); END;"
+    ).unwrap();
+    // Unchanged settings must not write or update their timestamp.
+    db.save_proxy_settings(Some(&saved)).unwrap();
+    let changed = crate::proxy::ProxySettings {
+        port: 8080,
+        ..saved.clone()
+    };
+    assert_eq!(
+        db.save_proxy_settings(Some(&changed)).unwrap_err().code,
+        "saveFailed"
+    );
+    assert_eq!(db.proxy_settings().unwrap(), Some(saved));
+}
+
+#[test]
+fn corrupt_proxy_is_reported_instead_of_replaced_with_direct_connection() {
+    let (_dir, path, legacy) = paths();
+    let db = Database::open(&path, &legacy).unwrap();
+    db.connection("test")
+        .unwrap()
+        .execute(
+            "INSERT INTO app_settings (setting_key, value_json) VALUES ('proxy', ?1)",
+            [r#"{"protocol":"http","address":"http://wrong","port":7890}"#],
+        )
+        .unwrap();
+    assert_eq!(db.proxy_settings().unwrap_err().code, "loadFailed");
+}
+
 fn paths() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("EasyVideoDownload/app.db");
@@ -44,7 +347,7 @@ fn preferences_restore_after_reopening_without_overwriting_saved_locale() {
         AppSettings {
             locale: "zh-CN".into(),
             theme: "system".into(),
-            notify_on_completion: true,
+            notify_on_completion: false,
             notify_on_failure: true,
             close_action: "ask".into(),
         }
@@ -285,7 +588,7 @@ fn version_two_times_become_beijing_time_once_without_changing_configuration() {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            11
         );
         assert_eq!(
             connection
@@ -465,7 +768,7 @@ fn version_one_migration_preserves_preferences_programs_and_original_times() {
         connection
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        3
+        11
     );
     drop(connection);
     drop(db);

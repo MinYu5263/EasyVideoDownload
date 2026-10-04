@@ -5,6 +5,13 @@
       <link href="/src/assets/app-icon.svg?no-inline" rel="icon" type="image/svg+xml"/>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>EasyVideoDownload</title>
+      <style>
+          /* Match the native background before the JavaScript/CSS bundle loads. */
+          html, body {
+              margin: 0;
+              background: var(--app-background, #f5f8f6);
+          }
+      </style>
   </head>
 
   <body>

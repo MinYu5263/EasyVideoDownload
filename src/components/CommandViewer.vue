@@ -7,6 +7,8 @@ import {type VideoPlatform} from "../composables/videoPlatforms";
 import {createVideoCommand, type DownloadCommandOptions} from "../composables/useVideoCommand";
 import {useCookieSettings} from "../composables/useCookieSettings";
 import {useDesktopActions} from "../composables/useDesktopActions";
+import {proxySettingsRevision} from "../composables/useProxySettings";
+import {usePlatformSettings} from "../composables/usePlatformSettings";
 
 const props = defineProps<{
   title: string; platform: VideoPlatform; input: string; active: boolean; disabled: boolean;
@@ -15,16 +17,21 @@ const props = defineProps<{
 const {t} = useI18n({useScope: "global"});
 const desktop = useDesktopActions();
 const cookies = useCookieSettings();
+const platformSettings = usePlatformSettings();
 const viewer = createVideoCommand({
   desktop: desktop.desktop,
   invoke,
-  beforeRead: cookies.whenIdle,
+  beforeRead: async selected => {
+    if (!await platformSettings.whenIdle(selected)) throw {code: "platformSettingsFailed"};
+    return cookies.whenIdle(selected);
+  },
   writeClipboard: desktop.writeClipboard
 });
 const {open, command, loading, copying, error} = viewer;
 const errorMessage = computed(() => {
+  if (error.value?.code === "platformSettingsFailed") return t("download.configuration.loadFailed");
   const known = ["invalidLink", "platformMismatch", "desktopOnly", "cookieSaveFailed", "cookieReadFailed", "toolMissing",
-    "toolSettingsFailed", "commandUnavailable", "clipboardWriteFailed", "invalidDownloadDirectory", "invalidDownloadOptions", "ffmpegMissing"];
+    "toolSettingsFailed", "proxySettingsFailed", "commandUnavailable", "clipboardWriteFailed", "invalidDownloadDirectory", "invalidDownloadOptions", "ffmpegMissing"];
   const code = error.value && known.includes(error.value.code) ? error.value.code : "bridgeFailed";
   return t(`download.errors.${code}`, {platform: t(`download.platforms.${props.platform}`)});
 });
@@ -32,6 +39,8 @@ watch(() => [props.active, props.disabled] as const, ([active, disabled]) => {
   if (!active || disabled) viewer.close();
 });
 watch(() => [props.platform, props.input, props.downloadOptions] as const, () => viewer.close());
+watch(proxySettingsRevision, viewer.close);
+watch(() => platformSettings.revision[props.platform], viewer.close);
 onUnmounted(viewer.dispose);
 
 function setOpen(value: boolean) {
@@ -122,7 +131,7 @@ async function copy() {
 
 .command-error {
   margin: 12px 0 0;
-  color: #a1392e;
+  color: var(--app-danger);
   font-size: 12px;
   line-height: 1.7;
 }

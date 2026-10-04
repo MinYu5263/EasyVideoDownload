@@ -12,7 +12,10 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "EasyVideoDownload",
+        "visible": false,
+        "backgroundColor": "#f5f8f6",
         "width": 1120,
         "height": 720,
         "minWidth": 960,

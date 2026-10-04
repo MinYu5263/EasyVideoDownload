@@ -30,7 +30,7 @@ function bridgeError(error: unknown): SettingsError {
 
 export function createAppSettings(bridge: SettingsBridge) {
     const settings = reactive<AppSettings>({
-        locale: "en", theme: "system", notifyOnCompletion: true,
+        locale: "en", theme: "system", notifyOnCompletion: false,
         notifyOnFailure: true, closeAction: "ask",
     });
     const draft = reactive<AppSettings>({...settings});

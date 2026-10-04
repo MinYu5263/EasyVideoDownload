@@ -54,7 +54,7 @@ const emit = defineEmits<{ change: [value: T] }>();
   --el-segmented-item-selected-bg-color: var(--app-accent-soft);
   --el-segmented-item-selected-disabled-bg-color: var(--app-accent-soft);
   --el-segmented-item-hover-color: var(--app-accent);
-  --el-segmented-item-hover-bg-color: #f0f5f1;
+  --el-segmented-item-hover-bg-color: var(--app-hover);
   --el-segmented-item-active-bg-color: var(--app-accent-soft);
   --el-border-radius-base: 11px;
 
@@ -67,6 +67,9 @@ const emit = defineEmits<{ change: [value: T] }>();
 
 .segmented-control :deep(.el-segmented__group) {
   gap: 4px;
+  /* Keep labels at their natural width and clip the rounded selection background. */
+  min-width: max-content;
+  overflow: hidden;
 }
 
 .segmented-control :deep(.el-segmented__item) {

@@ -1,5 +1,6 @@
 use super::{error, normalize_link, VideoError};
 use crate::cookies::{CookiePlatform, CookieStore};
+use crate::proxy::ProxySettings;
 use crate::required_tools::{RequiredToolId, RequiredToolSettings};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -9,6 +10,7 @@ fn configured_command(
     settings: &RequiredToolSettings,
     cookie: Option<&Path>,
     purpose: &[&str],
+    proxy: Option<&ProxySettings>,
 ) -> Result<Command, VideoError> {
     let ytdlp = settings
         .tools
@@ -34,6 +36,37 @@ fn configured_command(
         "--extractor-retries",
         "1",
     ]);
+    if let Some(proxy) = proxy {
+        // Only an explicit app proxy overrides the original network environment.
+        // With the switch off, yt-dlp keeps its normal system/VPN proxy discovery.
+        for name in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "FTP_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "ftp_proxy",
+            "no_proxy",
+        ] {
+            command.env_remove(name);
+        }
+        let url = proxy.url();
+        command.arg("--proxy").arg(&url);
+        // A nonempty environment proxy map avoids Windows registry bypass rules.
+        for name in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            command.env(name, &url);
+        }
+    }
     command.args(purpose);
     if let Some(deno) = settings
         .tools
@@ -56,11 +89,13 @@ pub(super) fn parsing_command(
     settings: &RequiredToolSettings,
     url: &str,
     cookie: Option<&Path>,
+    proxy: Option<&ProxySettings>,
 ) -> Result<Command, VideoError> {
     let mut command = configured_command(
         settings,
         cookie,
         &["--dump-single-json", "--simulate", "--no-progress"],
+        proxy,
     )?;
     command.arg("--").arg(url);
     Ok(command)
@@ -74,6 +109,9 @@ pub struct DownloadCommandOptions {
     pub(super) container: Option<String>,
     #[serde(default)]
     pub(super) cookie_fallback: bool,
+    // Only an immutable native parse/record snapshot supplies format constraints.
+    #[serde(skip)]
+    pub(super) selected_format: Option<super::VideoFormat>,
 }
 
 pub(super) fn download_command(
@@ -81,6 +119,7 @@ pub(super) fn download_command(
     url: &str,
     cookie: Option<&Path>,
     options: &DownloadCommandOptions,
+    proxy: Option<&ProxySettings>,
 ) -> Result<Command, VideoError> {
     if !Path::new(&options.directory).is_absolute() {
         return Err(error(
@@ -115,6 +154,9 @@ pub(super) fn download_command(
         },
         &[
             "--no-simulate",
+            "--verbose",
+            "--color",
+            "never",
             "--newline",
             "--no-overwrites",
             "--progress",
@@ -125,10 +167,11 @@ pub(super) fn download_command(
             "--progress-template",
             "postprocess:__EVD_PROCESSING__%(progress.{status,postprocessor})j",
             "--print",
-            "before_dl:__EVD_PLAN__{\"formats\":%(requested_formats.:.{format_id,filesize,filesize_approx}|[])j,\"formatId\":%(format_id)j,\"size\":%(filesize,filesize_approx|0)j}",
+            "before_dl:__EVD_PLAN__{\"filepath\":%(_filename)j,\"formats\":%(requested_formats.:.{format_id,filesize,filesize_approx}|[])j,\"formatId\":%(format_id)j,\"size\":%(filesize,filesize_approx|0)j}",
             "--print",
             "after_move:__EVD_FILE__%(.{filepath,__real_download})j",
         ],
+        proxy,
     )?;
     let ffmpeg = settings
         .tools
@@ -142,8 +185,7 @@ pub(super) fn download_command(
     // Match the exact selected stream. Quoting keeps numeric IDs as strings.
     // Video-only streams use separate audio when present. The second branch also
     // handles combined streams and genuinely silent videos without forcing audio.
-    let filters = format!("[format_id=\"{}\"]", options.format_id);
-    let format = format!("bestvideo{filters}+bestaudio/best*{filters}");
+    let format = download_format_selector(options, url);
     if let Some(container) = &options.container {
         // Keep the selected video's container when audio is merged. This changes
         // muxing only; the selected stream and its codec are not re-encoded.
@@ -160,6 +202,69 @@ pub(super) fn download_command(
         .args(["--output", "%(title)s [%(id)s] [%(format_id)s].%(ext)s"]);
     command.arg("--").arg(url);
     Ok(command)
+}
+
+fn download_format_selector(options: &DownloadCommandOptions, source: &str) -> String {
+    let exact_filter = format!("[format_id=\"{}\"]", options.format_id);
+    let select = |filter: &str| format!("bestvideo{filter}+bestaudio/best*{filter}");
+    let exact = select(&exact_filter);
+    let douyin = url::Url::parse(source).ok().is_some_and(|url| {
+        url.host_str()
+            .is_some_and(|host| host == "douyin.com" || host.ends_with(".douyin.com"))
+    });
+    let Some(selected) = options
+        .selected_format
+        .as_ref()
+        .filter(|format| format.format_id == options.format_id)
+    else {
+        return exact;
+    };
+    if !douyin {
+        return exact;
+    }
+    // Douyin returns several mirror URLs for one codec/resolution/bitrate family.
+    // yt-dlp's duplicate suffix is request-specific, so retain the exact ID first
+    // and accept only other mirrors with the same known quality and frame rate.
+    let family = options
+        .format_id
+        .rsplit_once('-')
+        .filter(|(_, suffix)| !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit()))
+        .map(|(family, _)| family)
+        .unwrap_or(&options.format_id);
+    let parts = family.split('_').collect::<Vec<_>>();
+    if parts.len() != 3
+        || !matches!(parts[0], "h264" | "bytevc1")
+        || !parts[1]
+        .strip_suffix('p')
+        .is_some_and(|height| !height.is_empty() && height.bytes().all(|c| c.is_ascii_digit()))
+        || parts[2].is_empty()
+        || !parts[2].bytes().all(|c| c.is_ascii_digit())
+    {
+        return exact;
+    }
+    let Some(height) = selected.height.filter(|height| *height > 0) else {
+        return exact;
+    };
+    let Some(extension) = selected
+        .extension
+        .as_deref()
+        .filter(|ext| !ext.is_empty() && ext.bytes().all(|c| c.is_ascii_alphanumeric()))
+    else {
+        return exact;
+    };
+    let Some(fps) = selected.fps.filter(|fps| fps.is_finite() && *fps > 0.0) else {
+        return exact;
+    };
+    let quality = format!("[height={height}][ext=\"{extension}\"][fps={fps}]");
+    [
+        format!("{exact_filter}{quality}"),
+        format!("[format_id=\"{family}\"]{quality}"),
+        format!("[format_id^=\"{family}-\"]{quality}"),
+    ]
+        .iter()
+        .map(|filter| select(filter))
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[derive(Debug, Serialize)]
@@ -198,6 +303,7 @@ pub(super) fn command_preview(
     store: &CookieStore,
     platform: CookiePlatform,
     input: &str,
+    proxy: Option<&ProxySettings>,
 ) -> Result<VideoCommand, VideoError> {
     let url = normalize_link(input, platform)?;
     let has_cookie = !store
@@ -207,7 +313,7 @@ pub(super) fn command_preview(
     // The execution snapshot is removed after parsing. Use the maintained file path
     // for a reusable command; never expose Cookie contents or create a new snapshot.
     let path = store.path(platform);
-    let command = parsing_command(settings, &url, has_cookie.then_some(path.as_path()))?;
+    let command = parsing_command(settings, &url, has_cookie.then_some(path.as_path()), proxy)?;
     render_command(&command, cfg!(windows))
 }
 
@@ -217,6 +323,7 @@ pub(super) fn download_command_preview(
     platform: CookiePlatform,
     input: &str,
     options: &DownloadCommandOptions,
+    proxy: Option<&ProxySettings>,
 ) -> Result<VideoCommand, VideoError> {
     let url = normalize_link(input, platform)?;
     let has_cookie = !options.cookie_fallback
@@ -230,6 +337,7 @@ pub(super) fn download_command_preview(
         &url,
         has_cookie.then_some(path.as_path()),
         options,
+        proxy,
     )?;
     render_command(&command, cfg!(windows))
 }

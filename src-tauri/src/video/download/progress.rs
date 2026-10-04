@@ -17,6 +17,7 @@ pub(super) struct ProgressTracker {
     planned: Vec<String>,
     combined_id: String,
     percentage: f64,
+    last_speed: Option<f64>,
     started: bool,
     processing: bool,
 }
@@ -80,6 +81,13 @@ impl ProgressTracker {
                 self.processing = true;
             }
         }
+        // Missing samples do not invalidate the last measured transfer speed.
+        // Postprocessing no longer represents an active network transfer.
+        self.last_speed = if self.processing {
+            None
+        } else {
+            speed.or(self.last_speed)
+        };
         DownloadProgress {
             phase: if self.processing {
                 "processing"
@@ -89,7 +97,7 @@ impl ProgressTracker {
                 "preparing"
             },
             percent: Some(self.percentage),
-            speed: if self.processing { None } else { speed },
+            speed: self.last_speed,
             eta: if self.processing { None } else { eta },
         }
     }

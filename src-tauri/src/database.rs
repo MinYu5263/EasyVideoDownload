@@ -1,8 +1,9 @@
 use crate::datetime;
+use crate::proxy::ProxySettings;
 use crate::required_tools::{
     self, Program, RequiredToolConfig, RequiredToolId, RequiredToolSettings, RequiredToolSource,
 };
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -39,6 +40,15 @@ pub struct AppSettings {
 pub struct Database {
     connection: Mutex<Connection>,
 }
+
+pub(crate) mod download_records;
+pub(crate) mod page_states;
+pub(crate) mod platform_settings;
+pub(crate) mod tool_checks;
+pub(crate) mod ui_preferences;
+
+#[cfg(test)]
+pub(crate) mod persistence_tests;
 
 impl Database {
     pub fn open(path: &Path, legacy: &Path) -> Result<Self, StorageError> {
@@ -92,7 +102,7 @@ impl Database {
                             .execute_batch(include_str!("../migrations/002_settings_key_value.sql"))
                             .map_err(|e| StorageError::new("loadFailed", e))?;
                     }
-                    2 | 3 => {}
+                    2..=11 => {}
                     _ => {
                         return Err(StorageError::new(
                             "loadFailed",
@@ -104,6 +114,70 @@ impl Database {
                     migrate_beijing_times(&transaction)?;
                     transaction
                         .pragma_update(None, "user_version", 3)
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                }
+                if version < 4 {
+                    transaction
+                        .execute_batch(include_str!("../migrations/004_automatic_ytdlp.sql"))
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                    transaction
+                        .pragma_update(None, "user_version", 4)
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                }
+                if version < 5 {
+                    transaction
+                        .execute_batch(include_str!("../migrations/005_persistence.sql"))
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                    transaction
+                        .pragma_update(None, "user_version", 5)
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                }
+                if version < 6 {
+                    transaction
+                        .execute_batch(include_str!("../migrations/006_automatic_tools.sql"))
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                    transaction
+                        .pragma_update(None, "user_version", 6)
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                }
+                if version < 7 {
+                    transaction
+                        .execute_batch(include_str!("../migrations/007_single_input_link.sql"))
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                    transaction
+                        .pragma_update(None, "user_version", 7)
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                }
+                if version < 8 {
+                    transaction
+                        .execute_batch(include_str!("../migrations/008_download_history_cards.sql"))
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                    transaction
+                        .pragma_update(None, "user_version", 8)
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                }
+                if version < 9 {
+                    transaction
+                        .execute_batch(include_str!("../migrations/009_download_history_trash.sql"))
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                    transaction
+                        .pragma_update(None, "user_version", 9)
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                }
+                if version < 10 {
+                    transaction
+                        .execute_batch(include_str!("../migrations/010_shared_download_tasks.sql"))
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                    transaction
+                        .pragma_update(None, "user_version", 10)
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                }
+                if version < 11 {
+                    transaction
+                        .execute_batch(include_str!("../migrations/011_output_identity.sql"))
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                    transaction
+                        .pragma_update(None, "user_version", 11)
                         .map_err(|e| StorageError::new("loadFailed", e))?;
                 }
                 // Legacy JSON is normalized to Beijing time during deserialization.
@@ -177,11 +251,31 @@ impl Database {
         Ok(())
     }
 
+    pub fn proxy_settings(&self) -> Result<Option<ProxySettings>, StorageError> {
+        let connection = self.connection("loadFailed")?;
+        read_proxy_settings(&connection)
+    }
+
+    pub fn save_proxy_settings(
+        &self,
+        settings: Option<&ProxySettings>,
+    ) -> Result<(), StorageError> {
+        let settings = settings.map(ProxySettings::normalized).transpose()?;
+        let value =
+            serde_json::to_string(&settings).map_err(|e| StorageError::new("saveFailed", e))?;
+        self.connection("saveFailed")?.execute(
+            "INSERT INTO app_settings (setting_key, value_json, updated_at) VALUES ('proxy', ?1, ?2)
+             ON CONFLICT (setting_key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at
+             WHERE app_settings.value_json <> excluded.value_json", params![value, datetime::now()],
+        ).map_err(|e| StorageError::new("saveFailed", e))?;
+        Ok(())
+    }
     pub fn tools(&self) -> Result<RequiredToolSettings, StorageError> {
         let connection = self.connection("loadFailed")?;
         read_tools(&connection, false)
     }
 
+    #[cfg(test)]
     pub fn save_tool(
         &self,
         id: RequiredToolId,
@@ -202,6 +296,29 @@ impl Database {
             .map_err(|e| StorageError::new("saveFailed", e))?;
         Ok(())
     }
+}
+
+fn read_proxy_settings(connection: &Connection) -> Result<Option<ProxySettings>, StorageError> {
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value_json FROM app_settings WHERE setting_key = 'proxy'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| StorageError::new("loadFailed", e))?;
+    let settings: Option<ProxySettings> = value
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .map_err(|_| StorageError::new("loadFailed", "Invalid stored proxy settings"))?
+        .flatten();
+    settings
+        .map(|settings| {
+            settings
+                .normalized()
+                .map_err(|_| StorageError::new("loadFailed", "Invalid stored proxy settings"))
+        })
+        .transpose()
 }
 
 fn migrate_beijing_times(connection: &Connection) -> Result<(), StorageError> {
@@ -264,7 +381,7 @@ fn read_app_settings(
     let mut settings = AppSettings {
         locale: initial_locale.into(),
         theme: "system".into(),
-        notify_on_completion: true,
+        notify_on_completion: false,
         notify_on_failure: true,
         close_action: "ask".into(),
     };
@@ -341,6 +458,7 @@ fn read_tools(connection: &Connection, legacy: bool) -> Result<RequiredToolSetti
         let source = match source.as_str() {
             "path" => RequiredToolSource::Path,
             "manual" => RequiredToolSource::Manual,
+            "automatic" => RequiredToolSource::Automatic,
             _ => return Err(StorageError::new("loadFailed", "invalid tool source")),
         };
         let manual_path = manual_path.unwrap_or_default();
@@ -382,6 +500,7 @@ fn write_tool(
     let source = match config.source {
         RequiredToolSource::Path => "path",
         RequiredToolSource::Manual => "manual",
+        RequiredToolSource::Automatic => "automatic",
     };
     let manual_path =
         (config.source == RequiredToolSource::Manual).then_some(config.manual_path.as_str());
@@ -424,7 +543,7 @@ impl Storage {
         }
     }
 
-    fn prepare_data_directory(&self) -> Result<PathBuf, StorageError> {
+    pub(crate) fn prepare_data_directory(&self) -> Result<PathBuf, StorageError> {
         let directory = self
             .database_path
             .parent()
@@ -483,27 +602,34 @@ pub async fn open_app_data_directory(
 
 #[tauri::command]
 pub async fn get_app_settings(
+    app: tauri::AppHandle,
     initial_locale: String,
     state: tauri::State<'_, Storage>,
 ) -> Result<AppSettings, StorageError> {
     let database = state.database()?;
-    tauri::async_runtime::spawn_blocking(move || database.app_settings(&initial_locale))
-        .await
-        .map_err(|e| StorageError::new("loadFailed", e))?
+    let settings =
+        tauri::async_runtime::spawn_blocking(move || database.app_settings(&initial_locale))
+            .await
+            .map_err(|e| StorageError::new("loadFailed", e))??;
+    crate::app_preferences::update(&app, &settings);
+    Ok(settings)
 }
 
 #[tauri::command]
 pub async fn save_app_settings(
+    app: tauri::AppHandle,
     settings: AppSettings,
     state: tauri::State<'_, Storage>,
 ) -> Result<AppSettings, StorageError> {
     let database = state.database()?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let settings = tauri::async_runtime::spawn_blocking(move || {
         database.save_app_settings(&settings)?;
-        Ok(settings)
+        Ok::<_, StorageError>(settings)
     })
     .await
-    .map_err(|e| StorageError::new("saveFailed", e))?
+        .map_err(|e| StorageError::new("saveFailed", e))??;
+    crate::app_preferences::update(&app, &settings);
+    Ok(settings)
 }
 
 #[cfg(test)]

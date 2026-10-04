@@ -7,7 +7,7 @@ import {type VideoPlatform} from "../composables/videoPlatforms";
 import {createCookieEditor} from "../composables/useCookieEditor";
 import {useDesktopActions} from "../composables/useDesktopActions";
 
-const props = defineProps<{ platform: VideoPlatform; contents: string; disabled: boolean }>();
+const props = defineProps<{ platform: VideoPlatform; contents: string; disabled: boolean; embedded?: boolean }>();
 const emit = defineEmits<{ close: []; change: [contents: string] }>();
 const {t} = useI18n({useScope: "global"});
 const desktop = useDesktopActions();
@@ -37,8 +37,9 @@ async function pasteContents() {
 </script>
 
 <template>
-  <section aria-labelledby="cookie-panel-title" class="cookie-panel">
-    <header class="cookie-heading">
+  <section :aria-labelledby="embedded ? 'platform-cookie-title' : 'cookie-panel-title'" :class="{embedded}"
+           class="cookie-panel">
+    <header v-if="!embedded" class="cookie-heading">
       <h2 id="cookie-panel-title" tabindex="-1">{{ t(`download.platforms.${platform}`) }}</h2>
       <ElButton :aria-label="t('download.cookie.close')" :icon="Close" class="close-button" @click="emit('close')"/>
     </header>
@@ -68,6 +69,12 @@ async function pasteContents() {
   background: var(--app-surface);
 }
 
+.cookie-panel.embedded {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+}
+
 .cookie-heading {
   display: flex;
   align-items: center;
@@ -88,12 +95,12 @@ async function pasteContents() {
   flex-shrink: 0;
   padding: 0;
   border: 0;
-  background: #2e6b5010;
+  background: var(--app-accent-soft);
   color: var(--app-text-secondary);
 }
 
 .close-button:hover {
-  background: #2e6b5020;
+  background: var(--app-hover);
   color: var(--app-accent);
 }
 
@@ -124,6 +131,10 @@ async function pasteContents() {
 @media (max-width: 800px) {
   .cookie-panel {
     padding: 20px;
+  }
+
+  .cookie-panel.embedded {
+    padding: 0;
   }
 }
 </style>
