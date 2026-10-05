@@ -48,7 +48,6 @@ const en = {
         },
         history: {
             emptyTitle: "No download records yet",
-            emptyDescription: "Accepted download tasks and their results appear here.",
         },
         settings: {
             emptyTitle: "Make downloading easier",

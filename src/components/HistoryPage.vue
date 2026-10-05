@@ -12,7 +12,7 @@ import {
 } from "element-plus";
 import {ArrowLeft, RefreshRight, Search} from "@element-plus/icons-vue";
 import {useI18n} from "vue-i18n";
-import {useDownloadHistory, type DownloadRecord, type HistoryStatus} from "../composables/useDownloadHistory";
+import {type DownloadRecord, type HistoryStatus, useDownloadHistory} from "../composables/useDownloadHistory";
 import {useDownloadHistoryActions} from "../composables/downloadHistoryActions";
 import {groupHistoryRecords, sanitizeHistoryDetail} from "../composables/downloadHistoryDisplay";
 import {useDownloadTasks} from "../composables/useDownloadTasks";
@@ -323,9 +323,8 @@ async function action(name: string, record: DownloadRecord) {
         <p v-if="!actions.desktop" class="action-feedback">{{ t('history.desktopOnly') }}</p>
         <ElEmpty v-if="!history.loading.value&&!history.error.value&&groups.length===0"
                  :description="t(filtered?'history.noResults':history.trashed.value?'history.trashEmpty':'pages.history.emptyTitle')">
-          <p v-if="!history.trashed.value">{{
-              t(filtered ? 'history.noResultsHint' : 'pages.history.emptyDescription')
-            }}</p></ElEmpty>
+          <p v-if="filtered&&!history.trashed.value">{{ t('history.noResultsHint') }}</p>
+        </ElEmpty>
         <p v-if="history.loading.value&&!history.records.value.length" class="loading" role="status">
           {{ t('history.refresh') }}…</p>
         <section v-for="group in groups" :key="group.date" :aria-label="group.label===group.date?group.date:t(`history.${group.label}`)"

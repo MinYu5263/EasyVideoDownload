@@ -13,7 +13,6 @@ export const appPages = [
         labelKey: "navigation.history",
         icon: Clock,
         emptyTitleKey: "pages.history.emptyTitle",
-        emptyDescriptionKey: "pages.history.emptyDescription",
     },
     {
         id: "settings",

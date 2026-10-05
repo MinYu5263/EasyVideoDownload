@@ -37,8 +37,7 @@ const zhCN = {
             emptyDescription: "选择平台、粘贴链接并解析，查看可用的下载选项。",
         },
         history: {
-            emptyTitle: "还没有下载记录",
-            emptyDescription: "有效下载任务被接收后，各次下载结果会显示在这里。",
+            emptyTitle: "暂无下载记录",
         },
         settings: {
             emptyTitle: "让下载更顺手",
