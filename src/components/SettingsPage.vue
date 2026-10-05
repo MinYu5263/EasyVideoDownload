@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {computed, nextTick, ref, watch} from "vue";
-import {ElButton, ElMessage, ElScrollbar, type ScrollbarInstance} from "element-plus";
+import {ElButton, ElScrollbar, type ScrollbarInstance} from "element-plus";
 import {FolderOpened} from "@element-plus/icons-vue";
 import {invoke} from "@tauri-apps/api/core";
 import {useI18n} from "vue-i18n";
@@ -8,10 +8,12 @@ import ApplicationSettings from "./ApplicationSettings.vue";
 import ProxySettings from "./ProxySettings.vue";
 import RequiredToolCard from "./RequiredToolCard.vue";
 import SegmentedToolbar from "./SegmentedToolbar.vue";
+import ContentMotion from "./ContentMotion.vue";
 import {toolIds, useRequiredTools} from "../composables/useRequiredTools";
 import appIcon from "../assets/app-icon.svg?no-inline";
 import {version} from "../../package.json";
-import {useUiPreferences} from "../composables/useUiPreferences";
+import {persistenceError, useUiPreferences} from "../composables/useUiPreferences";
+import {useFeedback} from "../composables/useFeedback";
 
 const {t} = useI18n({useScope: "global"});
 const {
@@ -28,6 +30,8 @@ const {
   configure,
   cancelConfiguration
 } = useRequiredTools();
+const {notifyError, watchError} = useFeedback();
+watchError(loadError, error => t(`settings.requiredTools.errors.${error.code}`), () => ({key: 'tools:load'}));
 const sections = [
   {value: "application", labelKey: "settings.application"},
   {value: "tools", labelKey: "settings.requiredTools.title"},
@@ -36,7 +40,8 @@ const sections = [
 ] as const;
 const uiPreferences = useUiPreferences();
 const activeSection = computed({
-  get: () => uiPreferences.draft.settingsSection, set: value => {
+  get: () => uiPreferences.draft.settingsSection === 'platforms' ? 'application' : uiPreferences.draft.settingsSection,
+  set: value => {
     void uiPreferences.update({settingsSection: value});
   }
 });
@@ -49,8 +54,8 @@ async function openDataDirectory() {
   openingDataDirectory.value = true;
   try {
     await invoke("open_app_data_directory");
-  } catch {
-    ElMessage.error(t("settings.dataDirectory.openFailed"));
+  } catch (error) {
+    notifyError(t("settings.dataDirectory.openFailed"), {detail: persistenceError(error).detail});
   } finally {
     openingDataDirectory.value = false;
   }
@@ -72,8 +77,10 @@ watch(() => uiPreferences.draft.activePage === "settings" && activeSection.value
                         :disabled="!uiPreferences.ready.value" :options="sectionOptions"/>
     </div>
 
-    <ElScrollbar ref="settingsScrollbar" :aria-label="t('navigation.settings')" :tabindex="0"
-                 class="settings-scrollbar" height="100%" role="region" view-class="settings-content">
+    <ContentMotion :active="uiPreferences.draft.activePage === 'settings'" :position="sections.findIndex(section => section.value === activeSection)"
+                   :view-key="activeSection">
+      <ElScrollbar ref="settingsScrollbar" :aria-label="t('navigation.settings')" :tabindex="0"
+                   class="settings-scrollbar" height="100%" role="region" view-class="settings-content">
       <ApplicationSettings v-show="activeSection === 'application'" id="settings-application-panel"/>
 
       <section v-show="activeSection === 'tools'" id="settings-tools-panel"
@@ -89,10 +96,6 @@ watch(() => uiPreferences.draft.activePage === "settings" && activeSection.value
         </div>
 
         <p v-if="!desktop" class="required-tool-notice">{{ t('settings.requiredTools.desktopOnly') }}</p>
-        <p v-if="loadError" class="load-error" role="alert">
-          {{ t(`settings.requiredTools.errors.${loadError.code}`) }}
-          <span v-if="loadError.detail">{{ loadError.detail }}</span>
-        </p>
       </section>
 
       <ProxySettings v-show="activeSection === 'proxy'" id="settings-proxy-panel"/>
@@ -127,7 +130,8 @@ watch(() => uiPreferences.draft.activePage === "settings" && activeSection.value
           </ElButton>
         </div>
       </section>
-    </ElScrollbar>
+      </ElScrollbar>
+    </ContentMotion>
   </div>
 </template>
 
@@ -169,16 +173,7 @@ watch(() => uiPreferences.draft.activePage === "settings" && activeSection.value
   line-height: 1.7;
 }
 
-.load-error {
-  color: var(--app-danger);
-  font-size: 12px;
-  line-height: 1.7;
-  overflow-wrap: anywhere;
-}
 
-.load-error span {
-  display: block;
-}
 
 .about-card,
 .data-directory-card {

@@ -30,6 +30,7 @@
     --app-scrollbar-hover: rgba(0, 0, 0, 0.3);
   --app-radius: 14px;
   --app-sidebar-width: 236px;
+    --app-dialog-offset: min(8vh, 72px);
 
   --el-color-primary: var(--app-accent);
   --el-color-primary-light-3: #6d9785;
@@ -167,12 +168,55 @@ textarea {
   }
 }
 
-/* Persistence errors remain visible until a real native retry succeeds. */
-.persistence-error {
+/* Shared placement for application dialogs; tall dialogs keep a 24px viewport gap. */
+.el-overlay-dialog,
+.is-message-box .el-overlay-message-box {
     display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 10px 32px;
-    color: var(--app-text-secondary);
-    font-size: 13px;
+    align-items: safe center;
+    justify-content: center;
+    padding: 24px 16px;
+}
+
+.is-message-box .el-overlay-message-box::after {
+    display: none;
+}
+
+.el-overlay-dialog > .el-dialog:not(.is-fullscreen),
+.is-message-box .el-overlay-message-box > .el-message-box {
+    flex-shrink: 0;
+    margin: 0;
+    max-height: calc(100vh - 48px);
+    overflow-y: auto;
+    /* Percentages in translate refer to the dialog height, limiting the upward offset. */
+    translate: 0 calc(-1 * min(var(--app-dialog-offset), max(0px, 50vh - 50% - 24px)));
+}
+
+.el-overlay-dialog:has(> .el-dialog.is-fullscreen) {
+    padding: 0;
+}
+
+/* Notification owns placement/closing; AppNotification owns the Alert content. */
+.app-notification {
+    max-width: calc(100vw - 32px);
+    padding: 0;
+}
+
+.app-notification .el-notification__group {
+    min-width: 0;
+    flex: 1;
+    margin: 0;
+}
+
+.app-notification .el-notification__title:empty {
+    display: none;
+}
+
+.app-notification .el-notification__content {
+    text-align: left;
+    overflow-wrap: anywhere;
+}
+
+.app-notification .el-notification__closeBtn {
+    top: 16px;
+    right: 14px;
 }

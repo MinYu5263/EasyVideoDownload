@@ -5,6 +5,7 @@ export type TaskPhase =
     'queued'
     | 'preparing'
     | 'downloading'
+    | 'paused'
     | 'processing'
     | 'cancelling'
     | 'completed'
@@ -30,11 +31,11 @@ export interface SubmitDownloadRequest {
 }
 
 export interface SubmitDownloadResult {
-    kind: 'accepted' | 'existing' | 'alreadyDownloaded';
+    kind: 'accepted' | 'existing' | 'alreadyDownloaded' | 'confirmationRequired';
     record: DownloadRecord;
     task: DownloadTaskSnapshot | null
 }
 
 export function taskIsActive(phase: string) {
-    return ['queued', 'preparing', 'downloading', 'processing', 'cancelling'].includes(phase);
+    return ['queued', 'preparing', 'downloading', 'paused', 'processing', 'cancelling'].includes(phase);
 }

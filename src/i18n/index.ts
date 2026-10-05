@@ -8,7 +8,8 @@ import type {AppLocale} from "../composables/useAppSettings";
 
 export type {AppLocale} from "../composables/useAppSettings";
 
-const localeStorageKey = "easyvideodownload.locale";
+// Read-only compatibility with language preferences saved before SQLite migration.
+const legacyLocaleStorageKey = "easyvideodownload.locale";
 
 export const languageOptions = [
     {value: "zh-CN", labelKey: "languages.simplifiedChinese"},
@@ -17,7 +18,7 @@ export const languageOptions = [
 
 function getInitialLocale(): AppLocale {
     try {
-        const savedLocale = localStorage.getItem(localeStorageKey);
+        const savedLocale = localStorage.getItem(legacyLocaleStorageKey);
         if (savedLocale === "zh-CN" || savedLocale === "en") return savedLocale;
     } catch {
         // If storage is unavailable, use the system language for this session.

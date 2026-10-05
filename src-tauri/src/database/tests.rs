@@ -1,4 +1,32 @@
 use super::*;
+
+#[test]
+fn download_limit_rejects_invalid_values_without_changing_saved_preferences() {
+    let (_dir, path, legacy) = paths();
+    let db = Database::open(&path, &legacy).unwrap();
+    let mut settings = db.app_settings("en").unwrap();
+    settings.max_concurrent_downloads = 6;
+    db.save_app_settings(&settings).unwrap();
+    for limit in [0, 7, usize::MAX] {
+        settings.max_concurrent_downloads = limit;
+        assert_eq!(db.save_app_settings(&settings).unwrap_err().code, "invalidSettings");
+        assert_eq!(db.download_limit().unwrap(), 6);
+    }
+    drop(db);
+    let reopened = Database::open(&path, &legacy).unwrap();
+    assert_eq!(reopened.download_limit().unwrap(), 6);
+}
+
+#[test]
+fn missing_download_limit_defaults_to_three_and_is_persisted() {
+    let (_dir, path, legacy) = paths();
+    let db = Database::open(&path, &legacy).unwrap();
+    let settings = serde_json::to_value(db.app_settings("en").unwrap()).unwrap();
+    assert_eq!(settings["maxConcurrentDownloads"], 3);
+    drop(db);
+    let reopened = Database::open(&path, &legacy).unwrap();
+    assert_eq!(serde_json::to_value(reopened.app_settings("en").unwrap()).unwrap()["maxConcurrentDownloads"], 3);
+}
 use crate::required_tools::{Program, RequiredToolSource};
 
 fn version_six_for_single_input_upgrade(path: &Path) -> Connection {
@@ -47,7 +75,7 @@ fn single_input_link_upgrade_keeps_current_results_and_history_but_clears_stale_
         connection
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        11
+        15
     );
     drop(connection);
     let states = database.download_page_states().unwrap();
@@ -122,7 +150,7 @@ fn persistence_migration_preserves_existing_data_and_can_roll_back() {
     assert_eq!(
         c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        11
+        15
     );
     assert_eq!(c.query_row("SELECT count(*) FROM sqlite_schema WHERE name IN ('download_page_states','download_records','idx_download_records_started','idx_download_records_platform_started')", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
     c.execute_batch("DROP TABLE download_records; DROP TABLE download_page_states; PRAGMA user_version=4; CREATE TABLE download_records (sentinel TEXT);").unwrap();
@@ -347,22 +375,57 @@ fn preferences_restore_after_reopening_without_overwriting_saved_locale() {
         AppSettings {
             locale: "zh-CN".into(),
             theme: "system".into(),
-            notify_on_completion: false,
-            notify_on_failure: true,
+            notify_on_completion: true,
             close_action: "ask".into(),
+            max_concurrent_downloads: 3,
         }
     );
     let preferences = AppSettings {
         locale: "en".into(),
         theme: "dark".into(),
         notify_on_completion: false,
-        notify_on_failure: false,
         close_action: "tray".into(),
+        max_concurrent_downloads: 4,
     };
     db.save_app_settings(&preferences).unwrap();
     drop(db);
     let reopened = Database::open(&path, &legacy).unwrap();
     assert_eq!(reopened.app_settings("zh-CN").unwrap(), preferences);
+}
+
+#[test]
+fn retired_failure_notification_preference_is_ignored_and_not_exposed() {
+    let (_dir, path, legacy) = paths();
+    let db = Database::open(&path, &legacy).unwrap();
+    db.connection.lock().unwrap().execute_batch(
+        "INSERT INTO app_settings (setting_key, value_json) VALUES ('notify_on_failure', 'false');",
+    ).unwrap();
+    let settings = db.app_settings("en").unwrap();
+    assert!(settings.notify_on_completion);
+    assert!(serde_json::to_value(&settings).unwrap().get("notifyOnFailure").is_none());
+    // Even an invalid retired value must not block loading the remaining preferences.
+    db.connection.lock().unwrap().execute_batch(
+        "UPDATE app_settings SET value_json = '\"invalid\"' WHERE setting_key = 'notify_on_failure';",
+    ).unwrap();
+    assert_eq!(db.app_settings("en").unwrap(), settings);
+}
+
+#[test]
+fn legacy_proxy_addresses_remain_editable_but_cannot_be_saved_or_used() {
+    let (_dir, path, legacy) = paths();
+    let db = Database::open(&path, &legacy).unwrap();
+    db.connection("test").unwrap().execute(
+        "INSERT INTO app_settings (setting_key, value_json) VALUES ('proxy', ?1)",
+        [r#"{"protocol":"http","address":"anything","port":7890}"#],
+    ).unwrap();
+    let restored = db.proxy_settings_for_editing().unwrap().unwrap();
+    assert_eq!(restored.address, "anything");
+    assert_eq!(db.proxy_settings().unwrap_err().code, "loadFailed");
+    assert_eq!(db.save_proxy_settings(Some(&restored)).unwrap_err().code, "invalidSettings");
+    assert_eq!(db.proxy_settings_for_editing().unwrap(), Some(restored.clone()));
+    let corrected = crate::proxy::ProxySettings { address: "127.0.0.1".into(), ..restored };
+    db.save_proxy_settings(Some(&corrected)).unwrap();
+    assert_eq!(db.proxy_settings().unwrap(), Some(corrected));
 }
 
 #[test]
@@ -588,7 +651,7 @@ fn version_two_times_become_beijing_time_once_without_changing_configuration() {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            11
+            15
         );
         assert_eq!(
             connection
@@ -738,7 +801,6 @@ fn version_one_migration_preserves_preferences_programs_and_original_times() {
     assert_eq!(settings.locale, "en");
     assert_eq!(settings.theme, "dark");
     assert!(!settings.notify_on_completion);
-    assert!(settings.notify_on_failure);
     assert_eq!(settings.close_action, "tray");
     let tools = db.tools().unwrap();
     assert_eq!(tools.tools.len(), 3);
@@ -749,7 +811,7 @@ fn version_one_migration_preserves_preferences_programs_and_original_times() {
     );
     let connection = db.connection.lock().unwrap();
     let dates = connection
-        .prepare("SELECT updated_at FROM app_settings")
+        .prepare("SELECT updated_at FROM app_settings WHERE setting_key <> 'max_concurrent_downloads'")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()
@@ -768,7 +830,7 @@ fn version_one_migration_preserves_preferences_programs_and_original_times() {
         connection
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        11
+        15
     );
     drop(connection);
     drop(db);
@@ -846,7 +908,7 @@ fn saving_preferences_updates_only_changed_keys_and_their_dates() {
 
 #[test]
 fn invalid_stored_preference_types_and_values_are_reported_without_overwriting_them() {
-    for (key, value) in [("theme", "\"unknown\""), ("notify_on_failure", "\"true\"")] {
+    for (key, value) in [("theme", "\"unknown\""), ("notify_on_completion", "\"true\"")] {
         let (_dir, path, legacy) = paths();
         let db = Database::open(&path, &legacy).unwrap();
         db.app_settings("en").unwrap();
@@ -881,11 +943,11 @@ fn failed_preference_write_rolls_back_all_changed_keys() {
     let old = db.app_settings("en").unwrap();
     db.connection.lock().unwrap().execute_batch(
         "CREATE TRIGGER fail_preference BEFORE INSERT ON app_settings
-         WHEN NEW.setting_key = 'notify_on_failure' BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+         WHEN NEW.setting_key = 'notify_on_completion' BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
     ).unwrap();
     let mut next = old.clone();
     next.theme = "dark".into();
-    next.notify_on_failure = false;
+    next.notify_on_completion = false;
     assert!(db.save_app_settings(&next).is_err());
     // Remove the injected failure so initialization can read without triggering it.
     db.connection

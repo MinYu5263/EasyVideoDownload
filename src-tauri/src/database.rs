@@ -33,9 +33,28 @@ pub struct AppSettings {
     pub locale: String,
     pub theme: String,
     pub notify_on_completion: bool,
-    pub notify_on_failure: bool,
     pub close_action: String,
+    pub max_concurrent_downloads: usize,
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSettingsResponse {
+    #[serde(flatten)]
+    settings: AppSettings,
+    close_background_mode: crate::app_preferences::CloseBackgroundMode,
+}
+
+impl From<AppSettings> for AppSettingsResponse {
+    fn from(settings: AppSettings) -> Self {
+        Self {
+            settings,
+            close_background_mode: crate::app_preferences::close_background_mode(),
+        }
+    }
+}
+
+pub(crate) const DEFAULT_DOWNLOAD_LIMIT: usize = 3;
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -43,6 +62,7 @@ pub struct Database {
 
 pub(crate) mod download_records;
 pub(crate) mod page_states;
+pub(crate) mod platform_directories;
 pub(crate) mod platform_settings;
 pub(crate) mod tool_checks;
 pub(crate) mod ui_preferences;
@@ -52,147 +72,190 @@ pub(crate) mod persistence_tests;
 
 impl Database {
     pub fn open(path: &Path, legacy: &Path) -> Result<Self, StorageError> {
-        let initialize =
-            || -> Result<Connection, StorageError> {
-                let parent = path
-                    .parent()
-                    .ok_or_else(|| StorageError::new("loadFailed", "missing database directory"))?;
-                std::fs::create_dir_all(parent).map_err(|e| StorageError::new("loadFailed", e))?;
-                let mut connection =
-                    Connection::open(path).map_err(|e| StorageError::new("loadFailed", e))?;
-                connection
-                    .busy_timeout(Duration::from_secs(5))
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-                connection
-                    .pragma_update(None, "foreign_keys", true)
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-                // Inspect and migrate under the same lock so simultaneous launches cannot both import JSON.
-                let transaction = connection
-                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-                let version: i64 = transaction
-                    .pragma_query_value(None, "user_version", |row| row.get(0))
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-                let mut imported_tools = None;
-                match version {
-                    0 => {
-                        imported_tools = Some(
-                            required_tools::load_settings(legacy)
-                                .map_err(|e| StorageError::new("loadFailed", e.detail))?,
-                        );
-                        transaction
-                            .execute_batch(include_str!("../migrations/001_settings.sql"))
-                            .map_err(|e| StorageError::new("loadFailed", e))?;
-                        transaction
-                            .execute_batch(include_str!("../migrations/002_settings_key_value.sql"))
-                            .map_err(|e| StorageError::new("loadFailed", e))?;
-                    }
-                    1 => {
-                        // Reject incomplete legacy groups before the join can discard them.
-                        read_tools(&transaction, true)?;
-                        let orphaned: bool = transaction.query_row(
-                        "SELECT EXISTS (SELECT 1 FROM required_tool_programs p WHERE NOT EXISTS
+        let initialize = || -> Result<Connection, StorageError> {
+            let parent = path
+                .parent()
+                .ok_or_else(|| StorageError::new("loadFailed", "missing database directory"))?;
+            std::fs::create_dir_all(parent).map_err(|e| StorageError::new("loadFailed", e))?;
+            let mut connection =
+                Connection::open(path).map_err(|e| StorageError::new("loadFailed", e))?;
+            connection
+                .busy_timeout(Duration::from_secs(5))
+                .map_err(|e| StorageError::new("loadFailed", e))?;
+            connection
+                .pragma_update(None, "foreign_keys", true)
+                .map_err(|e| StorageError::new("loadFailed", e))?;
+            // Inspect and migrate under the same lock so simultaneous launches cannot both import JSON.
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| StorageError::new("loadFailed", e))?;
+            let version: i64 = transaction
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .map_err(|e| StorageError::new("loadFailed", e))?;
+            let mut imported_tools = None;
+            match version {
+                0 => {
+                    imported_tools = Some(
+                        required_tools::load_settings(legacy)
+                            .map_err(|e| StorageError::new("loadFailed", e.detail))?,
+                    );
+                    transaction
+                        .execute_batch(include_str!("../migrations/001_settings.sql"))
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                    transaction
+                        .execute_batch(include_str!("../migrations/002_settings_key_value.sql"))
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                }
+                1 => {
+                    // Reject incomplete legacy groups before the join can discard them.
+                    read_tools(&transaction, true)?;
+                    let orphaned: bool = transaction
+                        .query_row(
+                            "SELECT EXISTS (SELECT 1 FROM required_tool_programs p WHERE NOT EXISTS
                          (SELECT 1 FROM required_tools t WHERE t.tool_id = p.tool_id))",
-                        [], |row| row.get(0),
-                    ).map_err(|e| StorageError::new("loadFailed", e))?;
-                        if orphaned {
-                            return Err(StorageError::new("loadFailed", "orphaned legacy program"));
-                        }
-                        transaction
-                            .execute_batch(include_str!("../migrations/002_settings_key_value.sql"))
-                            .map_err(|e| StorageError::new("loadFailed", e))?;
+                            [],
+                            |row| row.get(0),
+                        )
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                    if orphaned {
+                        return Err(StorageError::new("loadFailed", "orphaned legacy program"));
                     }
-                    2..=11 => {}
-                    _ => {
-                        return Err(StorageError::new(
-                            "loadFailed",
-                            format!("unsupported database schema version: {version}"),
+                    transaction
+                        .execute_batch(include_str!("../migrations/002_settings_key_value.sql"))
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                }
+                2..=15 => {}
+                _ => {
+                    return Err(StorageError::new(
+                        "loadFailed",
+                        format!("unsupported database schema version: {version}"),
+                    ))
+                }
+            }
+            if version < 3 {
+                migrate_beijing_times(&transaction)?;
+                transaction
+                    .pragma_update(None, "user_version", 3)
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+            }
+            if version < 4 {
+                transaction
+                    .execute_batch(include_str!("../migrations/004_automatic_ytdlp.sql"))
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                transaction
+                    .pragma_update(None, "user_version", 4)
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+            }
+            if version < 5 {
+                transaction
+                    .execute_batch(include_str!("../migrations/005_persistence.sql"))
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                transaction
+                    .pragma_update(None, "user_version", 5)
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+            }
+            if version < 6 {
+                transaction
+                    .execute_batch(include_str!("../migrations/006_automatic_tools.sql"))
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                transaction
+                    .pragma_update(None, "user_version", 6)
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+            }
+            if version < 7 {
+                transaction
+                    .execute_batch(include_str!("../migrations/007_single_input_link.sql"))
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                transaction
+                    .pragma_update(None, "user_version", 7)
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+            }
+            if version < 8 {
+                transaction
+                    .execute_batch(include_str!("../migrations/008_download_history_cards.sql"))
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                transaction
+                    .pragma_update(None, "user_version", 8)
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+            }
+            if version < 9 {
+                transaction
+                    .execute_batch(include_str!("../migrations/009_download_history_trash.sql"))
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                transaction
+                    .pragma_update(None, "user_version", 9)
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+            }
+            if version < 10 {
+                transaction
+                    .execute_batch(include_str!("../migrations/010_shared_download_tasks.sql"))
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                transaction
+                    .pragma_update(None, "user_version", 10)
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+            }
+            if version < 11 {
+                transaction
+                    .execute_batch(include_str!("../migrations/011_output_identity.sql"))
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                transaction
+                    .pragma_update(None, "user_version", 11)
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+            }
+            if version < 12 {
+                let present: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('download_records') WHERE name='format_snapshot_json')", [], |r| r.get(0)).map_err(|e| StorageError::new("loadFailed", e))?;
+                if !present {
+                    transaction
+                        .execute_batch(include_str!(
+                            "../migrations/012_download_format_snapshot.sql"
                         ))
-                    }
-                }
-                if version < 3 {
-                    migrate_beijing_times(&transaction)?;
-                    transaction
-                        .pragma_update(None, "user_version", 3)
                         .map_err(|e| StorageError::new("loadFailed", e))?;
-                }
-                if version < 4 {
-                    transaction
-                        .execute_batch(include_str!("../migrations/004_automatic_ytdlp.sql"))
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                    transaction
-                        .pragma_update(None, "user_version", 4)
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                }
-                if version < 5 {
-                    transaction
-                        .execute_batch(include_str!("../migrations/005_persistence.sql"))
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                    transaction
-                        .pragma_update(None, "user_version", 5)
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                }
-                if version < 6 {
-                    transaction
-                        .execute_batch(include_str!("../migrations/006_automatic_tools.sql"))
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                    transaction
-                        .pragma_update(None, "user_version", 6)
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                }
-                if version < 7 {
-                    transaction
-                        .execute_batch(include_str!("../migrations/007_single_input_link.sql"))
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                    transaction
-                        .pragma_update(None, "user_version", 7)
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                }
-                if version < 8 {
-                    transaction
-                        .execute_batch(include_str!("../migrations/008_download_history_cards.sql"))
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                    transaction
-                        .pragma_update(None, "user_version", 8)
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                }
-                if version < 9 {
-                    transaction
-                        .execute_batch(include_str!("../migrations/009_download_history_trash.sql"))
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                    transaction
-                        .pragma_update(None, "user_version", 9)
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                }
-                if version < 10 {
-                    transaction
-                        .execute_batch(include_str!("../migrations/010_shared_download_tasks.sql"))
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                    transaction
-                        .pragma_update(None, "user_version", 10)
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                }
-                if version < 11 {
-                    transaction
-                        .execute_batch(include_str!("../migrations/011_output_identity.sql"))
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                    transaction
-                        .pragma_update(None, "user_version", 11)
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                }
-                // Legacy JSON is normalized to Beijing time during deserialization.
-                // Import after schema migration so it cannot receive the offset twice.
-                if let Some(old) = imported_tools {
-                    for (id, config) in old.tools {
-                        write_tool(&transaction, id, &config)
-                            .map_err(|e| StorageError::new("loadFailed", e))?;
-                    }
                 }
                 transaction
-                    .commit()
+                    .pragma_update(None, "user_version", 12)
                     .map_err(|e| StorageError::new("loadFailed", e))?;
-                Ok(connection)
-            };
+            }
+            if version < 13 {
+                transaction
+                    .execute_batch(include_str!(
+                        "../migrations/013_download_records_by_format.sql"
+                    ))
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                transaction
+                    .pragma_update(None, "user_version", 13)
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+            }
+            if version < 14 {
+                transaction
+                    .execute_batch(include_str!("../migrations/014_paused_downloads.sql"))
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                transaction
+                    .pragma_update(None, "user_version", 14)
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+            }
+            if version < 15 {
+                transaction
+                    .execute_batch(include_str!(
+                        "../migrations/015_download_temporary_directories.sql"
+                    ))
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+                transaction
+                    .pragma_update(None, "user_version", 15)
+                    .map_err(|e| StorageError::new("loadFailed", e))?;
+            }
+            // Legacy JSON is normalized to Beijing time during deserialization.
+            // Import after schema migration so it cannot receive the offset twice.
+            if let Some(old) = imported_tools {
+                for (id, config) in old.tools {
+                    write_tool(&transaction, id, &config)
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                }
+            }
+            transaction
+                .commit()
+                .map_err(|e| StorageError::new("loadFailed", e))?;
+            Ok(connection)
+        };
         Ok(Self {
             connection: Mutex::new(initialize()?),
         })
@@ -251,9 +314,37 @@ impl Database {
         Ok(())
     }
 
+    pub(crate) fn download_limit(&self) -> Result<usize, StorageError> {
+        let connection = self.connection("loadFailed")?;
+        let value: Option<String> = connection.query_row(
+            "SELECT value_json FROM app_settings WHERE setting_key = 'max_concurrent_downloads'",
+            [], |row| row.get(0),
+        ).optional().map_err(|e| StorageError::new("loadFailed", e))?;
+        let limit = match value {
+            Some(value) => serde_json::from_str::<usize>(&value)
+                .map_err(|e| StorageError::new("loadFailed", e))?,
+            None => DEFAULT_DOWNLOAD_LIMIT,
+        };
+        if !(1..=6).contains(&limit) {
+            return Err(StorageError::new(
+                "loadFailed",
+                "Invalid download concurrency",
+            ));
+        }
+        Ok(limit)
+    }
+
     pub fn proxy_settings(&self) -> Result<Option<ProxySettings>, StorageError> {
         let connection = self.connection("loadFailed")?;
         read_proxy_settings(&connection)
+    }
+
+    pub fn proxy_settings_for_editing(&self) -> Result<Option<ProxySettings>, StorageError> {
+        let connection = self.connection("loadFailed")?;
+        read_stored_proxy_settings(&connection)?
+            .map(|settings| settings.normalized_for_editing()
+                .map_err(|_| StorageError::new("loadFailed", "Invalid stored proxy settings")))
+            .transpose()
     }
 
     pub fn save_proxy_settings(
@@ -299,6 +390,16 @@ impl Database {
 }
 
 fn read_proxy_settings(connection: &Connection) -> Result<Option<ProxySettings>, StorageError> {
+    read_stored_proxy_settings(connection)?
+        .map(|settings| {
+            settings
+                .normalized()
+                .map_err(|_| StorageError::new("loadFailed", "Invalid stored proxy settings"))
+        })
+        .transpose()
+}
+
+fn read_stored_proxy_settings(connection: &Connection) -> Result<Option<ProxySettings>, StorageError> {
     let value: Option<String> = connection
         .query_row(
             "SELECT value_json FROM app_settings WHERE setting_key = 'proxy'",
@@ -312,13 +413,7 @@ fn read_proxy_settings(connection: &Connection) -> Result<Option<ProxySettings>,
         .transpose()
         .map_err(|_| StorageError::new("loadFailed", "Invalid stored proxy settings"))?
         .flatten();
-    settings
-        .map(|settings| {
-            settings
-                .normalized()
-                .map_err(|_| StorageError::new("loadFailed", "Invalid stored proxy settings"))
-        })
-        .transpose()
+    Ok(settings)
 }
 
 fn migrate_beijing_times(connection: &Connection) -> Result<(), StorageError> {
@@ -348,6 +443,7 @@ fn validate_preferences(settings: &AppSettings) -> Result<(), StorageError> {
     if matches!(settings.locale.as_str(), "zh-CN" | "en")
         && matches!(settings.theme.as_str(), "system" | "light" | "dark")
         && matches!(settings.close_action.as_str(), "ask" | "tray" | "exit")
+        && (1..=6).contains(&settings.max_concurrent_downloads)
     {
         Ok(())
     } else {
@@ -366,11 +462,11 @@ fn setting_values(settings: &AppSettings) -> [(&'static str, serde_json::Value);
             "notify_on_completion",
             serde_json::json!(settings.notify_on_completion),
         ),
-        (
-            "notify_on_failure",
-            serde_json::json!(settings.notify_on_failure),
-        ),
         ("close_action", serde_json::json!(settings.close_action)),
+        (
+            "max_concurrent_downloads",
+            serde_json::json!(settings.max_concurrent_downloads),
+        ),
     ]
 }
 
@@ -381,9 +477,9 @@ fn read_app_settings(
     let mut settings = AppSettings {
         locale: initial_locale.into(),
         theme: "system".into(),
-        notify_on_completion: false,
-        notify_on_failure: true,
+        notify_on_completion: true,
         close_action: "ask".into(),
+        max_concurrent_downloads: DEFAULT_DOWNLOAD_LIMIT,
     };
     let mut statement = connection
         .prepare("SELECT setting_key, value_json FROM app_settings")
@@ -403,11 +499,11 @@ fn read_app_settings(
             "notify_on_completion" => {
                 settings.notify_on_completion = serde_json::from_str(&value).map_err(invalid)?
             }
-            "notify_on_failure" => {
-                settings.notify_on_failure = serde_json::from_str(&value).map_err(invalid)?
-            }
             "close_action" => {
                 settings.close_action = serde_json::from_str(&value).map_err(invalid)?
+            }
+            "max_concurrent_downloads" => {
+                settings.max_concurrent_downloads = serde_json::from_str(&value).map_err(invalid)?
             }
             _ => {} // Future settings survive reads and saves by this application version.
         }
@@ -605,14 +701,14 @@ pub async fn get_app_settings(
     app: tauri::AppHandle,
     initial_locale: String,
     state: tauri::State<'_, Storage>,
-) -> Result<AppSettings, StorageError> {
+) -> Result<AppSettingsResponse, StorageError> {
     let database = state.database()?;
     let settings =
         tauri::async_runtime::spawn_blocking(move || database.app_settings(&initial_locale))
             .await
             .map_err(|e| StorageError::new("loadFailed", e))??;
     crate::app_preferences::update(&app, &settings);
-    Ok(settings)
+    Ok(settings.into())
 }
 
 #[tauri::command]
@@ -620,16 +716,18 @@ pub async fn save_app_settings(
     app: tauri::AppHandle,
     settings: AppSettings,
     state: tauri::State<'_, Storage>,
-) -> Result<AppSettings, StorageError> {
+    downloads: tauri::State<'_, crate::video::download::DownloadManager>,
+) -> Result<AppSettingsResponse, StorageError> {
     let database = state.database()?;
+    let downloads = downloads.inner().clone();
     let settings = tauri::async_runtime::spawn_blocking(move || {
-        database.save_app_settings(&settings)?;
+        downloads.save_settings(&database, &settings)?;
         Ok::<_, StorageError>(settings)
     })
     .await
         .map_err(|e| StorageError::new("saveFailed", e))??;
     crate::app_preferences::update(&app, &settings);
-    Ok(settings)
+    Ok(settings.into())
 }
 
 #[cfg(test)]

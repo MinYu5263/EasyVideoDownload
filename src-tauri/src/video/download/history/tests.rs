@@ -1,6 +1,134 @@
 use super::*;
+
+#[test]
+fn a_missing_only_restart_never_removes_a_reappeared_successful_output() {
+    let root = tempfile::tempdir().unwrap();
+    eprintln!("owned reappeared output fixture: {}", root.path().display());
+    let database =
+        Arc::new(Database::open(&root.path().join("app.db"), &root.path().join("legacy")).unwrap());
+    let mut state = crate::database::persistence_tests::page();
+    state.download_directory = root.path().to_string_lossy().into();
+    let snapshot = DownloadSnapshot { page: state };
+    let original_id = uuid::Uuid::new_v4().to_string();
+    let (_, session) = DownloadRecordSession::accept(
+        database.clone(),
+        root.path(),
+        original_id.clone(),
+        snapshot.clone(),
+        None,
+        false,
+        false,
+    )
+        .unwrap();
+    let output = root.path().join("original.webm");
+    std::fs::write(&output, b"original").unwrap();
+    database
+        .finish_download_record(
+            &original_id,
+            &crate::database::download_records::DownloadRecordOutcome::Completed {
+                path: output.to_string_lossy().into(),
+                size: 8,
+                extension: Some("webm".into()),
+            },
+        )
+        .unwrap();
+    drop(session);
+    let previous = database
+        .find_download_record("youtube", "abc")
+        .unwrap()
+        .unwrap();
+    let result = DownloadRecordSession::restart(
+        database.clone(),
+        root.path(),
+        uuid::Uuid::new_v4().to_string(),
+        RestartTarget {
+            record: &previous,
+            restore_trashed: false,
+            output_policy: RestartOutputPolicy::RequireMissing,
+        },
+        snapshot,
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "an unconfirmed missing-only retry must stop when the successful output exists again"
+    );
+    assert_eq!(
+        database.get_download_record(previous.id).unwrap().status,
+        "completed"
+    );
+    assert_eq!(std::fs::read(&output).unwrap(), b"original");
+}
 use crate::database::persistence_tests::page;
 use std::time::{Duration, Instant};
+
+#[test]
+fn recovery_keeps_persisted_pause_intent_after_the_worker_lock_is_released() {
+    let root = tempfile::tempdir().unwrap();
+    eprintln!("owned paused recovery fixture: {}", root.path().display());
+    let database_path = root.path().join("app.db");
+    let legacy = root.path().join("legacy");
+    let db = Arc::new(Database::open(&database_path, &legacy).unwrap());
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut state = page();
+    state.download_directory = root.path().to_string_lossy().into();
+    let session = DownloadRecordSession::new(
+        db.clone(),
+        root.path(),
+        id.clone(),
+        DownloadSnapshot { page: state },
+        None,
+    )
+        .unwrap();
+    db.set_download_paused(&id, true).unwrap();
+    recover(&db, root.path()).unwrap();
+    assert_eq!(
+        db.find_request_record(&id).unwrap().unwrap().status,
+        "running"
+    );
+    let live_paused = db
+        .query_download_records(&HistoryQuery {
+            cursor: None,
+            limit: 10,
+            query: String::new(),
+            status: Some("paused".into()),
+        })
+        .unwrap();
+    assert_eq!(live_paused.records.len(), 1);
+    assert_eq!(live_paused.status_counts["paused"], 1);
+    assert_eq!(live_paused.status_counts["running"], 0);
+    db.set_download_paused(&id, false).unwrap();
+    let resumed = db
+        .query_download_records(&HistoryQuery {
+            cursor: None,
+            limit: 10,
+            query: String::new(),
+            status: Some("running".into()),
+        })
+        .unwrap();
+    assert_eq!(resumed.records.len(), 1);
+    assert_eq!(resumed.status_counts["running"], 1);
+    assert_eq!(resumed.status_counts["paused"], 0);
+    db.set_download_paused(&id, true).unwrap();
+    drop(session);
+    let reopened = Database::open(&database_path, &legacy).unwrap();
+    recover(&reopened, root.path()).unwrap();
+    recover(&reopened, root.path()).unwrap();
+    let record = reopened.find_request_record(&id).unwrap().unwrap();
+    assert_eq!(record.status, "paused");
+    assert!(record.finished_at.is_none());
+    assert!(record.error_code.is_none());
+    let filtered = reopened
+        .query_download_records(&HistoryQuery {
+            cursor: None,
+            limit: 10,
+            query: String::new(),
+            status: Some("paused".into()),
+        })
+        .unwrap();
+    assert_eq!(filtered.records.len(), 1);
+    assert_eq!(filtered.status_counts["paused"], 1);
+}
 
 #[test]
 #[ignore = "native lock holder fixture"]
@@ -263,6 +391,7 @@ async fn cancellation_while_restart_deletion_waits_for_database_preserves_the_ou
         RestartTarget {
             record: &previous,
             restore_trashed: false,
+            output_policy: RestartOutputPolicy::Deferred,
         },
         snapshot,
         None,

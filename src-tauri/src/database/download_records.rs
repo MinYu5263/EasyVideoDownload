@@ -3,6 +3,7 @@ use super::*;
 use std::collections::BTreeMap;
 pub(crate) mod identity;
 pub(crate) mod tasks;
+pub(crate) mod temporary;
 
 pub(crate) fn sanitize_source_link(source: &str) -> Result<String, StorageError> {
     let mut url = url::Url::parse(source)
@@ -95,6 +96,7 @@ pub enum DownloadRecordOutcome {
         detail: String,
     },
     Cancelled,
+    Paused,
     Interrupted,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +116,7 @@ pub struct HistoryQuery {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadRecord {
+    pub format_snapshot: Option<crate::video::VideoFormat>,
     pub id: i64,
     pub request_id: String,
     pub platform: String,
@@ -136,6 +139,8 @@ pub struct DownloadRecord {
     pub file_size_bytes: Option<u64>,
     #[serde(skip)]
     pub output_identity: Option<String>,
+    #[serde(skip)]
+    pub temporary_directories: Vec<temporary::TemporaryDirectory>,
     pub file_availability: String,
     pub successful_output: Option<SuccessfulOutput>,
     pub status: String,
@@ -152,6 +157,7 @@ pub struct DownloadRecord {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SuccessfulOutput {
+    pub format_snapshot: Option<crate::video::VideoFormat>,
     pub format_id: String,
     pub format_extension: Option<String>,
     pub height: Option<u32>,
@@ -170,7 +176,21 @@ pub struct HistoryPageResult {
     pub trash_count: u64,
 }
 fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadRecord> {
-    Ok(DownloadRecord {
+    let snapshot = |column: &str| -> rusqlite::Result<Option<crate::video::VideoFormat>> {
+        r.get::<_, Option<String>>(column)?
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })
+            .transpose()
+    };
+    let mut record = DownloadRecord {
+        format_snapshot: snapshot("format_snapshot_json")?,
         id: r.get("id")?,
         request_id: r.get("request_id")?,
         platform: r.get("platform")?,
@@ -192,11 +212,13 @@ fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadRecord> {
         output_extension: r.get("output_extension")?,
         file_size_bytes: r.get("file_size_bytes")?,
         output_identity: r.get("output_identity")?,
+        temporary_directories: Vec::new(),
         file_availability: r.get("file_availability")?,
         successful_output: r
             .get::<_, Option<String>>("successful_format_id")?
             .map(|format_id| {
                 Ok::<_, rusqlite::Error>(SuccessfulOutput {
+                    format_snapshot: snapshot("successful_format_snapshot_json")?,
                     format_id,
                     format_extension: r.get("successful_format_extension")?,
                     height: r.get("successful_height")?,
@@ -218,7 +240,33 @@ fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadRecord> {
         updated_at: r.get("updated_at")?,
         deleted_at: r.get("deleted_at")?,
         file_deleted_at: r.get("file_deleted_at")?,
-    })
+    };
+    // Old schemas have only scalar format columns. Hydrate the same public model
+    // at the read boundary without inventing codec, bitrate, or width.
+    let format = record.format_snapshot.get_or_insert_with(|| crate::video::VideoFormat {
+        format_id: record.format_id.clone(),
+        height: record.height,
+        fps: record.fps,
+        extension: record.format_extension.clone(),
+        size_bytes: record.selected_size_bytes,
+        size_approximate: record.size_approximate,
+        ..Default::default()
+    });
+    crate::video::formats::normalize(format);
+    if let Some(previous) = &mut record.successful_output {
+        let format = previous.format_snapshot.get_or_insert_with(|| crate::video::VideoFormat {
+            format_id: previous.format_id.clone(),
+            height: previous.height,
+            fps: previous.fps,
+            extension: previous.format_extension.clone(),
+            ..Default::default()
+        });
+        crate::video::formats::normalize(format);
+    }
+    // Older records may predate sanitization at the write boundary.
+    record.source_link = sanitize_source_link(&record.source_link).map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(std::io::Error::other(e.detail))))?;
+    record.error_detail = record.error_detail.as_deref().map(crate::app_logs::safe_text);
+    Ok(record)
 }
 impl Database {
     #[cfg(test)]
@@ -311,6 +359,7 @@ impl Database {
                 Some(detail.as_str()),
             ),
             DownloadRecordOutcome::Cancelled => ("cancelled", None, None, None, None, None),
+            DownloadRecordOutcome::Paused => ("paused", None, None, None, None, None),
             DownloadRecordOutcome::Interrupted => ("interrupted", None, None, None, None, None),
         };
         let output_identity = path.and_then(|path| identity::capture(Path::new(path)));
@@ -318,8 +367,11 @@ impl Database {
         let tx = c
             .transaction()
             .map_err(|e| StorageError::new("saveFailed", e))?;
-        let changed = tx.execute("UPDATE download_records SET status=?2,output_identity=CASE WHEN ?2='completed' THEN ?11 ELSE output_identity END,output_path=CASE WHEN ?2='completed' THEN ?3 ELSE output_path END,file_size_bytes=CASE WHEN ?2='completed' THEN ?4 ELSE file_size_bytes END,output_extension=CASE WHEN ?2='completed' THEN ?5 ELSE output_extension END,successful_format_id=CASE WHEN ?2='completed' THEN format_id ELSE successful_format_id END,successful_format_extension=CASE WHEN ?2='completed' THEN format_extension ELSE successful_format_extension END,successful_height=CASE WHEN ?2='completed' THEN height ELSE successful_height END,successful_fps=CASE WHEN ?2='completed' THEN fps ELSE successful_fps END,successful_directory=CASE WHEN ?2='completed' THEN download_directory ELSE successful_directory END,successful_finished_at=CASE WHEN ?2='completed' THEN ?8 ELSE successful_finished_at END,file_availability=CASE WHEN ?2='completed' THEN 'present' ELSE file_availability END,file_deleted_at=CASE WHEN ?2='completed' THEN NULL ELSE file_deleted_at END,error_code=?6,error_detail=?7,finished_at=?8,updated_at=?8,error_stage=?9,failure_kind=?10 WHERE request_id=?1 AND status IN ('queued','running')", params![request_id,status,path,size,extension,code,detail,datetime::now(),stage,kind,output_identity]).map_err(|e| StorageError::new("saveFailed", e))?;
+        let changed = tx.execute("UPDATE download_records SET status=?2,output_identity=CASE WHEN ?2='completed' THEN ?11 ELSE output_identity END,output_path=CASE WHEN ?2='completed' THEN ?3 ELSE output_path END,file_size_bytes=CASE WHEN ?2='completed' THEN ?4 ELSE file_size_bytes END,output_extension=CASE WHEN ?2='completed' THEN ?5 ELSE output_extension END,successful_format_id=CASE WHEN ?2='completed' THEN format_id ELSE successful_format_id END,successful_format_extension=CASE WHEN ?2='completed' THEN format_extension ELSE successful_format_extension END,successful_height=CASE WHEN ?2='completed' THEN height ELSE successful_height END,successful_fps=CASE WHEN ?2='completed' THEN fps ELSE successful_fps END,successful_directory=CASE WHEN ?2='completed' THEN download_directory ELSE successful_directory END,successful_finished_at=CASE WHEN ?2='completed' THEN ?8 ELSE successful_finished_at END,file_availability=CASE WHEN ?2='completed' THEN 'present' ELSE file_availability END,file_deleted_at=CASE WHEN ?2='completed' THEN NULL ELSE file_deleted_at END,error_code=?6,error_detail=?7,finished_at=CASE WHEN ?2='paused' THEN NULL ELSE ?8 END,pause_requested=CASE WHEN ?2='paused' THEN 1 ELSE 0 END,updated_at=?8,error_stage=?9,failure_kind=?10 WHERE request_id=?1 AND status IN ('queued','running')", params![request_id,status,path,size,extension,code,detail,datetime::now(),stage,kind,output_identity]).map_err(|e| StorageError::new("saveFailed", e))?;
         // Recovery scans can become stale when another instance settles a task.
+        if changed > 0 && status == "completed" {
+            tx.execute("UPDATE download_records SET successful_format_snapshot_json=format_snapshot_json WHERE request_id=?1", [request_id]).map_err(|e| StorageError::new("saveFailed", e))?;
+        }
         if changed == 0 && !matches!(outcome, DownloadRecordOutcome::Interrupted) {
             let previous: Option<String> = tx
                 .query_row(
@@ -485,9 +537,10 @@ impl Database {
         let mut first_error = None;
         // Filesystem changes cannot be rolled back. Settle each successful record,
         // retain failures, and commit those outcomes before reporting a partial clear.
-        for record in records {
+        for mut record in records {
             let result = (|| {
                 validate_record_time(&record)?;
+                record.temporary_directories = temporary::read(&transaction, record.id)?;
                 require_no_active_downloads(&transaction, &record)?;
                 let deleted = delete_file(&record, &protected)?;
                 any_file_deleted |= deleted;
@@ -537,10 +590,10 @@ impl Database {
         }
     }
 
-    pub fn recycle_download_record_file(
+    pub fn delete_download_record_and_file(
         &self,
         id: i64,
-        recycle: impl FnOnce(&DownloadRecord) -> Result<bool, StorageError>,
+        delete_file: impl FnOnce(&DownloadRecord, &[String]) -> Result<bool, StorageError>,
     ) -> Result<bool, StorageError> {
         let mut connection = self.connection("saveFailed")?;
         // Serialize validation and settlement against every other database writer.
@@ -558,7 +611,7 @@ impl Database {
         if record.status != "completed" {
             return Err(StorageError::new(
                 "invalidSettings",
-                "Only completed downloads have a final file to recycle",
+                "Only completed downloads have a final file to delete",
             ));
         }
         require_no_active_downloads(&transaction, &record)?;
@@ -579,19 +632,22 @@ impl Database {
                 "Another video record references this output",
             ));
         }
-        let recycled = recycle(&record)?;
-        // The OS recycle operation cannot be rolled back when SQLite settlement fails.
-        let save_code = if recycled {
-            "historyFileRecycledSaveFailed"
+        let deleted = delete_file(&record, &protected)?;
+        // Filesystem deletion cannot be rolled back when SQLite settlement fails.
+        let save_code = if deleted {
+            "historyFileDeletedSaveFailed"
         } else {
             "saveFailed"
         };
-        transaction.execute("UPDATE download_records SET deleted_at=?2, file_deleted_at=CASE WHEN ?3 THEN ?2 ELSE file_deleted_at END WHERE id=?1", params![id, datetime::now(), recycled])
+        let removed = transaction.execute("DELETE FROM download_records WHERE id=?1 AND deleted_at IS NULL AND status='completed'", [id])
             .map_err(|error| StorageError::new(save_code, error))?;
+        if removed != 1 {
+            return Err(StorageError::new(save_code, "The download record was not deleted"));
+        }
         transaction
             .commit()
             .map_err(|error| StorageError::new(save_code, error))?;
-        Ok(recycled)
+        Ok(deleted)
     }
 
     #[cfg(test)]
@@ -666,7 +722,7 @@ impl Database {
             .map(|status| ((*status).into(), 0))
             .collect();
         {
-            let mut statement = tx.prepare(&format!("SELECT status,count(*) FROM download_records WHERE {scope} AND {HISTORY_SEARCH} GROUP BY status"))
+            let mut statement = tx.prepare(&format!("SELECT {HISTORY_STATUS} AS history_status,count(*) FROM download_records WHERE {scope} AND {HISTORY_SEARCH} GROUP BY history_status"))
                 .map_err(|error| StorageError::new("loadFailed", error))?;
             let counts = statement
                 .query_map([&pattern], |row| {
@@ -687,7 +743,7 @@ impl Database {
             None => status_counts.values().sum(),
         };
         let mut records = {
-            let mut statement = tx.prepare(&format!("SELECT * FROM download_records WHERE {scope} AND {HISTORY_SEARCH} AND (?2 IS NULL OR status=?2 OR (?2='running' AND status='queued')) AND (?3 IS NULL OR started_at<?3 OR (started_at=?3 AND id<?4)) ORDER BY started_at DESC,id DESC LIMIT ?5")).map_err(|e| StorageError::new("loadFailed", e))?;
+            let mut statement = tx.prepare(&format!("SELECT * FROM download_records WHERE {scope} AND {HISTORY_SEARCH} AND (?2 IS NULL OR {HISTORY_STATUS}=?2 OR (?2='running' AND status='queued')) AND (?3 IS NULL OR started_at<?3 OR (started_at=?3 AND id<?4)) ORDER BY started_at DESC,id DESC LIMIT ?5")).map_err(|e| StorageError::new("loadFailed", e))?;
             let rows = statement
                 .query_map(
                     params![
@@ -736,7 +792,7 @@ fn require_no_active_downloads(
     transaction: &Transaction<'_>,
     record: &DownloadRecord,
 ) -> Result<(), StorageError> {
-    if record.output_path.is_none() {
+    if record.output_path.is_none() && record.temporary_directories.is_empty() {
         return Ok(());
     }
     let directories = transaction.prepare("SELECT download_directory,output_path FROM download_records WHERE status IN ('queued','running')")
@@ -748,22 +804,39 @@ fn require_no_active_downloads(
             .to_string_lossy()
             .replace('/', "\\");
         if cfg!(windows) {
+            // Existing paths canonicalize to extended Windows spelling; queued
+            // destinations may not exist yet. Compare both using the same prefix.
+            let value = if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+                format!(r"\\{unc}")
+            } else {
+                value.strip_prefix(r"\\?\").unwrap_or(&value).to_string()
+            };
             value.to_lowercase()
         } else {
             value
         }
     };
-    let output = record.output_path.as_deref().unwrap();
+    let output = record.output_path.as_deref();
     // yt-dlp resolves sanitized names only when execution starts. Reserve its destination
     // directory while queued/running so an unknown future output cannot be removed.
-    let parent = Path::new(output)
-        .parent()
+    let parent = output
+        .and_then(|path| Path::new(path).parent())
         .map(|p| normalize(&p.to_string_lossy()));
+    let temporary_roots = record
+        .temporary_directories
+        .iter()
+        .map(|directory| PathBuf::from(normalize(&directory.path)))
+        .collect::<Vec<_>>();
     if directories.iter().any(|(directory, path)| {
-        parent.as_ref() == Some(&normalize(directory))
+        temporary_roots.iter().any(|root| {
+            PathBuf::from(normalize(directory)).starts_with(root)
+                || path
+                .as_deref()
+                .is_some_and(|path| PathBuf::from(normalize(path)).starts_with(root))
+        }) || parent.as_ref() == Some(&normalize(directory))
             || path
             .as_deref()
-            .is_some_and(|p| normalize(p) == normalize(output))
+            .is_some_and(|p| output.is_some_and(|output| normalize(p) == normalize(output)))
     }) {
         return Err(StorageError::new(
             "historyBusy",
@@ -801,12 +874,13 @@ fn read_record_for_write(
     transaction: &Transaction<'_>,
     id: i64,
 ) -> Result<DownloadRecord, StorageError> {
-    let record = transaction
+    let mut record = transaction
         .query_row("SELECT * FROM download_records WHERE id=?1", [id], from_row)
         .optional()
         .map_err(|error| StorageError::new("saveFailed", error))?
         .ok_or_else(|| StorageError::new("recordNotFound", "Download record not found"))?;
     validate_record_time(&record)?;
+    record.temporary_directories = temporary::read(transaction, id)?;
     Ok(record)
 }
 
@@ -821,14 +895,19 @@ fn require_nonrunning(record: &DownloadRecord) -> Result<(), StorageError> {
     }
 }
 
-const HISTORY_STATUSES: [&str; 6] = [
+const HISTORY_STATUSES: [&str; 7] = [
     "queued",
     "running",
+    "paused",
     "completed",
     "failed",
     "cancelled",
     "interrupted",
 ];
+
+// Keep worker ownership in storage while counting and filtering its saved pause intent.
+const HISTORY_STATUS: &str =
+    "CASE WHEN status='running' AND pause_requested=1 THEN 'paused' ELSE status END";
 
 // A single predicate keeps rows and per-status counts aligned, including localized aliases.
 const HISTORY_SEARCH: &str = "(title LIKE ?1 ESCAPE '\\' OR

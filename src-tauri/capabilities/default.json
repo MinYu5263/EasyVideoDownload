@@ -11,6 +11,7 @@
     "core:window:allow-theme",
     "core:window:allow-set-theme",
     "opener:default",
+    "log:allow-log",
     "clipboard-manager:allow-read-text",
     "clipboard-manager:allow-write-text"
   ]

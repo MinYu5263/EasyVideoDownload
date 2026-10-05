@@ -24,7 +24,8 @@ use tokio::{
     process::Command,
     sync::watch,
 };
-mod failure;
+mod control;
+pub(crate) mod failure;
 pub(crate) mod history;
 mod progress;
 use history::DownloadRecordSession;
@@ -32,18 +33,18 @@ use progress::ProgressTracker;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct DownloadProgress {
-    phase: &'static str,
-    percent: Option<f64>,
-    speed: Option<f64>,
-    eta: Option<f64>,
+    pub(crate) phase: &'static str,
+    pub(crate) percent: Option<f64>,
+    pub(crate) speed: Option<f64>,
+    pub(crate) eta: Option<f64>,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadResult {
-    path: String,
-    already_downloaded: bool,
+    pub(crate) path: String,
+    pub(crate) already_downloaded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    storage_error: Option<crate::database::StorageError>,
+    pub(crate) storage_error: Option<crate::database::StorageError>,
 }
 
 pub(super) mod task_snapshot;
@@ -300,12 +301,23 @@ async fn run_download(
     run_download_with_history(command, directory, cancel, limit, notify, None).await
 }
 async fn run_download_with_history(
+    command: Command,
+    directory: &Path,
+    cancel: watch::Receiver<bool>,
+    limit: Duration,
+    notify: impl Fn(DownloadProgress) -> Result<(), VideoError> + Sync,
+    history: Option<&DownloadRecordSession>,
+) -> Result<DownloadResult, VideoError> {
+    run_controlled_download(command, directory, cancel, limit, notify, history, None).await
+}
+async fn run_controlled_download(
     mut command: Command,
     directory: &Path,
     mut cancel: watch::Receiver<bool>,
     limit: Duration,
     notify: impl Fn(DownloadProgress) -> Result<(), VideoError> + Sync,
     history: Option<&DownloadRecordSession>,
+    control: Option<&control::DownloadControl>,
 ) -> Result<DownloadResult, VideoError> {
     if *cancel.borrow() {
         return Err(error("downloadCancelled", ""));
@@ -318,6 +330,12 @@ async fn run_download_with_history(
     let (mut child, tree) = process_tree::spawn(&mut command)
         .await
         .map_err(|e| error("spawnFailed", e))?;
+    let tree = std::sync::Arc::new(tree);
+    let registration = control.map(|control| control.attach(tree.clone()));
+    let timeout_control = crate::douyin::cancel::Cancellation::default();
+    let timeout_control = control
+        .map(|control| &control.native)
+        .unwrap_or(&timeout_control);
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let tracker = Mutex::new(ProgressTracker::default());
@@ -329,17 +347,25 @@ async fn run_download_with_history(
                 read_stream(stderr, &tracker, &notify, history)
             )
         });
+        let mut processing_finished = false;
         let result = tokio::select! {
             biased;
             _ = async { if !*cancel.borrow() { let _ = cancel.changed().await; } } => Err(error("downloadCancelled", "")),
-            result = tokio::time::timeout(limit, &mut processing) => match result { Ok(result) => Ok(result), Err(_) => Err(error("downloadTimeout", "Download exceeded six hours")) },
+            result = &mut processing => {
+                processing_finished = true;
+                result
+            },
+            _ = timeout_control.active_timeout(limit) => Err(error("downloadTimeout", "Download exceeded six hours")),
         };
         // Kill the process tree, then consume its buffered start evidence before settlement.
+        drop(registration);
         drop(tree);
         match result {
-            Ok(result) => result,
+            Ok(result) => Ok(result),
             Err(failure) => {
-                let _ = tokio::time::timeout(Duration::from_secs(10), &mut processing).await;
+                if !processing_finished {
+                    let _ = tokio::time::timeout(Duration::from_secs(10), &mut processing).await;
+                }
                 Err(failure)
             }
         }

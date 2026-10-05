@@ -5,7 +5,8 @@ import type {PersistedAppPageId} from "../navigation.ts";
 
 export interface UiPreferences {
     downloadPlatform: VideoPlatform;
-    settingsSection: "application" | "tools" | "proxy" | "about";
+    settingsSection: "application" | "platforms" | "tools" | "proxy" | "about";
+    settingsPlatform: VideoPlatform;
     activePage: PersistedAppPageId
 }
 
@@ -30,6 +31,7 @@ export function createUiPreferences(bridge: PersistenceBridge) {
     const draft = reactive<UiPreferences>({
         downloadPlatform: "douyin",
         settingsSection: "application",
+        settingsPlatform: "douyin",
         activePage: "download"
     });
     const ready = ref(false), loading = ref(false), saving = ref(false);

@@ -4,7 +4,7 @@ use serde_json::Value;
 use url::Url;
 
 pub(super) const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
-pub(super) fn client(
+pub(crate) fn client(
     contents: &str,
     proxy: Option<&crate::proxy::ProxySettings>,
 ) -> Result<Client, LabError> {
@@ -72,7 +72,7 @@ async fn request_json(client: &Client, url: Url) -> Result<Value, LabError> {
         .map_err(|_| LabError::new("timeout", "Detail request timed out"))?
 }
 
-pub(super) async fn parse_video(client: &Client, input: &str) -> Result<ParsedResult, LabError> {
+pub(crate) async fn parse_video(client: &Client, input: &str) -> Result<ParsedResult, LabError> {
     let url = super::normalize_link(input)?;
     let url = if url.host_str() == Some("v.douyin.com") {
         tokio::time::timeout(std::time::Duration::from_secs(30), client.get(url).send())

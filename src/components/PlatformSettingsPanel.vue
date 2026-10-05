@@ -1,24 +1,22 @@
 <script lang="ts" setup>
 import {computed} from "vue";
-import {ElAlert, ElButton, ElSwitch} from "element-plus";
-import {Close} from "@element-plus/icons-vue";
+import {ElButton, ElInput, ElSwitch, ElTooltip} from "element-plus";
+import {FolderOpened, RefreshRight} from "@element-plus/icons-vue";
 import {useI18n} from "vue-i18n";
 import CookieImportPanel from "./CookieImportPanel.vue";
 import type {VideoPlatform} from "../composables/videoPlatforms";
 import type {ProxySettings} from "../composables/useProxySettings";
-import type {PersistenceError} from "../composables/useUiPreferences";
 
 const props = defineProps<{
   platform: VideoPlatform; contents: string; cookieDisabled: boolean;
   proxyEnabled: boolean; proxy: ProxySettings | null; settingsDisabled: boolean; saving: boolean;
-  loadError: PersistenceError | null; saveError: PersistenceError | null;
+  directory: string; directoryDisabled: boolean; directoryBusy: boolean;
 }>();
 const emit = defineEmits<{
-  close: [];
+  chooseDirectory: []; resetDirectory: [];
   change: [contents: string];
   proxyChange: [enabled: boolean];
   openProxy: [];
-  retry: []
 }>();
 const {t} = useI18n({useScope: "global"});
 const proxyAddress = computed(() => {
@@ -29,18 +27,33 @@ const proxyAddress = computed(() => {
 </script>
 
 <template>
-  <section aria-labelledby="platform-settings-title" class="platform-settings">
-    <header class="configuration-heading">
-      <h2 id="platform-settings-title" tabindex="-1">
-        {{ t('download.configuration.title', {platform: t(`download.platforms.${platform}`)}) }}</h2>
-      <ElButton :aria-label="t('download.configuration.close')" :icon="Close" class="close-button"
-                @click="emit('close')"/>
-    </header>
-    <section aria-labelledby="platform-proxy-title" class="proxy-section">
+  <section :aria-label="t('download.configuration.title', {platform: t(`download.platforms.${platform}`)})"
+           class="platform-settings">
+    <section aria-labelledby="platform-directory-title" class="directory-section">
+      <h3 id="platform-directory-title">{{ t('download.saveDirectory') }}</h3>
+      <div class="directory-row">
+        <ElInput :aria-label="t('download.saveDirectory')" :model-value="directory"
+                 :placeholder="t('download.directoryPlaceholder')" readonly>
+          <template #append>
+            <div class="directory-actions">
+              <ElTooltip :content="t('download.chooseDirectory')" placement="top">
+                <ElButton :aria-label="t('download.chooseDirectory')" :disabled="directoryDisabled" :icon="FolderOpened"
+                          :loading="directoryBusy" @click="emit('chooseDirectory')"/>
+              </ElTooltip>
+              <ElTooltip :content="t('download.resetDirectory')" placement="top">
+                <ElButton :aria-label="t('download.resetDirectory')" :disabled="directoryDisabled" :icon="RefreshRight"
+                          @click="emit('resetDirectory')"/>
+              </ElTooltip>
+            </div>
+          </template>
+        </ElInput>
+      </div>
+    </section>
+    <section :aria-busy="saving" aria-labelledby="platform-proxy-title" class="proxy-section">
       <div class="proxy-row">
         <h3 id="platform-proxy-title">{{ t('download.configuration.useProxy') }}</h3>
         <ElSwitch :aria-label="t('download.configuration.useProxy')" :disabled="settingsDisabled || saving || (!proxy && !proxyEnabled)"
-                  :loading="saving" :model-value="proxyEnabled"
+                  :class="{'is-saving': saving && !settingsDisabled}" :model-value="proxyEnabled" class="proxy-switch"
                   @update:model-value="emit('proxyChange', Boolean($event))"/>
       </div>
       <div class="proxy-description">
@@ -48,12 +61,6 @@ const proxyAddress = computed(() => {
         <span v-else>{{ t('download.configuration.proxyMissing') }}</span>
         <ElButton link type="primary" @click="emit('openProxy')">{{ t('download.configuration.openProxy') }}</ElButton>
       </div>
-      <ElAlert v-if="loadError" :closable="false" :title="t('download.configuration.loadFailed')" show-icon
-               type="error">
-        <ElButton link type="primary" @click="emit('retry')">{{ t('persistence.retry') }}</ElButton>
-      </ElAlert>
-      <ElAlert v-if="saveError" :closable="false" :title="t(saveError.code === 'proxyNotConfigured' ? 'download.configuration.proxyMissing' : 'download.configuration.saveFailed')" show-icon
-               type="error"/>
     </section>
     <section aria-labelledby="platform-cookie-title" class="cookie-section">
       <h3 id="platform-cookie-title">{{ t('download.cookie.title') }}</h3>
@@ -65,27 +72,26 @@ const proxyAddress = computed(() => {
 
 <style scoped>
 .platform-settings {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: min-content;
   padding: 24px;
   border: 1px solid var(--app-border);
   border-radius: var(--app-radius);
   background: var(--app-surface);
 }
 
-.configuration-heading, .proxy-row {
+.proxy-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
 }
 
-.configuration-heading {
-  margin-bottom: 24px;
-}
-
-.configuration-heading h2 {
-  margin: 0;
-  font-size: 18px;
-  font-weight: 600;
+.proxy-switch.is-saving {
+  /* Prevent duplicate toggles without dimming the switch during persistence. */
+  opacity: 1;
 }
 
 h3 {
@@ -94,14 +100,47 @@ h3 {
   font-weight: 600;
 }
 
-.close-button {
-  width: 32px;
-  height: 32px;
+.directory-section {
   flex-shrink: 0;
+  margin-bottom: 22px;
+  padding-bottom: 22px;
+  border-bottom: 1px solid var(--app-border);
+}
+
+.proxy-section {
+  flex-shrink: 0;
+}
+
+.directory-row {
+  display: flex;
+  margin-top: 12px;
+}
+
+.directory-row .el-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.directory-row :deep(.el-input-group__append) {
+  padding: 0;
+  background: var(--app-surface);
+}
+
+.directory-row :deep(.el-input-group__append .el-button) {
+  margin: 0;
+  width: 40px;
+  height: 36px;
   padding: 0;
   border: 0;
-  background: var(--app-accent-soft);
-  color: var(--app-text-secondary);
+  border-radius: 0;
+}
+
+.directory-actions {
+  display: flex;
+}
+
+.directory-actions :deep(.el-button + .el-button) {
+  border-left: 1px solid var(--app-border);
 }
 
 .proxy-description {
@@ -118,19 +157,22 @@ h3 {
   overflow-wrap: anywhere;
 }
 
-.proxy-section :deep(.el-alert) {
-  margin-top: 12px;
-}
 
 .cookie-section {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: min-content;
   margin-top: 22px;
   padding-top: 22px;
   border-top: 1px solid var(--app-border);
 }
 
 .cookie-section h3 {
+  flex-shrink: 0;
   margin-bottom: 14px;
 }
+
 
 @media (max-width: 800px) {
   .platform-settings {

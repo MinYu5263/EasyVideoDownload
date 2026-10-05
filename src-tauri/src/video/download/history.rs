@@ -96,12 +96,24 @@ impl Drop for PendingObservation {
         }
     }
 }
-pub(super) struct DownloadRecordSession(Arc<SessionInner>);
-pub(super) struct RestartTarget<'a> {
+pub(crate) struct DownloadRecordSession(Arc<SessionInner>);
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum RestartOutputPolicy {
+    Deferred,
+    RequireMissing,
+    Replace,
+}
+pub(crate) struct RestartTarget<'a> {
     pub record: &'a crate::database::download_records::DownloadRecord,
     pub restore_trashed: bool,
+    pub output_policy: RestartOutputPolicy,
 }
 impl DownloadRecordSession {
+    pub(crate) fn native_stage(&self, stage: &'static str) {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.stage = stage;
+        }
+    }
     pub fn accept(
         database: Arc<Database>,
         root: &Path,
@@ -166,7 +178,22 @@ impl DownloadRecordSession {
             &target.record.request_id,
             &snapshot,
             target.restore_trashed,
-            |_, _| Ok(None),
+            |record, protected| match target.output_policy {
+                RestartOutputPolicy::Deferred => Ok(None),
+                RestartOutputPolicy::Replace => {
+                    permanent::delete_output_file(record, protected).map(Some)
+                }
+                RestartOutputPolicy::RequireMissing => {
+                    if permanent::validated_record_output(record)?.is_some() {
+                        Err(StorageError::new(
+                            "historyOutputReturned",
+                            "The final output reappeared before download",
+                        ))
+                    } else {
+                        Ok(Some(false))
+                    }
+                }
+            },
         )?;
         if matches!(
             &acceptance,
@@ -288,6 +315,13 @@ impl DownloadRecordSession {
         &self,
         result: &Result<DownloadResult, VideoError>,
     ) -> Option<StorageError> {
+        self.finish_with_pause(result, false).await
+    }
+    pub async fn finish_with_pause(
+        &self,
+        result: &Result<DownloadResult, VideoError>,
+        preserve_pause: bool,
+    ) -> Option<StorageError> {
         let result = result.clone();
         let inner = self.0.clone();
         tauri::async_runtime::spawn_blocking(move || {
@@ -313,7 +347,11 @@ impl DownloadRecordSession {
                     }),
                     Err(e) => return Some(StorageError::new("saveFailed", e)),
                 },
-                Err(e) if e.code == "downloadCancelled" => Some(DownloadRecordOutcome::Cancelled),
+                Err(e) if e.code == "downloadCancelled" => Some(if preserve_pause {
+                    DownloadRecordOutcome::Paused
+                } else {
+                    DownloadRecordOutcome::Cancelled
+                }),
                 Err(e) => Some(DownloadRecordOutcome::Failed {
                     code: e.code.clone(),
                     detail: super::failure::sanitize_diagnostic(&e.detail),
@@ -362,7 +400,12 @@ impl SessionInner {
 pub(crate) fn recover(database: &Database, root: &Path) -> Result<(), StorageError> {
     for id in database.running_request_ids()? {
         if let Some(_lock) = RequestLock::acquire(root, &id, false)? {
-            database.finish_download_record(&id, &DownloadRecordOutcome::Interrupted)?;
+            let outcome = if database.download_pause_requested(&id)? {
+                DownloadRecordOutcome::Paused
+            } else {
+                DownloadRecordOutcome::Interrupted
+            };
+            database.finish_download_record(&id, &outcome)?;
         }
     }
     Ok(())
@@ -392,7 +435,6 @@ pub async fn list_download_records(
             )
             .map(|page| HistoryListResult {
                 page,
-                file_recycling_supported: cfg!(windows),
                 file_deletion_supported: permanent::supported(),
             })
     })
@@ -404,12 +446,11 @@ pub async fn list_download_records(
 pub struct HistoryListResult {
     #[serde(flatten)]
     page: HistoryPageResult,
-    file_recycling_supported: bool,
     file_deletion_supported: bool,
 }
 
 pub(crate) mod actions;
 pub(crate) mod permanent;
-mod recycle;
+pub(crate) mod recycle;
 #[cfg(test)]
 mod tests;

@@ -73,9 +73,9 @@ export function historyOperationMessage(error: {
     detail?: string
 } | null | undefined, t: (key: string, args: Record<string, string>) => string, te: (key: string) => boolean, platform: string) {
     if (!error) return null;
-    const key = te(`history.${error.code}`) ? `history.${error.code}` : te(`download.errors.${error.code}`) ? `download.errors.${error.code}` : 'history.operationFailed';
-    const detail = ["historyFileOccupied", "historyFileDeleteFailed", "historyFilePermissionDenied", "historyFileReadOnly"].includes(error.code) ? "" : sanitizeHistoryDetail(error.detail);
-    return `${t(key, {platform: t(`download.platforms.${platform}`, {})})}${detail ? ` ${detail}` : ''}`;
+    const key = te(`history.${error.code}`) ? `history.${error.code}` : te(`download.errors.${error.code}`) ? `download.errors.${error.code}` :
+        platform === 'douyin' && te(`download.douyinErrors.${error.code}`) ? `download.douyinErrors.${error.code}` : 'history.operationFailed';
+    return t(key, {platform: t(`download.platforms.${platform}`, {})});
 }
 
 export function historySuggestionKey(row: Pick<DownloadRecord, "status" | "failureKind"> & Partial<Pick<DownloadRecord, "errorCode">>) {

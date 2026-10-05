@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import {computed} from "vue";
-import {ElButton, ElIcon, ElInput, ElMessage, ElOption, ElSelect} from "element-plus";
+import {computed, watch} from "vue";
+import {ElButton, ElIcon, ElInput, ElOption, ElSelect} from "element-plus";
 import {FolderOpened, TopRight} from "@element-plus/icons-vue";
 import {toolWebsites, useDesktopActions} from "../composables/useDesktopActions";
 import {useI18n} from "vue-i18n";
 import type {RequiredToolId, RequiredToolSource, RequiredToolState} from "../composables/useRequiredTools";
+import {useFeedback} from "../composables/useFeedback";
+import {persistenceError} from "../composables/useUiPreferences";
 
 const props = defineProps<{
   toolId: RequiredToolId;
@@ -34,6 +36,13 @@ const currentConfig = computed(() => {
   return active;
 });
 const visibleError = computed(() => automatic.value && props.state.error?.code === "notFound" ? null : props.state.error);
+const {notifyError, watchError, inform} = useFeedback();
+watchError(() => visibleError.value?.code === 'configureCancelled' ? null : visibleError.value,
+    error => t(`settings.requiredTools.errors.${error.code}`, {program: error.program || t(`settings.requiredTools.${props.toolId}.name`)}),
+    () => ({key: `tool:${props.toolId}`, title: t(`settings.requiredTools.${props.toolId}.name`)}));
+watch(() => props.state.error, error => {
+  if (error?.code === 'configureCancelled') inform(t('settings.requiredTools.errors.configureCancelled'), 'info');
+});
 const managedReady = computed(() => currentConfig.value?.source === "automatic");
 // Automatic setup reuses current bundles and upgrades obsolete managed layouts.
 const needsConfiguration = computed(() => automatic.value);
@@ -66,8 +75,8 @@ async function openWebsite(event: MouseEvent) {
   event.preventDefault();
   try {
     await desktop.openToolWebsite(props.toolId);
-  } catch {
-    ElMessage.error(t("settings.requiredTools.websiteOpenFailed", {url: toolWebsites[props.toolId]}));
+  } catch (error) {
+    notifyError(t("settings.requiredTools.websiteOpenFailed", {url: toolWebsites[props.toolId]}), {detail: persistenceError(error).detail});
   }
 }
 </script>
@@ -123,7 +132,7 @@ async function openWebsite(event: MouseEvent) {
           }}
         </ElButton>
         <ElButton v-if="state.operation === 'configuring'"
-                  :disabled="!state.progress || state.progress.phase === 'saving' || state.cancelling"
+                  :disabled="!state.progress || state.progress.phase === 'saving' || state.cancelling || state.cancellationUnavailable"
                   @click="emit('cancel')">
           {{ t("settings.requiredTools.cancel") }}
         </ElButton>
@@ -154,17 +163,6 @@ async function openWebsite(event: MouseEvent) {
       </div>
     </div>
 
-    <p v-if="state.error?.code === 'configureCancelled'" class="draft-note" role="status">
-      {{ t("settings.requiredTools.errors.configureCancelled") }}</p>
-    <div v-else-if="visibleError" class="required-tool-error" role="alert">
-      <p>{{
-          t(`settings.requiredTools.errors.${visibleError.code}`, {program: visibleError.program || t(`settings.requiredTools.${toolId}.name`)})
-        }}</p>
-      <details v-if="visibleError.detail">
-        <summary>{{ t("settings.requiredTools.errorDetails") }}</summary>
-        <pre>{{ visibleError.detail }}</pre>
-      </details>
-    </div>
 
     <dl v-if="currentConfig" class="required-tool-details">
       <template v-for="program in currentConfig.programs" :key="program.name">
@@ -352,35 +350,6 @@ async function openWebsite(event: MouseEvent) {
   overflow-wrap: anywhere;
 }
 
-.required-tool-error {
-  margin-top: 14px;
-  padding: 12px;
-  border-radius: 8px;
-  background: var(--app-danger-soft);
-  color: var(--app-danger);
-  font-size: 12px;
-  line-height: 1.7;
-}
-
-.required-tool-error p {
-  margin: 0;
-}
-
-.required-tool-error details {
-  margin-top: 6px;
-}
-
-.required-tool-error summary {
-  cursor: pointer;
-}
-
-.required-tool-error pre {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  font: inherit;
-  max-height: 160px;
-  overflow: auto;
-}
 
 .draft-note {
   margin: 12px 0 0;

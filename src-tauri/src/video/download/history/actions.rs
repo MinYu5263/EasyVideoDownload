@@ -1,13 +1,7 @@
-use crate::database::{Storage, StorageError};
+use crate::database::{Database, Storage, StorageError};
 use std::path::{Path, PathBuf};
 use tauri::Emitter;
 use tauri_plugin_opener::OpenerExt;
-
-#[derive(Debug, PartialEq)]
-enum FolderTarget {
-    Reveal(PathBuf),
-    Open(PathBuf),
-}
 
 fn classify_file_error(error: std::io::Error) -> StorageError {
     if error.kind() == std::io::ErrorKind::NotFound {
@@ -34,36 +28,17 @@ fn file_target(path: Option<&str>) -> Result<PathBuf, StorageError> {
     }
     Ok(path)
 }
-fn folder_target(output: Option<&str>, directory: &str) -> Result<FolderTarget, StorageError> {
-    match file_target(output) {
-        Ok(file) => return Ok(FolderTarget::Reveal(file)),
-        Err(e) if e.code == "historyFileMissing" => {}
-        Err(e) => return Err(e),
-    }
-    let path = Path::new(directory);
-    if !path.is_absolute() {
-        return Err(StorageError::new(
-            "historyDirectoryMissing",
-            "The download directory is unavailable",
-        ));
-    }
-    let path = path.canonicalize().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            StorageError::new(
-                "historyDirectoryMissing",
-                "The download directory is unavailable",
-            )
-        } else {
-            StorageError::new("historyOpenFailed", e)
+fn checked_record_file(db: &Database, id: i64) -> Result<PathBuf, StorageError> {
+    let record = db.get_download_record(id)?;
+    let checked = file_target(record.output_path.as_deref());
+    match &checked {
+        Ok(_) => db.mark_download_output_availability(&record, "present")?,
+        Err(e) if e.code == "historyFileMissing" && record.output_path.is_some() => {
+            db.mark_download_output_availability(&record, "missing")?
         }
-    })?;
-    if !path.is_dir() {
-        return Err(StorageError::new(
-            "historyDirectoryMissing",
-            "The download directory is unavailable",
-        ));
+        _ => {}
     }
-    Ok(FolderTarget::Open(path))
+    checked
 }
 fn source_target(source: &str) -> Result<String, StorageError> {
     let url = url::Url::parse(source)
@@ -118,7 +93,7 @@ pub async fn purge_download_record(
 ) -> Result<(), StorageError> {
     let db = storage.database()?;
     let result = tauri::async_runtime::spawn_blocking(move || {
-        db.purge_download_record(id, super::permanent::delete_output_file)
+        db.purge_download_record(id, super::permanent::delete_download_files)
     })
         .await
         .map_err(|e| StorageError::new("saveFailed", e))?;
@@ -133,7 +108,7 @@ pub async fn empty_download_record_trash(
 ) -> Result<(), StorageError> {
     let db = storage.database()?;
     let result = tauri::async_runtime::spawn_blocking(move || {
-        db.empty_download_record_trash(super::permanent::delete_output_file)
+        db.empty_download_record_trash(super::permanent::delete_download_files)
     })
         .await
         .map_err(|e| StorageError::new("saveFailed", e))?;
@@ -143,8 +118,18 @@ pub async fn empty_download_record_trash(
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RecycleFileResult {
-    file_recycled: bool,
+pub struct DeleteFileResult {
+    file_deleted: bool,
+}
+
+pub(crate) fn delete_record_files(db: &Database, id: i64) -> Result<bool, StorageError> {
+    let mut file_deleted = false;
+    db.delete_download_record_and_file(id, |record, protected| {
+        let fragments_deleted = super::permanent::delete_download_fragments(record, protected)?;
+        file_deleted = super::permanent::delete_output_file(record, protected)?;
+        Ok(file_deleted || fragments_deleted)
+    })?;
+    Ok(file_deleted)
 }
 
 #[tauri::command]
@@ -152,11 +137,9 @@ pub async fn delete_download_record_and_file(
     app: tauri::AppHandle,
     storage: tauri::State<'_, Storage>,
     id: i64,
-) -> Result<RecycleFileResult, StorageError> {
+) -> Result<DeleteFileResult, StorageError> {
     let db = storage.database()?;
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        db.recycle_download_record_file(id, super::recycle::recycle_output_file)
-    })
+    let result = tauri::async_runtime::spawn_blocking(move || delete_record_files(&db, id))
         .await
         .map_err(|e| StorageError::new("saveFailed", e))?;
     // Even a partial success changes file availability and must refresh observers.
@@ -164,11 +147,20 @@ pub async fn delete_download_record_and_file(
         || result
         .as_ref()
         .err()
-        .is_some_and(|e| e.code == "historyFileRecycledSaveFailed")
+        .is_some_and(|e| e.code == "historyFileDeletedSaveFailed")
     {
         let _ = app.emit("download-records-changed", ());
     }
-    result.map(|file_recycled| RecycleFileResult { file_recycled })
+    match &result {
+        Ok(deleted) => {
+            log::info!("operation=delete_record_and_file record_id={id} file_deleted={deleted}")
+        }
+        Err(error) => log::warn!(
+            "operation=delete_record_and_file record_id={id} code={}",
+            error.code
+        ),
+    }
+    result.map(|file_deleted| DeleteFileResult { file_deleted })
 }
 
 #[tauri::command]
@@ -178,18 +170,7 @@ pub async fn open_download_record_file(
     id: i64,
 ) -> Result<(), StorageError> {
     let db = storage.database()?;
-    let path = tauri::async_runtime::spawn_blocking(move || {
-        let record = db.get_download_record(id)?;
-        let checked = file_target(record.output_path.as_deref());
-        match &checked {
-            Ok(_) => db.mark_download_output_availability(&record, "present")?,
-            Err(e) if e.code == "historyFileMissing" && record.output_path.is_some() => {
-                db.mark_download_output_availability(&record, "missing")?
-            }
-            _ => {}
-        }
-        checked
-    })
+    let path = tauri::async_runtime::spawn_blocking(move || checked_record_file(&db, id))
         .await
         .map_err(|e| StorageError::new("historyOpenFailed", e))?;
     let _ = app.emit("download-records-changed", ());
@@ -205,34 +186,23 @@ pub async fn open_download_record_folder(
     id: i64,
 ) -> Result<(), StorageError> {
     let db = storage.database()?;
-    let target = tauri::async_runtime::spawn_blocking(move || {
-        let record = db.get_download_record(id)?;
-        let directory = record.successful_output.as_ref().map(|s| s.directory.as_str()).unwrap_or(&record.download_directory);
-        let missing = record.output_path.is_some() && matches!(file_target(record.output_path.as_deref()),Err(e) if e.code=="historyFileMissing");
-        if missing { db.mark_download_output_availability(&record, "missing")?; }
-        let target = folder_target(record.output_path.as_deref(), directory).map_err(|e| if missing && e.code == "historyDirectoryMissing" { StorageError::new("historyFileMissing", "The output file and its directory are missing") } else { e })?;
-        if !missing { db.mark_download_output_availability(&record, if record.output_path.is_some() { "present" } else { "unknown" })?; }
-        Ok::<_, StorageError>((target, missing))
-    })
+    let target = tauri::async_runtime::spawn_blocking(move || checked_record_file(&db, id))
         .await
         .map_err(|e| StorageError::new("historyOpenFailed", e))?;
     let _ = app.emit("download-records-changed", ());
-    let (target, missing) = target?;
-    let result = match target {
-        FolderTarget::Reveal(path) => app.opener().reveal_item_in_dir(path),
-        FolderTarget::Open(path) => app
-            .opener()
-            .open_path(path.to_string_lossy().into_owned(), None::<String>),
+    let result = target.and_then(|path| {
+        app.opener()
+            .reveal_item_in_dir(path)
+            .map_err(|e| StorageError::new("historyOpenFailed", e))
+    });
+    match &result {
+        Ok(()) => log::info!("operation=open_record_folder record_id={id}"),
+        Err(error) => log::warn!(
+            "operation=open_record_folder record_id={id} code={}",
+            error.code
+        ),
     };
-    result.map_err(|e| StorageError::new("historyOpenFailed", e))?;
-    if missing {
-        let _ = app.emit("download-records-changed", ());
-        return Err(StorageError::new(
-            "historyFileMissing",
-            "Opened the folder; the output file is missing",
-        ));
-    }
-    Ok(())
+    result
 }
 #[tauri::command]
 pub async fn open_download_record_source(
@@ -270,7 +240,7 @@ mod tests {
         );
     }
     #[test]
-    fn missing_file_keeps_folder_available_and_rejects_non_http_sources() {
+    fn missing_file_blocks_folder_opening_and_existing_file_can_be_revealed() {
         let dir = tempfile::tempdir().unwrap();
         eprintln!(
             "temporary native history action directory: {}",
@@ -283,22 +253,47 @@ mod tests {
                 .code,
             "historyFileMissing"
         );
-        assert_eq!(
-            folder_target(
-                Some(missing.to_str().unwrap()),
-                dir.path().to_str().unwrap()
-            )
-                .unwrap(),
-            FolderTarget::Open(dir.path().canonicalize().unwrap())
-        );
+        assert_eq!(file_target(None).unwrap_err().code, "historyFileMissing");
         std::fs::write(&missing, b"video").unwrap();
         assert_eq!(
-            folder_target(
-                Some(missing.to_str().unwrap()),
-                dir.path().to_str().unwrap()
+            file_target(Some(missing.to_str().unwrap())).unwrap(),
+            missing.canonicalize().unwrap()
+        );
+        assert_eq!(
+            file_target(dir.path().to_str()).unwrap_err().code,
+            "historyFileMissing"
+        );
+        let db = Database::open(&dir.path().join("app.db"), &dir.path().join("legacy")).unwrap();
+        let mut page = crate::database::persistence_tests::page();
+        page.download_directory = dir.path().to_string_lossy().into();
+        let id = db
+            .begin_download_record(
+                "folder-check",
+                &crate::database::download_records::DownloadSnapshot { page },
+                "2026-10-04 10:00:00",
             )
-                .unwrap(),
-            FolderTarget::Reveal(missing.canonicalize().unwrap())
+            .unwrap();
+        db.finish_download_record(
+            "folder-check",
+            &crate::database::download_records::DownloadRecordOutcome::Completed {
+                path: missing.to_string_lossy().into(),
+                size: 5,
+                extension: Some("mp4".into()),
+            },
+        )
+            .unwrap();
+        assert_eq!(
+            checked_record_file(&db, id).unwrap(),
+            missing.canonicalize().unwrap()
+        );
+        std::fs::remove_file(&missing).unwrap();
+        assert_eq!(
+            checked_record_file(&db, id).unwrap_err().code,
+            "historyFileMissing"
+        );
+        assert_eq!(
+            db.get_download_record(id).unwrap().file_availability,
+            "missing"
         );
         for source in [
             "file:///C:/secret",

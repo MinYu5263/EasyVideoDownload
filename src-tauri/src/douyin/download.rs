@@ -77,16 +77,12 @@ async fn transfer(
         let attempt = async {
             let mut response = cancel
                 .run(async {
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        client
-                            .get(url)
-                            .header("Referer", "https://www.douyin.com/")
-                            .send(),
-                    )
-                        .await
-                        .map_err(|_| LabError::new("timeout", "Media request timed out"))?
-                        .map_err(|_| LabError::new("downloadFailed", "Media request failed"))
+                    tokio::select! {
+                        result = client.get(url).header("Referer", "https://www.douyin.com/").send() =>
+                            result.map_err(|_| LabError::new("downloadFailed", "Media request failed")),
+                        _ = cancel.active_timeout(std::time::Duration::from_secs(30)) =>
+                            Err(LabError::new("timeout", "Media request timed out")),
+                    }
                 })
                 .await?;
             if [401, 403, 410].contains(&response.status().as_u16()) {
@@ -112,17 +108,16 @@ async fn transfer(
             loop {
                 let chunk = cancel
                     .run(async {
-                        tokio::time::timeout(std::time::Duration::from_secs(30), response.chunk())
-                            .await
-                            .map_err(|_| LabError::new("timeout", "Media transfer stalled"))?
-                            .map_err(|_| {
-                                LabError::new("downloadFailed", "Media transfer interrupted")
-                            })
+                        tokio::select! {
+                            result = response.chunk() => result.map_err(|_| LabError::new("downloadFailed", "Media transfer interrupted")),
+                            _ = cancel.active_timeout(std::time::Duration::from_secs(30)) => Err(LabError::new("timeout", "Media transfer stalled")),
+                        }
                     })
                     .await?;
                 let Some(chunk) = chunk else {
                     break;
                 };
+                cancel.wait_until_resumed().await?;
                 file.write_all(&chunk)
                     .await
                     .map_err(|_| LabError::new("fileFailed", "Temporary file write failed"))?;
@@ -256,17 +251,18 @@ fn publish(
     ))
 }
 
-pub(super) async fn download(
+pub(crate) async fn download(
     client: &reqwest::Client,
     parsed: &super::ParsedResult,
     candidate: &Candidate,
     directory: &Path,
+    temporary_directory: &Path,
     ffprobe: &Path,
     cancel: &Cancellation,
     progress: impl Fn(u64, Option<u64>),
     verifying: impl Fn(),
 ) -> Result<(String, ObservedMedia), LabError> {
-    if !directory.is_absolute() {
+    if !directory.is_absolute() || !temporary_directory.is_absolute() {
         return Err(LabError::new(
             "fileFailed",
             "Choose an absolute download directory",
@@ -279,7 +275,7 @@ pub(super) async fn download(
     let temporary = tempfile::Builder::new()
         .prefix(&format!(".douyin-lab-{}-", uuid::Uuid::new_v4()))
         .suffix(".part")
-        .tempfile_in(directory)
+        .tempfile_in(temporary_directory)
         .map_err(|_| LabError::new("fileFailed", "Unable to create temporary file"))?;
     let mut selected = candidate.clone();
     if let Err(error) = transfer(client, &selected.urls, temporary.path(), cancel, &progress).await
@@ -295,6 +291,7 @@ pub(super) async fn download(
     }
     cancel.check()?;
     verifying();
+    cancel.wait_until_resumed().await?;
     let json = probe(temporary.path(), ffprobe, cancel).await?;
     let size = temporary
         .as_file()
@@ -338,6 +335,62 @@ fn refreshed_candidate(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[tokio::test]
+    async fn native_http_transfer_preserves_partial_file_while_paused_then_continues() {
+        use std::{
+            io::{Read, Write},
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pause.part");
+        eprintln!("owned HTTP pause test file: {}", path.display());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/media", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.write_all(&vec![7u8; 65536]).unwrap();
+        });
+        let token = Cancellation::default();
+        let control = token.clone();
+        let paused = Arc::new(AtomicBool::new(false));
+        let observed_pause = paused.clone();
+        let output = path.clone();
+        let worker = tokio::spawn(async move {
+            transfer(&reqwest::Client::new(), &[url], &output, &token, |_, _| {
+                if !observed_pause.swap(true, Ordering::SeqCst) {
+                    token.set_paused(true);
+                }
+            })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !paused.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        assert!(!worker.is_finished());
+        control.set_paused(false);
+        tokio::time::timeout(std::time::Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![7u8; 65536]);
+        server.join().unwrap();
+        root.close().unwrap();
+    }
     #[test]
     fn verifies_actual_media_against_selected_dimensions() {
         let parsed = super::super::parse_detail(&json!({"aweme_detail":{"aweme_id":"1","video":{"bit_rate":[{"bit_rate":1000,"play_addr":{"width":1920,"height":1080,"url_list":["https://media.test/a"]}}]}}})).unwrap();
@@ -477,6 +530,8 @@ mod tests {
         );
         let keep = root.path().join("user.mp4");
         std::fs::write(&keep, b"keep").unwrap();
+        let temporary_directory = root.path().join("owned temporary files");
+        std::fs::create_dir(&temporary_directory).unwrap();
         let cancel = Cancellation::default();
         let token = cancel.clone();
         let trigger = tokio::spawn(async move {
@@ -489,6 +544,7 @@ mod tests {
             &parsed,
             &parsed.candidates[0],
             root.path(),
+            &temporary_directory,
             Path::new("unused-ffprobe"),
             &cancel,
             |_, _| {},
@@ -499,6 +555,7 @@ mod tests {
         trigger.await.unwrap();
         server.join().unwrap();
         assert_eq!(std::fs::read(&keep).unwrap(), b"keep");
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&temporary_directory).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
     }
 }

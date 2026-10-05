@@ -28,6 +28,7 @@ export interface RequiredToolState {
     error: RequiredToolError | null;
     progress: ConfigureProgress | null;
     cancelling: boolean;
+    cancellationUnavailable: boolean;
 }
 
 type RequiredToolCheckState = Pick<RequiredToolState, "source" | "manualPath" | "error">;
@@ -61,7 +62,14 @@ export function createRequiredTools(bridge: RequiredToolBridge) {
     const automaticFfmpegRequiresRosetta = ref(false);
     const loadError = ref<RequiredToolError | null>(null);
     const tools = reactive(Object.fromEntries(toolIds.map(id => [id, {
-        source: "path", manualPath: "", active: null, operation: null, error: null, progress: null, cancelling: false,
+        source: "path",
+        manualPath: "",
+        active: null,
+        operation: null,
+        error: null,
+        progress: null,
+        cancelling: false,
+        cancellationUnavailable: false,
     }])) as Record<RequiredToolId, RequiredToolState>);
     let pendingLoad = false;
     let loadTask: Promise<void> | undefined;
@@ -173,6 +181,7 @@ export function createRequiredTools(bridge: RequiredToolBridge) {
         tool.operation = "configuring";
         tool.error = null;
         tool.progress = null;
+        tool.cancellationUnavailable = false;
         const previous = configurationKey(tool.active);
         const onProgress = new Channel<ConfigureProgress>();
         onProgress.onmessage = progress => {
@@ -202,13 +211,13 @@ export function createRequiredTools(bridge: RequiredToolBridge) {
 
     async function cancelConfiguration(id: RequiredToolId) {
         const tool = tools[id];
-        if (tool.operation !== "configuring" || !tool.progress || tool.progress.phase === "saving" || tool.cancelling) return;
+        if (tool.operation !== "configuring" || !tool.progress || tool.progress.phase === "saving" || tool.cancelling || tool.cancellationUnavailable) return;
         tool.cancelling = true;
         try {
             const accepted = await bridge.invoke<boolean>("cancel_tool_configuration", {toolId: id});
             if (!accepted && tool.operation === "configuring") {
                 tool.cancelling = false;
-                tool.progress = {phase: "saving", downloaded: 0, total: null};
+                tool.cancellationUnavailable = true;
             }
         } catch (error) {
             tool.error = bridgeError(error);

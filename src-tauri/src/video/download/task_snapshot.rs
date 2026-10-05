@@ -5,9 +5,53 @@ pub(super) struct TaskExecutionSnapshot {
     pub page: DownloadPageState,
     pub settings: RequiredToolSettings,
     pub platform: CookiePlatform,
-    pub command: Command,
+    pub runner: DownloadExecution,
+    pub network_diagnostic: String,
+    pub command_options: Option<(
+        DownloadCommandOptions,
+        Option<crate::proxy::ProxySettings>,
+        String,
+    )>,
     pub _cookie: Option<tempfile::NamedTempFile>,
     pub _tools: ToolUsageLease,
+}
+pub(super) enum DownloadExecution {
+    Ytdlp(Command),
+    Douyin(crate::video::native_douyin::NativeExecution),
+}
+impl TaskExecutionSnapshot {
+    pub(super) fn set_temporary_directory(&mut self, directory: &Path) -> Result<(), VideoError> {
+        if let Some((options, proxy, url)) = &self.command_options {
+            self.runner = DownloadExecution::Ytdlp(
+                super::super::commands::download_command_with_temporary_directory(
+                    &self.settings,
+                    url,
+                    self._cookie.as_ref().map(|f| f.path()),
+                    options,
+                    proxy.as_ref(),
+                    Some(directory),
+                )?,
+            );
+        }
+        Ok(())
+    }
+    pub(super) async fn check_tools(&self) -> Result<(), VideoError> {
+        match &self.runner {
+            DownloadExecution::Ytdlp(_) => {
+                check_download_tool_files(&self.settings, self.platform).await
+            }
+            DownloadExecution::Douyin(native) => native.check_tools(),
+        }
+    }
+}
+#[cfg(test)]
+impl TaskExecutionSnapshot {
+    pub(super) fn ytdlp_command(&self) -> &Command {
+        match &self.runner {
+            DownloadExecution::Ytdlp(c) => c,
+            _ => panic!("Expected yt-dlp task"),
+        }
+    }
 }
 
 pub(super) async fn capture_task_snapshot(
@@ -31,9 +75,17 @@ pub(super) async fn capture_record_snapshot(
 fn page_from_record(
     record: &crate::database::download_records::DownloadRecord,
 ) -> Result<DownloadPageState, VideoError> {
-    let previous = record.successful_output.as_ref();
-    let format_id = previous
-        .map(|p| p.format_id.clone())
+    let previous = record
+        .successful_output
+        .as_ref()
+        .filter(|_| record.status != "paused");
+    let saved = previous
+        .map(|p| p.format_snapshot.clone())
+        .unwrap_or_else(|| record.format_snapshot.clone());
+    let format_id = saved
+        .as_ref()
+        .map(|f| f.format_id.clone())
+        .or_else(|| previous.map(|p| p.format_id.clone()))
         .unwrap_or_else(|| record.format_id.clone());
     let extension = previous
         .map(|p| p.format_extension.clone())
@@ -66,6 +118,7 @@ fn page_from_record(
             } else {
                 record.size_approximate
             },
+            ..saved.unwrap_or_default()
         }],
         selected_format_id: Some(format_id),
         selected_height: height,
@@ -92,13 +145,17 @@ async fn capture_snapshot(
     storage: &Storage,
     recorded: bool,
 ) -> Result<TaskExecutionSnapshot, VideoError> {
+    page.validate("invalidDownloadOptions")
+        .map_err(|e| error("invalidDownloadOptions", e.detail))?;
+    crate::video::formats::normalize_all(&mut page.formats);
     let platform: CookiePlatform = serde_json::from_value(serde_json::json!(page.platform))
         .map_err(|e| error("invalidDownloadOptions", e))?;
     let (settings, lease) = tools
         .settings_and_usage()
         .map_err(|e| error("toolSettingsFailed", e.detail))?;
-    let fingerprint = crate::database::page_states::parser_fingerprint(&settings)
-        .map_err(|e| error("pageSaveFailed", e.detail))?;
+    let fingerprint =
+        crate::database::page_states::parser_fingerprint_for_platform(&settings, &page.platform)
+            .map_err(|e| error("pageSaveFailed", e.detail))?;
     if recorded {
         page.parser_fingerprint = Some(fingerprint);
     } else if page.parser_fingerprint.as_ref() != Some(&fingerprint) {
@@ -111,6 +168,38 @@ async fn capture_snapshot(
         .database()
         .and_then(|db| db.proxy_for_platform(platform))
         .map_err(|e| error("proxySettingsFailed", e.detail))?;
+    let network_diagnostic = super::super::diagnostics::network_summary(&page.platform, proxy.as_ref());
+    if matches!(platform, CookiePlatform::Douyin) {
+        let contents = cookies
+            .load(platform)
+            .map_err(|_| error("cookieReadFailed", "Unable to read Douyin Cookie"))?;
+        let ffprobe = settings
+            .tools
+            .get(&RequiredToolId::Ffmpeg)
+            .and_then(|c| c.programs.iter().find(|p| p.name == "ffprobe"))
+            .map(|p| p.path.clone())
+            .ok_or_else(|| error("ffprobeMissing", "Configure ffprobe in Settings"))?;
+        let runner = DownloadExecution::Douyin(
+            crate::video::native_douyin::capture(
+                &mut page,
+                &contents,
+                proxy.as_ref(),
+                recorded,
+                ffprobe,
+            )
+                .await?,
+        );
+        return Ok(TaskExecutionSnapshot {
+            page,
+            settings,
+            platform,
+            runner,
+            network_diagnostic,
+            command_options: None,
+            _cookie: None,
+            _tools: lease,
+        });
+    }
     let copy = if page.cookie_fallback {
         None
     } else {
@@ -143,11 +232,14 @@ async fn capture_snapshot(
         &options,
         proxy.as_ref(),
     )?;
+    let source = normalize_link(&page.input_link, platform)?;
     Ok(TaskExecutionSnapshot {
         page,
         settings,
         platform,
-        command,
+        runner: DownloadExecution::Ytdlp(command),
+        network_diagnostic,
+        command_options: Some((options, proxy, source)),
         _cookie: copy,
         _tools: lease,
     })

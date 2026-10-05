@@ -1,5 +1,214 @@
 use super::*;
+
+#[test]
+fn different_formats_of_one_video_have_independent_records_and_duplicates_are_per_format() {
+    let dir = tempfile::tempdir().unwrap();
+    eprintln!(
+        "owned per-format records test directory: {}",
+        dir.path().display()
+    );
+    let db = Database::open(&dir.path().join("app.db"), &dir.path().join("legacy")).unwrap();
+    let mut state = page();
+    state.download_directory = dir.path().to_string_lossy().into();
+    let first = DownloadSnapshot { page: state };
+    let mut second = first.clone();
+    second.page.formats[0].format_id = "other-codec".into();
+    second.page.formats[0].video_codec = Some("hevc".into());
+    second.page.selected_format_id = Some("other-codec".into());
+    let a = match db
+        .accept_download_record("format-a", &first, false, false)
+        .unwrap()
+    {
+        RecordAcceptance::Accepted(row) => row,
+        _ => panic!("first format must be accepted"),
+    };
+    let b = match db
+        .accept_download_record("format-b", &second, false, false)
+        .unwrap()
+    {
+        RecordAcceptance::Accepted(row) => row,
+        _ => panic!("a distinct format must be accepted independently"),
+    };
+    assert_ne!(a.id, b.id);
+    assert_eq!(
+        db.get_download_record(a.id).unwrap().format_id,
+        first.page.selected_format_id.unwrap()
+    );
+    assert_eq!(
+        db.get_download_record(b.id)
+            .unwrap()
+            .format_snapshot
+            .unwrap()
+            .video_codec
+            .as_deref(),
+        Some("hevc")
+    );
+    assert!(
+        matches!(db.accept_download_record("duplicate-b", &second, false, false).unwrap(), RecordAcceptance::Existing(row) if row.id == b.id)
+    );
+}
 use crate::database::persistence_tests::page;
+
+#[test]
+fn temporary_download_ownership_survives_trash_and_is_removed_with_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    eprintln!(
+        "owned temporary ownership fixture: {}",
+        dir.path().display()
+    );
+    let db = Database::open(&dir.path().join("app.db"), &dir.path().join("legacy")).unwrap();
+    let count: i64 = db
+        .connection("test")
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='download_temporary_directories'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "temporary ownership must be persisted separately from final outputs"
+    );
+    let mut state = page();
+    state.download_directory = dir.path().to_string_lossy().into();
+    let id = db
+        .begin_download_record(
+            "temporary-owner",
+            &DownloadSnapshot { page: state },
+            &crate::datetime::now(),
+        )
+        .unwrap();
+    db.connection("test").unwrap().execute(
+        "INSERT INTO download_temporary_directories(record_id,path,identity) VALUES (?1,?2,'fixture')",
+        rusqlite::params![id, dir.path().join("owned").to_string_lossy()],
+    ).unwrap();
+    db.finish_download_record(
+        "temporary-owner",
+        &super::super::DownloadRecordOutcome::Paused,
+    )
+        .unwrap();
+    db.delete_download_record(id).unwrap();
+    db.restore_download_record(id).unwrap();
+    assert_eq!(
+        db.connection("test")
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM download_temporary_directories WHERE record_id=?1",
+                [id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    db.delete_download_record(id).unwrap();
+    db.purge_download_record(id, |_, _| Ok(false)).unwrap();
+    assert_eq!(
+        db.connection("test")
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM download_temporary_directories",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn legacy_successful_selector_protects_shared_output_from_an_active_format() {
+    let (_dir, db, mut snapshot, original) = restart_fixture();
+    db.connection("test").unwrap().execute("UPDATE download_records SET format_id='a',format_snapshot_json=NULL,successful_format_snapshot_json=NULL WHERE id=?1", [original.id]).unwrap();
+    db.accept_download_record("active-successful-format", &snapshot, false, false)
+        .unwrap();
+    snapshot.page.selected_format_id = Some("a".into());
+    let failure = db
+        .restart_download_record(
+            "unsafe-legacy-retry",
+            original.id,
+            &original.request_id,
+            &snapshot,
+            false,
+            |_, _| Ok(None),
+        )
+        .err()
+        .expect("the old successful format still owns this file");
+    assert_eq!(failure.code, "historyBusy");
+    assert_eq!(
+        db.get_download_record(original.id).unwrap().request_id,
+        original.request_id
+    );
+    assert!(Path::new(original.output_path.as_ref().unwrap()).exists());
+}
+
+#[test]
+fn historical_format_identity_stays_stable_when_retry_resolves_a_canonical_format() {
+    let (_dir, db, mut snapshot, original) = restart_fixture();
+    let selected = snapshot
+        .page
+        .formats
+        .iter_mut()
+        .find(|f| Some(&f.format_id) == snapshot.page.selected_format_id.as_ref())
+        .unwrap();
+    selected.format_id = "canonical-format".into();
+    snapshot.page.selected_format_id = Some(selected.format_id.clone());
+    db.accept_download_record("canonical-existing", &snapshot, false, false)
+        .unwrap();
+    db.finish_download_record("canonical-existing", &DownloadRecordOutcome::Cancelled)
+        .unwrap();
+    let RecordAcceptance::Accepted(retry) = db
+        .restart_download_record(
+            "legacy-retry",
+            original.id,
+            &original.request_id,
+            &snapshot,
+            false,
+            |_, _| Ok(None),
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(retry.id, original.id);
+    assert_eq!(retry.format_id, original.format_id);
+    assert_eq!(retry.format_snapshot.unwrap().format_id, "canonical-format");
+    assert_eq!(
+        db.video_download_records("youtube", "abc").unwrap().len(),
+        2
+    );
+    assert!(Path::new(original.output_path.as_ref().unwrap()).exists());
+}
+
+#[test]
+fn another_active_format_in_the_same_directory_does_not_block_record_retry() {
+    let (_dir, db, mut snapshot, original) = restart_fixture();
+    let selected = snapshot
+        .page
+        .formats
+        .iter_mut()
+        .find(|f| Some(&f.format_id) == snapshot.page.selected_format_id.as_ref())
+        .unwrap();
+    selected.format_id = "another-format".into();
+    snapshot.page.selected_format_id = Some(selected.format_id.clone());
+    db.accept_download_record("other-active", &snapshot, false, false)
+        .unwrap();
+    snapshot.page.selected_format_id = Some(original.format_id.clone());
+    snapshot
+        .page
+        .formats
+        .push(original.format_snapshot.clone().unwrap());
+    let retry = db.restart_download_record(
+        "same-format-retry",
+        original.id,
+        &original.request_id,
+        &snapshot,
+        false,
+        |_, _| Ok(None),
+    );
+    assert!(matches!(retry, Ok(RecordAcceptance::Accepted(_))));
+    assert!(Path::new(original.output_path.as_ref().unwrap()).exists());
+}
 
 #[test]
 fn duplicate_submissions_and_stale_completion_cannot_replace_current_attempt() {
@@ -160,7 +369,7 @@ fn unrelated_task_directory_does_not_block_history_file_actions() {
     db.accept_download_record("other", &DownloadSnapshot { page: other }, false, false)
         .unwrap();
     assert!(db
-        .recycle_download_record_file(row.id, |_| Ok(false))
+        .delete_download_record_and_file(row.id, |_, _| Ok(false))
         .is_ok());
 }
 
@@ -340,7 +549,7 @@ fn review_recycle_protects_an_alternate_case_shared_output() {
         ids.push(id);
     }
     let called = std::cell::Cell::new(false);
-    let result = db.recycle_download_record_file(ids[0], |_| {
+    let result = db.delete_download_record_and_file(ids[0], |_, _| {
         called.set(true);
         Ok(false)
     });
@@ -384,6 +593,43 @@ fn restart_fixture() -> (
         .unwrap();
     let record = db.get_download_record(row.id).unwrap();
     (dir, db, snapshot, record)
+}
+
+#[cfg(windows)]
+#[test]
+fn refreshing_retained_output_rejects_a_replaced_file_of_the_same_size() {
+    let (dir, db, snapshot, original) = restart_fixture();
+    db.restart_download_record(
+        "failed-retry",
+        original.id,
+        &original.request_id,
+        &snapshot,
+        false,
+        |_, _| Ok(None),
+    )
+        .unwrap();
+    db.finish_download_record(
+        "failed-retry",
+        &DownloadRecordOutcome::Failed {
+            code: "downloadFailed".into(),
+            detail: "old output retained".into(),
+        },
+    )
+        .unwrap();
+    let before = db.get_download_record(original.id).unwrap();
+    let output = Path::new(before.output_path.as_ref().unwrap());
+    std::fs::rename(output, dir.path().join("owned-original.webm")).unwrap();
+    std::fs::write(output, b"replaced").unwrap();
+    let failure = db
+        .refresh_download_record_output(&before)
+        .err()
+        .expect("file existence and equal size do not prove it is the successful output");
+    assert_eq!(failure.code, "historyFileChanged");
+    assert_eq!(
+        db.get_download_record(original.id).unwrap().status,
+        "failed"
+    );
+    assert_eq!(std::fs::read(output).unwrap(), b"replaced");
 }
 
 #[cfg(windows)]
@@ -605,7 +851,7 @@ fn identity_migration_preserves_legacy_records_and_allows_confirmed_restart() {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        11
+        15
     );
     let RecordAcceptance::Accepted(retry) = db
         .restart_download_record(
@@ -693,7 +939,8 @@ fn restart_from_new_parse_updates_metadata_and_options_without_changing_successf
     assert!(!row.source_link.contains("secret"));
     assert_eq!(row.height, Some(720));
     assert_eq!(row.fps, Some(30.0));
-    assert_eq!(row.format_id, "a");
+    assert_eq!(row.format_id, original.format_id);
+    assert_eq!(row.format_snapshot.as_ref().unwrap().format_id, "a");
     assert_eq!(row.successful_output.as_ref().unwrap().format_id, "b");
     assert_eq!(row.successful_output.as_ref().unwrap().height, Some(1080));
     assert_eq!(row.successful_output.as_ref().unwrap().fps, Some(59.94));

@@ -1,5 +1,5 @@
 use crate::database::{page_states::valid_thumbnail_path, Storage, StorageError};
-use crate::proxy::{saved_proxy, ProxySettings};
+use crate::proxy::{platform_proxy, ProxySettings};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -35,6 +35,16 @@ fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 impl ThumbnailStore {
+    async fn cache_for_platform(
+        &self,
+        url: &str,
+        platform: crate::cookies::CookiePlatform,
+        storage: &Storage,
+    ) -> Result<String, StorageError> {
+        let proxy = platform_proxy(storage, platform).await?;
+        self.cache(url, proxy.as_ref()).await
+    }
+
     pub fn new(directory: &Path) -> Self {
         Self {
             directory: directory.to_owned(),
@@ -154,11 +164,15 @@ impl ThumbnailStore {
 #[tauri::command]
 pub async fn cache_video_thumbnail(
     url: String,
+    platform: crate::cookies::CookiePlatform,
     store: tauri::State<'_, ThumbnailStore>,
     storage: tauri::State<'_, Storage>,
 ) -> Result<String, StorageError> {
-    let proxy = saved_proxy(storage.inner()).await?;
-    store.cache(&url, proxy.as_ref()).await
+    let result = store.cache_for_platform(&url, platform, storage.inner()).await;
+    if let Err(error) = &result {
+        log::warn!("thumbnailCacheFailed platform={platform:?} code={} detail={}", error.code, crate::app_logs::safe_text(&error.detail));
+    }
+    result
 }
 #[tauri::command]
 pub async fn get_cached_thumbnail(

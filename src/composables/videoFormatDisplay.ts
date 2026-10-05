@@ -9,3 +9,9 @@ export function formatVideoSize(bytes: number | null | undefined): string | null
     }
     return `${size.toFixed(unit === 0 ? 0 : 1).replace(/\.0$/, "")} ${units[unit]}`;
 }
+
+export function formatVideoBitrate(bitsPerSecond: number | null | undefined): string | null {
+    if (bitsPerSecond == null || !Number.isSafeInteger(bitsPerSecond) || bitsPerSecond <= 0) return null;
+    const kbps = bitsPerSecond / 1000;
+    return `${kbps < 1 ? kbps : Math.round(kbps)} kbps`;
+}

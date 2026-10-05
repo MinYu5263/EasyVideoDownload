@@ -59,7 +59,6 @@ onUnmounted(() => {
            @focusout="focusOut(task.record.id,$event)" @mouseenter="interact(task.record.id,'hover',true)"
            @mouseleave="interact(task.record.id,'hover',false)">
         <DownloadHistoryCard :busy="busy||tasks.isSubmitting(task.record.id)" :desktop="desktop" :downloading="false" :record="task.record"
-                             :retry-error="tasks.redownloadErrors.value[task.record.id]"
                              :task="task" mode="current"
                              @action="action"/>
       </div>

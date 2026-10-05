@@ -5,22 +5,29 @@ use super::*;
 pub struct UiPreferences {
     pub download_platform: String,
     pub settings_section: String,
+    #[serde(default = "default_settings_platform")]
+    pub settings_platform: String,
     pub active_page: String,
+}
+fn default_settings_platform() -> String {
+    "douyin".into()
 }
 impl Default for UiPreferences {
     fn default() -> Self {
         Self {
             download_platform: "douyin".into(),
             settings_section: "application".into(),
+            settings_platform: default_settings_platform(),
             active_page: "download".into(),
         }
     }
 }
 impl UiPreferences {
-    fn values(&self) -> [(&str, &str); 3] {
+    fn values(&self) -> [(&str, &str); 4] {
         [
             ("download_platform", &self.download_platform),
             ("settings_section", &self.settings_section),
+            ("settings_platform", &self.settings_platform),
             ("active_page", &self.active_page),
         ]
     }
@@ -30,7 +37,10 @@ impl UiPreferences {
             "douyin" | "bilibili" | "youtube"
         ) || !matches!(
             self.settings_section.as_str(),
-            "application" | "tools" | "proxy" | "about"
+            "application" | "platforms" | "tools" | "proxy" | "about"
+        ) || !matches!(
+            self.settings_platform.as_str(),
+            "douyin" | "bilibili" | "youtube"
         ) || !matches!(
             self.active_page.as_str(),
             "download" | "history" | "settings"
@@ -50,6 +60,7 @@ impl Database {
         for (key, value) in [
             ("download_platform", &mut settings.download_platform),
             ("settings_section", &mut settings.settings_section),
+            ("settings_platform", &mut settings.settings_platform),
             ("active_page", &mut settings.active_page),
         ] {
             let stored: Option<String> = tx

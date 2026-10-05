@@ -1,8 +1,9 @@
 import type {DownloadRecord} from './useDownloadHistory';
 import type {createDownloadTasks} from './useDownloadTasks';
 
-export function createHistoryRedownload({tasks}: {
-    tasks: Pick<ReturnType<typeof createDownloadTasks>, 'redownload'>
+export function createHistoryRedownload({tasks, confirmRedownload}: {
+    tasks: Pick<ReturnType<typeof createDownloadTasks>, 'redownload'>;
+    confirmRedownload: (record: DownloadRecord) => Promise<boolean>
 }) {
     const pending = new Map<number, Promise<boolean>>();
 
@@ -12,8 +13,11 @@ export function createHistoryRedownload({tasks}: {
         if (previous) return previous;
         const request = Promise.resolve().then(async () => {
             try {
-                await tasks.redownload(record);
-                return true;
+                const result = await tasks.redownload(record);
+                if (result.kind !== 'confirmationRequired') return true;
+                if (!await confirmRedownload(result.record)) return false;
+                const restarted = await tasks.redownload(result.record, true);
+                return restarted.kind === 'accepted' || restarted.kind === 'existing';
             } catch {
                 return false;
             } // The shared task service retains the per-record error.

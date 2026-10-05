@@ -144,19 +144,8 @@ pub(crate) fn parse_detail(value: &Value) -> Result<ParsedResult, LabError> {
             "No downloadable video formats returned",
         ));
     }
-    candidates.sort_by(|a, b| {
-        let rank = |f: &LabFormat| {
-            (
-                f.watermarked == Some(true),
-                std::cmp::Reverse(f.height.unwrap_or(0)),
-                f.codec != "h264",
-                std::cmp::Reverse(f.bitrate.unwrap_or(0)),
-            )
-        };
-        rank(&a.format)
-            .cmp(&rank(&b.format))
-            .then(a.format.id.cmp(&b.format.id))
-    });
+    // Extraction order is not a preference policy. The shared VideoFormat
+    // adapter owns business ordering and default selection for every platform.
     let public = LabVideo {
         result_id: uuid::Uuid::new_v4().to_string(),
         video_id: id.into(),

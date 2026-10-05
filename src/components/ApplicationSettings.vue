@@ -1,14 +1,13 @@
 <script lang="ts" setup>
 import {computed} from "vue";
-import {ElOption, ElSelect, ElSwitch} from "element-plus";
+import {ElInputNumber, ElOption, ElSelect, ElSwitch} from "element-plus";
 import {useI18n} from "vue-i18n";
 import {languageOptions} from "../i18n";
 import {useAppSettings} from "../composables/useAppSettings";
 
 const {t} = useI18n({useScope: "global"});
-const {desktop, draft: settings, ready, loading, saving, loadError, saveError, update} = useAppSettings();
+const {desktop, draft: settings, closeBackgroundMode, ready, loading, saving, update} = useAppSettings();
 const locked = computed(() => !ready.value);
-const error = computed(() => loadError.value ?? saveError.value);
 const themeOptions = ["system", "light", "dark"] as const;
 const closeOptions = ["ask", "tray", "exit"] as const;
 
@@ -22,6 +21,12 @@ function changeTheme(value: unknown) {
 
 function changeCloseAction(value: unknown) {
   if (value === "ask" || value === "tray" || value === "exit") void update({closeAction: value});
+}
+
+function changeDownloadLimit(value: unknown) {
+  if (typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 6) {
+    void update({maxConcurrentDownloads: value});
+  }
 }
 </script>
 
@@ -53,6 +58,19 @@ function changeCloseAction(value: unknown) {
       </ElSelect>
     </div>
 
+    <div aria-describedby="download-limit-description" aria-labelledby="download-limit-label" class="setting-row"
+         role="group">
+      <div class="setting-description">
+        <label id="download-limit-label" for="download-limit">{{ t("settings.downloadLimit.title") }}</label>
+        <p id="download-limit-description">{{ t("settings.downloadLimit.description") }}</p>
+      </div>
+      <ElInputNumber id="download-limit" :aria-label="t('settings.downloadLimit.title')"
+                     :disabled="locked || !desktop" :max="6"
+                     :min="1" :model-value="settings.maxConcurrentDownloads" :precision="0" :step="1"
+                     :value-on-clear="settings.maxConcurrentDownloads" aria-describedby="download-limit-description" class="setting-select"
+                     step-strictly @update:model-value="changeDownloadLimit"/>
+    </div>
+
     <div aria-describedby="completion-notification-description" aria-labelledby="completion-notification-label" class="setting-row"
          role="group">
       <div class="setting-description">
@@ -61,23 +79,9 @@ function changeCloseAction(value: unknown) {
         <p id="completion-notification-description">{{ t("settings.notifications.completionDescription") }}</p>
       </div>
       <ElSwitch id="completion-notification" :aria-label="t('settings.notifications.completion')"
-                :disabled="locked || !desktop"
+                :disabled="locked"
                 :model-value="settings.notifyOnCompletion"
                 @update:model-value="update({notifyOnCompletion: Boolean($event)})"/>
-    </div>
-
-    <div aria-describedby="failure-notification-description" aria-labelledby="failure-notification-label" class="setting-row"
-         role="group">
-      <div class="setting-description">
-        <label id="failure-notification-label" for="failure-notification">{{
-            t("settings.notifications.failure")
-          }}</label>
-        <p id="failure-notification-description">{{ t("settings.notifications.failureDescription") }}</p>
-      </div>
-      <ElSwitch id="failure-notification" :aria-label="t('settings.notifications.failure')"
-                :disabled="locked || !desktop"
-                :model-value="settings.notifyOnFailure"
-                @update:model-value="update({notifyOnFailure: Boolean($event)})"/>
     </div>
 
     <div aria-describedby="close-action-description" aria-labelledby="close-action-label" class="setting-row"
@@ -88,20 +92,14 @@ function changeCloseAction(value: unknown) {
       </div>
       <ElSelect id="close-action" :aria-label="t('settings.closeAction.title')" :disabled="locked || !desktop"
                 :model-value="settings.closeAction"
-                class="setting-select" @update:model-value="changeCloseAction">
-        <ElOption v-for="option in closeOptions" :key="option" :label="t(`settings.closeAction.${option}`)"
+                class="setting-select close-behavior-select" @update:model-value="changeCloseAction">
+        <ElOption v-for="option in closeOptions" :key="option"
+                  :label="t(`settings.closeAction.${option === 'tray' && closeBackgroundMode === 'window' ? 'window' : option}`)"
                   :value="option"/>
       </ElSelect>
     </div>
 
     <p v-if="!desktop" class="preview-notice">{{ t("settings.persistence.desktopOnly") }}</p>
-    <div v-if="error" class="settings-error" role="alert">
-      <p>{{ t(`settings.persistence.errors.${error.code}`) }}</p>
-      <details v-if="error.detail">
-        <summary>{{ t("settings.requiredTools.errorDetails") }}</summary>
-        <p>{{ error.detail }}</p>
-      </details>
-    </div>
   </section>
 </template>
 
@@ -143,16 +141,21 @@ function changeCloseAction(value: unknown) {
   font-weight: 500;
 }
 
+.setting-select {
+  width: 180px;
+  flex-shrink: 0;
+}
+
+.close-behavior-select {
+  width: 280px;
+  max-width: 100%;
+}
+
 .setting-description p {
   margin: 6px 0 0;
   color: var(--app-text-secondary);
   font-size: 12px;
   line-height: 1.7;
-}
-
-.setting-select {
-  width: 180px;
-  flex-shrink: 0;
 }
 
 .preview-notice {
@@ -162,24 +165,6 @@ function changeCloseAction(value: unknown) {
   line-height: 1.7;
 }
 
-.settings-error {
-  color: var(--app-danger);
-  font-size: 12px;
-  line-height: 1.7;
-  overflow-wrap: anywhere;
-}
-
-.settings-error p {
-  margin: 8px 0;
-}
-
-.settings-error details {
-  margin-top: 8px;
-}
-
-.settings-error summary {
-  cursor: pointer;
-}
 
 @media (max-width: 800px) {
   .setting-row {

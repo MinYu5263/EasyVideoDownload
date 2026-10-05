@@ -1,30 +1,46 @@
 <script lang="ts" setup>
-import {computed, h, nextTick, ref, watch} from "vue";
+import {computed, inject, nextTick, onBeforeUpdate, onUnmounted, ref, watch} from "vue";
 import {
   ElButton,
   ElEmpty,
   ElInput,
-  ElMessage,
   ElMessageBox,
   ElScrollbar,
   ElTooltip,
+  type ButtonInstance,
   type ScrollbarInstance
 } from "element-plus";
-import {ArrowLeft, RefreshRight, Search} from "@element-plus/icons-vue";
+import {ArrowLeft, Search} from "@element-plus/icons-vue";
 import {useI18n} from "vue-i18n";
 import {type DownloadRecord, type HistoryStatus, useDownloadHistory} from "../composables/useDownloadHistory";
 import {useDownloadHistoryActions} from "../composables/downloadHistoryActions";
-import {groupHistoryRecords, sanitizeHistoryDetail} from "../composables/downloadHistoryDisplay";
+import {groupHistoryRecords, historyOperationMessage} from "../composables/downloadHistoryDisplay";
+import {useFeedback} from "../composables/useFeedback";
 import {useDownloadTasks} from "../composables/useDownloadTasks";
 import {createHistoryRedownload} from "../composables/useHistoryRedownload";
 import {createHistoryFileRecovery} from "../composables/useHistoryFileRecovery";
 import DownloadHistoryCard from "./DownloadHistoryCard.vue";
 import DownloadHistoryDetails from "./DownloadHistoryDetails.vue";
+import ContentMotion from "./ContentMotion.vue";
+import {contentMotionAllowed} from "../composables/motionContext";
 
 const props = withDefaults(defineProps<{ active: boolean; downloading?: boolean }>(), {downloading: false});
-const {t} = useI18n({useScope: "global"});
+const {t, te} = useI18n({useScope: "global"});
+const {inform, notifyError, watchError} = useFeedback();
 const history = useDownloadHistory(), actions = useDownloadHistoryActions(), tasks = useDownloadTasks();
-const redownload = createHistoryRedownload({tasks});
+const parentMotionAllowed = inject(contentMotionAllowed, computed(() => true));
+const scopeMotion = ref<InstanceType<typeof ContentMotion>>();
+const scopeButton = ref<ButtonInstance>();
+const listMotionAllowed = computed(() => props.active && parentMotionAllowed.value && !scopeMotion.value?.moving && !history.switching.value);
+const redownload = createHistoryRedownload({
+  tasks,
+  confirmRedownload: async record => {
+    const retained = retainedRetries.value[record.id];
+    if (retained) retainedRetries.value = {...retainedRetries.value, [record.id]: {...retained, record}};
+    await history.refresh();
+    return confirm(t('tasks.replaceMessage'), t('history.prepare'), t('tasks.replaceConfirm'));
+  }
+});
 const recovery = createHistoryFileRecovery({
   actions,
   confirmRedownload: async () => confirm(t("tasks.missingMessage"), t("tasks.missingTitle"), t("history.prepare")),
@@ -32,11 +48,38 @@ const recovery = createHistoryFileRecovery({
 });
 const scrollbar = ref<ScrollbarInstance>(), search = ref(history.filters.value.query),
     selected = ref<DownloadRecord | null>(null), drawer = ref(false);
+const cardList = ref<{ $el: HTMLElement }>();
+const cardPositions = new WeakMap<HTMLElement, { width: number; left: number; top: number }>();
+const restoringRecords = new Set<number>();
+onBeforeUpdate(() => {
+  const list = cardList.value?.$el;
+  if (!list || typeof list.getBoundingClientRect !== 'function') return;
+  // Capture all positions before an exiting date heading or card can shrink the layout.
+  for (const child of Array.from(list.children)) {
+    const item = child as HTMLElement;
+    if (item.classList.contains('history-item-leave-active')) continue;
+    cardPositions.set(item, {width: item.getBoundingClientRect().width, left: item.offsetLeft, top: item.offsetTop});
+  }
+});
+const showLoadingHint = ref(false);
+watch(() => props.active && (history.switching.value || history.blockingLoading.value), (waiting, _previous, onCleanup) => {
+  showLoadingHint.value = false;
+  if (!waiting) return;
+  const timer = setTimeout(() => {
+    showLoadingHint.value = true;
+  }, 180);
+  onCleanup(() => clearTimeout(timer));
+}, {immediate: true});
+const revealedRecordId = ref<number | null>(null);
+let revealVersion = 0, revealPending = false;
+let revealTimer: ReturnType<typeof setTimeout> | undefined;
+onUnmounted(cancelReveal);
 const retainedRetries = ref<Record<number, { record: DownloadRecord; previousRequestIds: string[] }>>({});
 let retryContext = 0;
 watch(() => [history.filters.value.status, history.filters.value.query, history.trashed.value, props.active], () => {
   retryContext++;
   retainedRetries.value = {};
+  restoringRecords.clear();
 }, {flush: "sync"});
 watch(history.records, rows => {
   const retained = {...retainedRetries.value};
@@ -56,7 +99,21 @@ async function restartRecord(record: DownloadRecord) {
   drawer.value = false;
   actions.clearFeedback();
   retainedRetries.value = {...retainedRetries.value, [record.id]: {record, previousRequestIds}};
-  if (await redownload.run(record) && context === retryContext) {
+  const restarted = await redownload.run(record);
+  if (!restarted) {
+    const error = tasks.redownloadErrors.value[record.id];
+    if (error) notifyError(historyOperationMessage(error, t, te, record.platform)!, {
+      key: `redownload:${record.id}`,
+      detail: error.detail
+    });
+    if (context === retryContext) {
+      const retained = {...retainedRetries.value};
+      delete retained[record.id];
+      retainedRetries.value = retained;
+      await history.refresh();
+    }
+  }
+  if (restarted && context === retryContext) {
     const current = history.records.value.find(row => row.id === record.id);
     if (!current || previousRequestIds.includes(current.requestId)) retainedRetries.value = {
       ...retainedRetries.value,
@@ -65,10 +122,13 @@ async function restartRecord(record: DownloadRecord) {
   }
 }
 
-const statuses: (HistoryStatus | null)[] = [null, "running", "completed", "failed", "cancelled", "interrupted"];
+const statuses: (HistoryStatus | null)[] = [null, "running", "paused", "completed", "failed", "cancelled", "interrupted"];
 let returnFocus: HTMLElement | null = null;
 watch(() => props.active, active => {
-  if (active) void history.refresh(); else drawer.value = false;
+  if (active) void history.setTrashed(false); else {
+    cancelReveal();
+    drawer.value = false;
+  }
 }, {immediate: true});
 watch(history.records, rows => {
   if (selected.value) {
@@ -89,6 +149,15 @@ const groups = computed(() => {
   return groupHistoryRecords([...rows.values()].map(tasks.mergeRecord).sort((a, b) => b.startedAt.localeCompare(a.startedAt) || b.id - a.id));
 });
 const retainedOutsideFilter = computed(() => !history.trashed.value && Object.values(retainedRetries.value).some(({record}) => !history.records.value.some(row => row.id === record.id)));
+const listEntries = computed(() => groups.value.flatMap((group, index) => [
+  {
+    key: `date:${group.date}`,
+    label: group.label === group.date ? group.date : t(`history.${group.label}`),
+    record: null as DownloadRecord | null,
+    separated: index > 0
+  },
+  ...group.records.map(record => ({key: `record:${record.id}`, label: '', record, separated: false}))
+]));
 
 function taskForRecord(record: DownloadRecord | null) {
   const task = record ? tasks.taskFor(record.id) : null;
@@ -97,37 +166,99 @@ function taskForRecord(record: DownloadRecord | null) {
 
 const displayedSelected = computed(() => selected.value ? tasks.mergeRecord(selected.value) : null);
 
-async function revealRecord(id: number) {
+function cancelReveal() {
+  revealVersion++;
+  revealPending = false;
+  if (revealTimer !== undefined) clearTimeout(revealTimer);
+  revealTimer = undefined;
+  revealedRecordId.value = null;
+}
+
+async function revealRecord(id: number, trashed = false) {
+  cancelReveal();
+  const version = revealVersion;
+  const current = () => version === revealVersion && props.active;
+  if (!current()) return;
+  revealPending = true;
+  drawer.value = false;
   search.value = "";
-  await history.setTrashed(false);
-  await history.setFilters({status: null, query: ""});
-  while (!history.records.value.some(row => row.id === id) && history.nextCursor.value) {
-    if (!await history.loadMore()) break;
-  }
-  const record = history.records.value.find(row => row.id === id);
-  if (record) {
+  try {
+    if (!await history.setTrashed(trashed) || !current()) return;
+    if (!await history.setFilters({status: null, query: ""}) || !current()) return;
+    const visited = new Set<string>();
+    while (!history.records.value.some(row => row.id === id) && history.nextCursor.value) {
+      // A concurrent refresh can reset pagination. Do not loop forever on the same page.
+      const cursor = JSON.stringify(history.nextCursor.value);
+      if (visited.has(cursor)) {
+        inform(t('history.recordLocateFailed'), 'info');
+        return;
+      }
+      visited.add(cursor);
+      if (!await history.loadMore() || !current()) return;
+    }
+    if (!history.records.value.some(row => row.id === id)) {
+      inform(t('history.recordNotFound'), 'info');
+      return;
+    }
     await nextTick();
-    await action("details", tasks.mergeRecord(record));
+    await scopeMotion.value?.whenIdle();
+    if (!current()) return;
+    const wrap = scrollbar.value?.wrapRef;
+    const card = wrap?.querySelector<HTMLElement>(`[data-record-id="${id}"]`);
+    if (!wrap || !card) {
+      inform(t('history.recordLocateFailed'), 'info');
+      return;
+    }
+    const bounds = card.getBoundingClientRect();
+    const top = wrap.scrollTop + bounds.top - wrap.getBoundingClientRect().top - (wrap.clientHeight - bounds.height) / 2;
+    wrap.scrollTo({
+      top: Math.max(0, top),
+      behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'
+    });
+    card.focus({preventScroll: true});
+    revealedRecordId.value = id;
+    revealTimer = setTimeout(() => {
+      revealedRecordId.value = null;
+      revealTimer = undefined;
+    }, 2000);
+  } finally {
+    if (version === revealVersion) revealPending = false;
   }
 }
 
 defineExpose({revealRecord});
-const feedbackError = computed(() => {
-  const error = actions.error.value;
-  if (!error) return null;
-  const key = `history.${error.code}`;
-  const known = ["desktopOnly", "recordNotFound", "recordRunning", "recordTrashed", "recordNotTrashed", "historyBusy", "historyFileUnavailable", "historyFileUnsafe", "historyFileChanged", "historyRecycleFailed", "historyFileRecycledSaveFailed", "historyFileMissing", "historyDirectoryMissing", "historyOpenFailed", "loadFailed", "saveFailed"];
-  const deletionErrors = ["historyFilePermissionDenied", "historyFileReadOnly", "historyFileOccupied", "historyFileDeleteFailed", "historyFileInUse", "historyFileDeletedSaveFailed", "historyTrashPartiallyDeleted", "historyFileDeletionUnsupported"];
-  return `${t(known.includes(error.code) || deletionErrors.includes(error.code) ? key : "history.operationFailed")}${error.detail ? ` ${sanitizeHistoryDetail(error.detail)}` : ""}`;
+
+function beforeCardLeave(element: Element) {
+  const card = element as HTMLElement;
+  // Freeze the exiting item's geometry before it leaves the layout for FLIP movement.
+  const position = cardPositions.get(card) ?? {
+    width: card.getBoundingClientRect().width,
+    left: card.offsetLeft,
+    top: card.offsetTop
+  };
+  card.style.width = `${position.width}px`;
+  card.style.left = `${position.left}px`;
+  card.style.top = `${position.top}px`;
+  card.style.margin = '0';
+  const recordId = Number(card.querySelector<HTMLElement>('[data-record-id]')?.dataset.recordId);
+  card.style.setProperty('--history-item-leave-x', restoringRecords.has(recordId) ? '-64px' : '64px');
+  restoringRecords.delete(recordId);
+  card.inert = true;
+}
+
+watchError(history.error, () => t('history.loadFailed'), () => ({key: 'history:load'}));
+watch(retainedOutsideFilter, retained => {
+  if (retained) inform(t('tasks.retryRetained'), 'info');
 });
-const feedbackSuccess = computed(() => actions.success.value ? t(`history.${actions.success.value}`) : null);
 
 async function filter(status: HistoryStatus | null) {
+  cancelReveal();
   scrollbar.value?.setScrollTop(0);
   await history.setFilters({status, query: search.value});
 }
 
 function searchChanged(value: string) {
+  cancelReveal();
   search.value = value;
   scrollbar.value?.setScrollTop(0);
   void history.setFilters({query: value});
@@ -135,17 +266,19 @@ function searchChanged(value: string) {
 
 async function restoreFocus() {
   await nextTick();
-  if (!props.active) return;
+  if (!props.active || revealPending || revealedRecordId.value !== null) return;
   if (returnFocus?.isConnected) returnFocus.focus(); else document.querySelector<HTMLElement>("#main-content")?.focus();
 }
 
-function toast(message: string, type: "success" | "error" | "info" = "success") {
+function toast(message: string, type: "success" | "info" = "success") {
   actions.clearFeedback();
-  ElMessage({showClose: false, duration: 2000, message, type, grouping: true});
+  inform(message, type);
 }
 
 function failed() {
-  toast(feedbackError.value ?? t("history.operationFailed"), "error");
+  const error = actions.error.value;
+  notifyError(historyOperationMessage(error, t, te, selected.value?.platform ?? 'youtube') ?? t('history.operationFailed'), {detail: error?.detail});
+  actions.clearFeedback();
 }
 
 async function changed(record?: DownloadRecord) {
@@ -160,18 +293,26 @@ async function changed(record?: DownloadRecord) {
 
 async function restore(record: DownloadRecord) {
   if (actions.busy.value) return;
-  if (await actions.restore(record)) {
-    toast(t("history.restored"));
-    await changed(record);
-  } else failed();
+  const pendingRestore = restoringRecords.has(record.id);
+  restoringRecords.add(record.id);
+  let restored = false;
+  try {
+    restored = await actions.restore(record);
+    if (restored) {
+      toast(t("history.restored"));
+      await changed(record);
+    } else failed();
+  } finally {
+    // A failed refresh may leave the card visible until a later native update.
+    if (!restored && !pendingRestore) restoringRecords.delete(record.id);
+  }
 }
 
-async function confirm(message: string | ReturnType<typeof h>, title: string, button: string) {
+async function confirm(message: string, title: string, button: string) {
   try {
     await ElMessageBox.confirm(message, title, {
       confirmButtonText: button,
       cancelButtonText: t("history.cancel"),
-      type: "warning",
       distinguishCancelAndClose: true
     });
     return true;
@@ -181,15 +322,21 @@ async function confirm(message: string | ReturnType<typeof h>, title: string, bu
 }
 
 async function toggleTrash() {
+  cancelReveal();
+  const version = revealVersion;
   drawer.value = false;
   actions.clearFeedback();
-  scrollbar.value?.setScrollTop(0);
-  await history.setTrashed(!history.trashed.value);
+  if (await history.setTrashed(!history.trashed.value)) {
+    await nextTick();
+    scrollbar.value?.setScrollTop(0);
+    await scopeMotion.value?.whenIdle();
+    if (props.active && version === revealVersion) scopeButton.value?.$el?.focus({preventScroll: true});
+  }
 }
 
 async function emptyTrash() {
   if (!actions.desktop || !history.fileDeletionSupported.value || actions.busy.value || !history.trashCount.value) return;
-  if (!await confirm(t("history.emptyTrashConfirm", {count: history.trashCount.value}), t("history.emptyTrashTitle"), t("history.emptyTrash"))) return;
+  if (!await confirm(t("history.emptyTrashConfirm"), t("history.emptyTrashTitle"), t("history.emptyTrash"))) return;
   if (!history.fileDeletionSupported.value || actions.busy.value) return;
   if (await actions.emptyTrash()) {
     toast(t("history.trashEmptied"));
@@ -201,8 +348,15 @@ async function emptyTrash() {
 }
 
 async function action(name: string, record: DownloadRecord) {
+  cancelReveal();
+  if (name === "resume") {
+    if (!actions.desktop || actions.busy.value) return;
+    await tasks.resume(record.requestId);
+    await changed();
+    return;
+  }
   if (name === "cancel") {
-    if (!await tasks.cancel(record.requestId)) toast(t("download.errors.cancelFailed"), "error");
+    if (await tasks.cancel(record.requestId)) await changed(record);
     return;
   }
   if (name === "details") {
@@ -222,14 +376,7 @@ async function action(name: string, record: DownloadRecord) {
   }
   if (name === "purge") {
     if (!record.deletedAt || record.status === "running" || !actions.desktop || !history.fileDeletionSupported.value || actions.busy.value) return;
-    const message = h("div", [h("p", t("history.purgeConfirm")), ...(record.outputPath ? [h("p", {
-      style: {
-        whiteSpace: "pre-wrap",
-        overflowWrap: "anywhere",
-        userSelect: "text"
-      }
-    }, record.outputPath ?? '')] : [])]);
-    if (!await confirm(message, t("history.purgeTitle"), t("history.purge"))) return;
+    if (!await confirm(t("history.purgeConfirm"), t("history.purgeTitle"), t("history.purge"))) return;
     if (!history.fileDeletionSupported.value || actions.busy.value) return;
     if (await actions.purge(record)) {
       toast(t("history.purged"));
@@ -242,8 +389,6 @@ async function action(name: string, record: DownloadRecord) {
   }
   if (name === "remove") {
     if (record.deletedAt || record.status === "running" || !actions.desktop || actions.busy.value) return;
-    if (!await confirm(t("history.removeConfirm"), t("history.removeTitle"), t("history.confirm"))) return;
-    if (actions.busy.value) return;
     if (await actions.remove(record)) {
       toast(t("history.removed"));
       await changed(record);
@@ -251,42 +396,45 @@ async function action(name: string, record: DownloadRecord) {
     return;
   }
   if (name === "removeAndFile") {
-    if (record.deletedAt || record.status !== "completed" || !record.outputPath || !actions.desktop || !history.fileRecyclingSupported.value || actions.busy.value) return;
-    const path = record.outputPath, name = path.split(/[\\/]/).pop() ?? path;
-    const message = h("div", [
-      h("p", t("history.removeAndFileConfirm")), h("p", {style: {fontWeight: "600"}}, name),
-      h("p", {style: {whiteSpace: "pre-wrap", overflowWrap: "anywhere", userSelect: "text"}}, path),
-      h("p", t("history.removeAndFileScope")),
-    ]);
-    if (!await confirm(message, t("history.removeAndFile"), t("history.removeAndFile"))) return;
-    if (!history.fileRecyclingSupported.value || actions.busy.value) return;
+    if (record.deletedAt || record.status !== "completed" || !record.outputPath || !actions.desktop || !history.fileDeletionSupported.value || actions.busy.value) return;
+    if (!await confirm(t("history.removeAndFileConfirm"), t("history.removeAndFile"), t("history.purge"))) return;
+    if (!history.fileDeletionSupported.value || actions.busy.value) return;
     const result = await actions.removeAndFile(record);
     if (result) {
-      toast(t(result.fileRecycled ? "history.fileAndRecordRecycled" : "history.fileMissingRecordRemoved"), result.fileRecycled ? "success" : "info");
+      toast(t(result.fileDeleted ? "history.fileAndRecordDeleted" : "history.fileMissingRecordRemoved"), result.fileDeleted ? "success" : "info");
       await changed(record);
-    } else failed();
+    } else {
+      failed();
+      await history.refresh();
+    }
     return;
   }
   if (name === "openFile" || name === "openFolder") {
     const opened = await (name === "openFile" ? recovery.openFile(record) : recovery.openFolder(record));
-    if (!opened && actions.error.value && actions.error.value.code !== "historyFileMissing") failed();
+    if (!opened && actions.error.value) failed();
   } else if (name === "openSource") {
     if (!await actions.openSource(record)) failed();
   } else if (name === "copyLink") {
     if (actions.busy.value) return;
     const copied = await actions.copyLink(record);
     const message = t(copied ? "history.linkCopied" : actions.error.value?.code === "desktopOnly" ? "history.desktopOnly" : "download.errors.clipboardWriteFailed");
-    actions.clearFeedback();
-    ElMessage({showClose: true, message, type: copied ? "success" : "error", grouping: true});
+    if (copied) toast(message);
+    else {
+      notifyError(message, {detail: actions.error.value?.detail});
+      actions.clearFeedback();
+    }
   }
 }
 </script>
 <template>
   <div class="history-container">
+    <ContentMotion ref="scopeMotion" :active="props.active" :position="history.trashed.value ? 1 : 0"
+                   :view-key="history.trashed.value">
     <section :aria-busy="history.loading.value" aria-labelledby="page-title" class="history-page">
       <header class="history-header">
-        <div class="history-toolbar">
-          <ElButton v-if="history.trashed.value" :aria-label="t('history.backToHistory')" :icon="ArrowLeft"
+        <div :inert="history.switching.value || undefined" class="history-toolbar">
+          <ElButton v-if="history.trashed.value" ref="scopeButton" :aria-label="t('history.backToHistory')"
+                    :icon="ArrowLeft"
                     @click="toggleTrash">{{ t('history.back') }}
           </ElButton>
           <div v-else :aria-label="t('navigation.history')" class="filters" role="group">
@@ -299,57 +447,58 @@ async function action(name: string, record: DownloadRecord) {
             </button>
           </div>
           <div class="heading-actions">
-            <ElButton v-if="!history.trashed.value" @click="toggleTrash">{{ t('history.trash') }}</ElButton>
+            <ElButton v-if="!history.trashed.value" ref="scopeButton" @click="toggleTrash">{{
+                t('history.trash')
+              }}
+            </ElButton>
             <ElTooltip v-else :content="t('history.fileDeletionUnavailable')"
                        :disabled="history.fileDeletionSupported.value"><span><ElButton :disabled="!actions.desktop||!history.fileDeletionSupported.value||actions.busy.value||!history.trashCount.value" plain
                                                                                        type="danger"
                                                                                        @click="emptyTrash">{{
                 t('history.emptyTrash')
               }}</ElButton></span></ElTooltip>
-            <ElButton :icon="RefreshRight" :loading="history.loading.value" @click="history.refresh">
-              {{ t('history.refresh') }}
-            </ElButton>
           </div>
-        </div>
-        <div v-if="history.error.value" class="persistent-error" role="alert">{{ t('history.loadFailed') }}
-          <ElButton size="small" @click="history.refresh">{{ t('persistence.retry') }}</ElButton>
         </div>
         <ElInput :aria-label="t('history.search')" :model-value="search" :placeholder="t('history.search')"
                  :prefix-icon="Search" class="history-search" clearable @update:model-value="searchChanged"/>
       </header>
-      <ElScrollbar ref="scrollbar" :aria-label="t('navigation.history')" :tabindex="0" class="history-scrollbar" height="100%"
-                   role="region" view-class="history-list">
-        <p v-if="retainedOutsideFilter" class="action-feedback" role="status">{{ t('tasks.retryRetained') }}</p>
-        <p v-if="!actions.desktop" class="action-feedback">{{ t('history.desktopOnly') }}</p>
-        <ElEmpty v-if="!history.loading.value&&!history.error.value&&groups.length===0"
-                 :description="t(filtered?'history.noResults':history.trashed.value?'history.trashEmpty':'pages.history.emptyTitle')">
-          <p v-if="filtered&&!history.trashed.value">{{ t('history.noResultsHint') }}</p>
-        </ElEmpty>
-        <p v-if="history.loading.value&&!history.records.value.length" class="loading" role="status">
-          {{ t('history.refresh') }}…</p>
-        <section v-for="group in groups" :key="group.date" :aria-label="group.label===group.date?group.date:t(`history.${group.label}`)"
-                 class="date-group"><h2>
-          {{ group.label === group.date ? group.date : t(`history.${group.label}`) }}</h2>
-          <div class="cards">
-            <DownloadHistoryCard v-for="record in group.records" :key="record.id" :busy="actions.busy.value||tasks.isSubmitting(record.id)"
-                                 :desktop="actions.desktop" :downloading="props.downloading"
-                                 :file-deletion-supported="history.fileDeletionSupported.value"
-                                 :record="record"
-                                 :retry-error="tasks.redownloadErrors.value[record.id]"
-                                 :task="taskForRecord(record)" @action="action"/>
+      <div class="history-content">
+        <p v-if="showLoadingHint" class="history-loading-hint" role="status">{{ t('history.loading') }}</p>
+        <ElScrollbar ref="scrollbar" :aria-label="t('navigation.history')" :inert="history.switching.value || undefined"
+                     :tabindex="0" class="history-scrollbar" height="100%"
+                     role="region" view-class="history-list">
+          <p v-if="!actions.desktop" class="action-feedback">{{ t('history.desktopOnly') }}</p>
+          <TransitionGroup :key="JSON.stringify([props.active, history.trashed.value, history.filters.value.status, history.filters.value.query])"
+                           ref="cardList"
+                           :css="listMotionAllowed" :move-class="listMotionAllowed ? 'history-item-move' : 'history-item-static'" class="cards" name="history-item"
+                           tag="div"
+                           @before-leave="beforeCardLeave">
+            <div v-for="entry in listEntries" :key="entry.key"
+                 :class="{'history-date': !entry.record, 'history-date-separated': entry.separated}">
+              <h2 v-if="!entry.record" class="date-heading">{{ entry.label }}</h2>
+              <DownloadHistoryCard v-else :busy="actions.busy.value||tasks.isSubmitting(entry.record.id)"
+                                   :class="{'is-revealed': revealedRecordId === entry.record.id}" :data-record-id="entry.record.id"
+                                   :desktop="actions.desktop"
+                                   :downloading="props.downloading" :file-deletion-supported="history.fileDeletionSupported.value"
+                                   :record="entry.record"
+                                   :tabindex="-1"
+                                   :task="taskForRecord(entry.record)" @action="action"/>
+            </div>
+            <ElEmpty v-if="!history.blockingLoading.value&&!history.error.value&&groups.length===0" key="empty"
+                     :description="t(filtered?'history.noResults':history.trashed.value?'history.trashEmpty':'pages.history.emptyTitle')"/>
+          </TransitionGroup>
+          <div v-if="history.nextCursor.value" class="pagination">
+            <ElButton :loading="history.loading.value" @click="history.loadMore">{{ t('history.loadMore') }}</ElButton>
           </div>
-        </section>
-        <div v-if="history.nextCursor.value" class="pagination">
-          <ElButton :loading="history.loading.value" @click="history.loadMore">{{ t('history.loadMore') }}</ElButton>
-        </div>
-      </ElScrollbar>
+        </ElScrollbar>
+      </div>
     </section>
+    </ContentMotion>
     <DownloadHistoryDetails v-model="drawer" :busy="actions.busy.value||Boolean(selected&&tasks.isSubmitting(selected.id))" :desktop="actions.desktop"
-                            :downloading="props.downloading" :error="feedbackError"
+                            :downloading="props.downloading"
                             :file-deletion-supported="history.fileDeletionSupported.value"
-                            :file-recycling-supported="history.fileRecyclingSupported.value"
                             :record="displayedSelected"
-                            :success="feedbackSuccess" :task="taskForRecord(displayedSelected)" @action="action" @closed="restoreFocus"/>
+                            :task="taskForRecord(displayedSelected)" @action="action" @closed="restoreFocus"/>
   </div>
 </template>
 <style scoped>
@@ -367,8 +516,6 @@ async function action(name: string, record: DownloadRecord) {
   flex: 1;
   flex-direction: column;
   width: 100%;
-  max-width: calc(1120px + 2 * var(--app-page-padding-x));
-  margin: 0 auto;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -429,8 +576,42 @@ async function action(name: string, record: DownloadRecord) {
   outline-offset: 2px;
 }
 
+.history-content {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.history-loading-hint {
+  position: absolute;
+  top: 0;
+  right: var(--app-page-padding-x);
+  z-index: 2;
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--app-surface);
+  color: var(--app-text-secondary);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.cards :deep(.history-card.is-revealed) {
+  border-color: var(--app-accent);
+  background: var(--app-accent-soft);
+  box-shadow: 0 0 0 2px var(--app-accent-soft);
+}
+
+.cards :deep(.history-card:focus-visible) {
+  outline: 2px solid var(--app-accent);
+  outline-offset: 2px;
+}
+
 .history-scrollbar {
   flex: 1;
+  min-width: 0;
   min-height: 0;
 }
 
@@ -438,38 +619,57 @@ async function action(name: string, record: DownloadRecord) {
   padding: 0 var(--app-page-padding-x) calc(var(--app-page-padding-bottom) + 20px);
 }
 
-.date-group h2 {
+.date-heading {
   font-size: 12px;
   font-weight: 600;
   color: var(--app-text-secondary);
-  margin: 10px 0;
+  margin: 10px 0 0;
 }
 
-.date-group + .date-group {
-  margin-top: 22px;
+.history-date-separated {
+  margin-top: 21px;
 }
 
 .cards {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 11px;
 }
 
-.persistent-error {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px;
-  border: 1px solid var(--el-color-danger-light-5);
-  border-radius: 8px;
-  padding: 12px;
-  color: var(--el-color-danger);
-  font-size: 13px;
-  margin-bottom: 16px;
-  overflow-wrap: anywhere;
+.cards :deep(.history-item-move),
+.cards :deep(.history-item-leave-active) {
+  transition: transform 250ms ease, opacity 250ms ease;
 }
 
-.action-feedback, .loading {
+.cards :deep(.history-item-leave-active) {
+  position: absolute;
+  box-sizing: border-box;
+  pointer-events: none;
+}
+
+.cards :deep(.history-item-leave-to) {
+  transform: translateX(var(--history-item-leave-x, 64px));
+  opacity: 0;
+}
+
+.cards .history-date.history-item-leave-to {
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cards :deep(.history-item-move),
+  .cards :deep(.history-item-leave-active) {
+    transition: none;
+  }
+
+  .cards :deep(.history-item-leave-to) {
+    transform: none;
+  }
+}
+
+
+.action-feedback {
   font-size: 13px;
   color: var(--app-text-secondary);
 }

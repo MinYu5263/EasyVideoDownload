@@ -1,6 +1,6 @@
 <script lang="ts" setup>
 import {computed, ref, watch} from "vue";
-import {ElButton, ElDrawer, ElIcon, ElScrollbar, ElTooltip} from "element-plus";
+import {ElAlert, ElButton, ElDrawer, ElIcon, ElScrollbar, ElTooltip} from "element-plus";
 import {Picture} from "@element-plus/icons-vue";
 import {useI18n} from "vue-i18n";
 import type {DownloadRecord} from "../composables/useDownloadHistory";
@@ -14,8 +14,11 @@ import {
   sanitizeHistoryLink
 } from "../composables/downloadHistoryDisplay";
 import DownloadTaskProgress from './DownloadTaskProgress.vue';
+import DownloadTaskPauseButton from './DownloadTaskPauseButton.vue';
 import {taskIsActive, type DownloadTaskSnapshot} from '../composables/downloadTaskTypes';
 import {useThumbnail} from "../composables/useThumbnail";
+import {videoCodecLabel, videoQualityLabel} from '../composables/videoFormatTable';
+import {formatVideoBitrate} from '../composables/videoFormatDisplay';
 
 const props = withDefaults(defineProps<{
   modelValue: boolean;
@@ -23,12 +26,9 @@ const props = withDefaults(defineProps<{
   desktop: boolean;
   busy: boolean;
   downloading: boolean;
-  fileRecyclingSupported?: boolean;
   fileDeletionSupported?: boolean;
-  error: string | null;
-  success: string | null;
   task?: DownloadTaskSnapshot | null
-}>(), {fileRecyclingSupported: false, fileDeletionSupported: false, task: null});
+}>(), {fileDeletionSupported: false, task: null});
 const emit = defineEmits<{
   "update:modelValue": [value: boolean];
   action: [name: string, record: DownloadRecord];
@@ -48,12 +48,23 @@ function imageError() {
 }
 
 const size = computed(() => props.record ? historySize(props.record) : null);
+const recordedFormat = computed(() => props.record?.formatSnapshot);
 const active = computed(() => props.task ? taskIsActive(props.task.phase) : ['queued', 'running'].includes(props.record?.status ?? ''));
+const statusLabel = computed(() => props.record ? t(props.task ? `tasks.phase.${props.task.phase}` : `history.status.${props.record.status}`) : '');
 const systemDisabled = computed(() => !props.desktop || props.busy);
 const trashed = computed(() => Boolean(props.record?.deletedAt));
-const technical = computed(() => sanitizeHistoryDetail(props.record?.errorDetail));
+const failureDetail = computed(() => sanitizeHistoryDetail(props.record?.errorDetail) || sanitizeHistoryDetail(props.record?.errorCode));
+const failureDescription = computed(() => {
+  const record = props.record;
+  if (!record) return "";
+  const lines = [
+    `${t('history.failureStage')}：${t(historyStageKey(record.errorStage))}`,
+    `${t('history.suggestionLabel')}：${t(historySuggestionKey(record))}`,
+  ];
+  if (failureDetail.value) lines.push(t('history.failureDetails', {detail: failureDetail.value}));
+  return lines.join('\n');
+});
 const hint = computed(() => !props.desktop ? t("history.desktopOnly") : "");
-const fileHint = computed(() => !props.desktop ? t("history.desktopOnly") : !props.fileRecyclingSupported ? t("history.fileRecyclingUnavailable") : props.downloading ? t("history.busyHint") : "");
 const deletionHint = computed(() => !props.desktop ? t("history.desktopOnly") : !props.fileDeletionSupported ? t("history.fileDeletionUnavailable") : props.downloading ? t("history.busyHint") : "");
 
 function action(name: string) {
@@ -69,11 +80,13 @@ function action(name: string) {
         <div class="detail-cover"><img v-if="image" :src="image" alt="" @error="imageError"><span v-else><ElIcon
             :size="36"><Picture/></ElIcon>{{ t('history.thumbnail') }}</span></div>
         <h2>{{ record.title || t('history.unknownTitle') }}</h2>
-        <p class="detail-status">{{ t(`download.platforms.${record.platform}`) }} ·
-          {{ t(`history.status.${record.status}`) }}</p>
+        <p class="detail-status" role="status">{{ t(`download.platforms.${record.platform}`) }} ·
+          {{ statusLabel }}</p>
         <DownloadTaskProgress v-if="task" :task="task"/>
         <div class="detail-actions">
-          <ElButton v-if="active&&task" :disabled="systemDisabled||task.phase==='cancelling'" @click="action('cancel')">
+          <DownloadTaskPauseButton v-if="active&&task" :disabled="systemDisabled" :task="task"/>
+          <ElButton v-if="!trashed&&((active&&task)||['paused','cancelled'].includes(record.status))"
+                    :disabled="systemDisabled||task?.phase==='cancelling'" @click="action('cancel')">
             {{ t('download.actions.cancel') }}
           </ElButton>
           <ElButton v-if="trashed" :disabled="systemDisabled||active" type="primary" @click="action('restore')">
@@ -95,17 +108,28 @@ function action(name: string) {
               :disabled="systemDisabled" @click="action('openFolder')">{{ t('history.openFolder') }}
           </ElButton>
           <ElTooltip v-if="!trashed&&!active" :content="hint" :disabled="!hint"><span><ElButton
-              :disabled="systemDisabled" @click="action('prepare')">{{ t('history.prepare') }}</ElButton></span>
+              :disabled="systemDisabled" @click="action(record.status==='paused'?'resume':'prepare')">{{
+              t(record.status === 'paused' ? 'tasks.resume' : 'history.prepare')
+            }}</ElButton></span>
           </ElTooltip>
         </div>
         <p v-if="!desktop" class="muted">{{ t('history.desktopOnly') }}</p>
-        <p v-if="error" class="feedback error" role="alert">{{ error }}</p>
-        <p v-if="success" class="feedback" role="status">{{ success }}</p>
         <dl>
           <dt>{{ t('history.quality') }}</dt>
-          <dd>{{ record.height ? `${record.height}p` : t('history.unknown') }}</dd>
+          <dd>{{ videoQualityLabel(recordedFormat) ?? '-' }}</dd>
+          <dt>{{ t('history.formatId') }}</dt>
+          <dd class="path">{{ record.formatSnapshot?.formatId ?? record.formatId }}</dd>
+          <dt>{{ t('download.result.resolution') }}</dt>
+          <dd>{{
+              recordedFormat?.width && recordedFormat.height ? `${recordedFormat.width} × ${recordedFormat.height}` : '-'
+            }}
+          </dd>
+          <dt>{{ t('download.result.codec') }}</dt>
+          <dd>{{ videoCodecLabel(record.formatSnapshot) ?? '-' }}</dd>
+          <dt>{{ t('download.result.bitrate') }}</dt>
+          <dd>{{ formatVideoBitrate(record.formatSnapshot?.bitrate) ?? '-' }}</dd>
           <dt>{{ t('history.frameRate') }}</dt>
-          <dd>{{ record.fps ? `${record.fps} FPS` : t('history.unknown') }}</dd>
+          <dd>{{ record.fps ? `${record.fps} fps` : '-' }}</dd>
           <dt>{{ t('history.format') }}</dt>
           <dd>{{
               (record.status === 'completed' ? record.outputExtension || record.formatExtension : record.formatExtension)?.toUpperCase() || t('history.unknown')
@@ -115,7 +139,7 @@ function action(name: string) {
           <dd>{{ historyDuration(record.durationSeconds) || t('history.unknown') }}</dd>
           <dt>{{ t('history.size') }}</dt>
           <dd>{{
-              size?.kind === 'actual' ? size.text : size?.kind === 'stream' ? t('history.streamSize', {size: size.text}) : t('history.unknownSize')
+              size && size.kind !== 'unknown' ? size.text : t('history.unknownSize')
             }}
           </dd>
           <dt>{{ t(record.outputPath ? 'history.path' : 'history.directory') }}</dt>
@@ -125,8 +149,9 @@ function action(name: string) {
         </dl>
         <section v-if="record.successfulOutput&&record.status!=='completed'" class="last-output">
           <h3>{{ t('tasks.lastSuccessfulOutput') }}</h3>
-          <p>{{ record.successfulOutput.height }}p · {{ record.successfulOutput.fps }} FPS ·
-            {{ record.outputExtension?.toUpperCase() }}</p>
+          <p>{{ videoQualityLabel(record.successfulOutput.formatSnapshot) ?? t('history.unknown') }} ·
+            {{ record.successfulOutput.fps ? `${record.successfulOutput.fps} FPS` : t('history.unknown') }} ·
+            {{ record.outputExtension?.toUpperCase() || t('history.unknown') }}</p>
           <p class="path">{{ record.outputPath }}</p>
           <p>{{ record.successfulOutput.finishedAt }}</p>
         </section>
@@ -148,29 +173,22 @@ function action(name: string) {
             <dd>{{ record.deletedAt }}</dd>
           </template>
         </dl>
-        <section v-if="record.status==='failed'||record.status==='interrupted'" class="failure">
-          <h3>{{ t(historyFailureKey(record)) }}</h3>
-          <p>{{ t('history.failureStage') }}：{{ t(historyStageKey(record.errorStage)) }}</p>
-          <p>{{ t('history.suggestionLabel') }}：{{ t(historySuggestionKey(record)) }}</p>
-          <details v-if="record.errorCode||technical">
-            <summary>{{ t('history.technical') }}</summary>
-            <pre>{{ sanitizeHistoryDetail(record.errorCode) }}<template v-if="technical">{{ '\n' }}{{
-                technical
-              }}</template></pre>
-          </details>
-        </section>
+        <ElAlert v-if="record.status==='failed'||record.status==='interrupted'" :closable="false"
+                 :description="failureDescription" :title="t(historyFailureKey(record))"
+                 :type="record.status === 'interrupted' ? 'warning' : 'error'" class="failure"/>
         <div v-if="!trashed&&!active" class="detail-actions">
           <ElButton :disabled="systemDisabled" plain type="danger" @click="action('remove')">{{
               t('history.remove')
             }}
           </ElButton>
-          <ElTooltip v-if="record.status==='completed'&&record.outputPath" :content="fileHint" :disabled="!fileHint">
-            <span><ElButton :disabled="systemDisabled||downloading||!fileRecyclingSupported" plain type="danger"
+          <ElTooltip v-if="record.status==='completed'&&record.outputPath" :content="deletionHint"
+                     :disabled="!deletionHint">
+            <span><ElButton :disabled="systemDisabled||downloading||!fileDeletionSupported" plain type="danger"
                             @click="action('removeAndFile')">{{ t('history.removeAndFile') }}</ElButton></span>
           </ElTooltip>
         </div>
-        <p v-if="!trashed&&record.status==='completed'&&record.outputPath&&!fileRecyclingSupported" class="muted">
-          {{ t('history.fileRecyclingUnavailable') }}</p>
+        <p v-if="!trashed&&record.status==='completed'&&record.outputPath&&!fileDeletionSupported" class="muted">
+          {{ t('history.fileDeletionUnavailable') }}</p>
       </div>
     </ElScrollbar>
   </ElDrawer>
@@ -268,49 +286,25 @@ dd {
 }
 
 .failure {
-  padding: 15px;
-  background: var(--app-background);
-  border: 1px solid var(--app-border);
-  border-radius: 8px;
+  align-items: flex-start;
   margin-bottom: 20px;
 }
 
-.failure h3 {
-  font-size: 14px;
-  margin: 0;
+.failure :deep(.el-alert__content) {
+  flex: 1;
+  min-width: 0;
 }
 
-.failure p {
-  font-size: 13px;
+.failure :deep(.el-alert__title) {
+  overflow-wrap: anywhere;
 }
 
-.failure summary {
-  cursor: pointer;
-  font-size: 13px;
-}
-
-.failure pre {
+.failure :deep(.el-alert__description) {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  font-size: 12px;
+  user-select: text;
+  line-height: 1.6;
 }
-
-.feedback {
-  padding: 12px;
-  border: 1px solid var(--app-border);
-  border-radius: 8px;
-  font-size: 13px;
-  overflow-wrap: anywhere;
-}
-
-.error {
-  color: var(--el-color-danger);
-}
-
-summary:focus-visible {
-  outline: 2px solid var(--app-accent);
-}
-
 @media (max-width: 720px) {
   dl {
     grid-template-columns:90px minmax(0, 1fr);

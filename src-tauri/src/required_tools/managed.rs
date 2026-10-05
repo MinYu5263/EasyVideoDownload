@@ -644,7 +644,7 @@ pub async fn configure_required_tool(
     cancellation: tauri::State<'_, ConfigureManager>,
     on_progress: Channel<ConfigureProgress>,
 ) -> Result<CheckResult, RequiredToolError> {
-    let mut result = configure(tool_id, &state, &cancellation, |progress| {
+    let result = configure(tool_id, &state, &cancellation, |progress| {
         let _ = on_progress.send(progress);
     })
         .await
@@ -653,7 +653,9 @@ pub async fn configure_required_tool(
                 e.program = tool_id.names()[0].into();
             }
             e
-        })?;
+        });
+    super::log_check_result("toolConfigurationCompleted", tool_id, &result);
+    let mut result = result?;
     if let Some(e) = &mut result.error {
         if e.program.is_empty() || e.program == "yt-dlp" {
             e.program = tool_id.names()[0].into();

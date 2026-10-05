@@ -1,5 +1,84 @@
 use super::*;
+#[test]
+fn metadata_keeps_real_table_fields_without_media_urls() {
+    let v = parse_metadata(br#"{"id":"id","title":"title","formats":[{"format_id":"v","width":1920,"height":1080,"vcodec":"hev1.1","fps":60,"vbr":1234.5,"format_note":"1080p high","filesize_approx":10000,"url":"https://secret.test/signed","http_headers":{"Cookie":"secret"}}]}"#).unwrap();
+    let json = serde_json::to_value(v).unwrap();
+    assert_eq!(json["formats"][0]["width"], 1920);
+    assert_eq!(json["formats"][0]["videoCodec"], "hev1.1");
+    assert_eq!(json["formats"][0]["qualityLabel"], "1080P HIGH");
+    assert_eq!(json["formats"][0]["bitrate"], 1234500);
+    assert!(!json.to_string().contains("secret"));
+}
 use serde_json::json;
+
+#[test]
+fn native_metadata_owns_normalization_preference_and_downloadable_ids() {
+    let source = json!({"id":"v","title":"Title","extractor_key":"Youtube","formats":[
+        {"format_id":"portrait","width":1080,"height":1920,"vcodec":"hev1.1","fps":60,"format_note":"unknown"},
+        {"format_id":"landscape","width":1920,"height":1080,"vcodec":"avc1.640028","fps":30},
+        {"format_id":"height-only","height":720,"format_note":" n/a ","vbr":0.00001},
+        {"format_id":"width-only","width":720},
+        {"format_id":"bad+selector","height":2160},
+        {"format_id":"audio","vcodec":" NONE "}
+    ]});
+    let payload = serde_json::to_value(parse_metadata(&serde_json::to_vec(&source).unwrap()).unwrap()).unwrap();
+    assert_eq!(payload["defaultFormatId"], "landscape");
+    assert_eq!(payload["formats"].as_array().unwrap().len(), 4);
+    let f = |id: &str| payload["formats"].as_array().unwrap().iter().find(|f| f["formatId"] == id).unwrap();
+    assert_eq!(f("portrait")["qualityLabel"], "1080P");
+    assert_eq!(f("portrait")["qualityLabelSource"], "dimensions");
+    assert_eq!(f("portrait")["codecLabel"], "H.265");
+    assert_eq!(f("portrait")["videoCodec"], "hev1.1");
+    assert_eq!(f("height-only")["qualityLabel"], "720P");
+    assert!(f("height-only")["bitrate"].is_null());
+    assert!(f("width-only")["qualityLabel"].is_null());
+}
+
+#[test]
+fn bilibili_placeholder_note_uses_platform_name_before_dimensions() {
+    let source = json!({"id":"v","title":"Title","extractor_key":"BiliBili","formats":[
+        {"format_id":"80","width":1920,"height":1080,"format_note":" none ","format":"1080p 高清"}
+    ]});
+    let payload = serde_json::to_value(parse_metadata(&serde_json::to_vec(&source).unwrap()).unwrap()).unwrap();
+    assert_eq!(payload["formats"][0]["qualityLabel"], "1080P 高清");
+    assert_eq!(payload["formats"][0]["qualityLabelSource"], "format");
+}
+
+#[test]
+fn metadata_keeps_bilibili_quality_tiers_from_ytdlp_format() {
+    for extractor in ["BiliBili", "BiliBiliBangumi", "bilibili"] {
+        let source = json!({"id":"BV1", "title":"Title", "extractor_key":extractor, "formats":[
+            {"format_id":"80", "format":"1080P 高清", "width":1920, "height":1080, "tbr":487.2},
+            {"format_id":"112", "format":"1080P 高码率", "width":1920, "height":1080, "tbr":629.3},
+            {"format_id":"120", "format_note":"4K 超高清", "format":"Different fallback"},
+            {"format_id":"blank-note", "format_note":"  ", "format":"1080P 高帧率"},
+            {"format_id":"generated", "format":"generated - 1920x1080"}
+        ]});
+        let video = parse_metadata(&serde_json::to_vec(&source).unwrap()).unwrap();
+        let f = |id: &str| video.formats.iter().find(|f| f.format_id == id).unwrap();
+        assert_eq!(f("80").quality_label.as_deref(), Some("1080P 高清"));
+        assert_eq!(f("112").quality_label.as_deref(), Some("1080P 高码率"));
+        assert_eq!(f("120").quality_label.as_deref(), Some("4K 超高清"));
+        assert_eq!(f("blank-note").quality_label.as_deref(), Some("1080P 高帧率"));
+        assert_eq!(f("generated").quality_label, None);
+        assert_eq!(f("80").bitrate, Some(487200));
+        assert_eq!(f("112").bitrate, Some(629300));
+    }
+}
+
+#[test]
+fn metadata_does_not_use_generated_format_strings_as_quality_names() {
+    for extractor in ["Youtube", "Other", ""] {
+        let source = json!({"id":"v", "title":"Title", "extractor_key":extractor, "formats":[
+            {"format_id":"137", "format":"137 - 1920x1080", "height":1080},
+            {"format_id":"248", "format_note":"1080p", "format":"248 - 1920x1080"}
+        ]});
+        let video = parse_metadata(&serde_json::to_vec(&source).unwrap()).unwrap();
+        assert_eq!(video.formats[0].quality_label.as_deref(), Some("1080P"));
+        assert_eq!(video.formats[0].quality_label_source.as_deref(), Some("dimensions"));
+        assert_eq!(video.formats[1].quality_label.as_deref(), Some("1080P"));
+    }
+}
 
 #[test]
 fn extracts_douyin_share_text_and_accepts_other_platform_links() {
@@ -105,19 +184,18 @@ fn metadata_returns_exact_estimated_and_unknown_sizes_for_each_video_stream() {
     ]);
     let video = parse_metadata(&serde_json::to_vec(&source).unwrap()).unwrap();
     let payload = serde_json::to_value(video).unwrap();
-    for (index, (bytes, approximate)) in [
-        (Some(10485760_u64), false),
-        (Some(31457280), true),
-        (None, false),
-        (None, false),
-        (None, false),
-        (Some(2048), true),
-        (None, false),
+    for (id, bytes, approximate) in [
+        ("exact", Some(10485760_u64), false),
+        ("estimate", Some(31457280), true),
+        ("unknown", None, false),
+        ("invalid", None, false),
+        ("zero", None, false),
+        ("fallback", Some(2048), true),
+        ("too-large", None, false),
     ]
     .into_iter()
-    .enumerate()
     {
-        let format = &payload["formats"][index];
+        let format = payload["formats"].as_array().unwrap().iter().find(|f| f["formatId"] == id).unwrap();
         assert!(
             format.get("sizeBytes").is_some(),
             "Native payload must include sizeBytes"
@@ -832,10 +910,12 @@ echo {"id":"123","title":"Native result","formats":[{"format_id":"video","vcodec
         .unwrap();
     let mut context = tauri::generate_context!();
     context.config_mut().app.windows.clear();
+    let (logger, log_handle) = crate::app_logs::builder(directory, false).unwrap().build().unwrap();
     let app = tauri::Builder::default()
         .any_thread()
         .manage(RequiredToolManager::new(storage.clone()))
         .manage(CookieStore::new(directory))
+        .manage(crate::app_logs::AppLogStore::new(logger.into(), log_handle))
         .manage(storage)
         .build(context)
         .unwrap();
@@ -862,8 +942,9 @@ echo {"id":"123","title":"Native result","formats":[{"format_id":"video","vcodec
         };
         let (result, blocked) = tokio::join!(
             parse_video(
-                CookiePlatform::Douyin,
-                "https://v.douyin.com/abc/".into(),
+                app.handle().clone(),
+                CookiePlatform::Bilibili,
+                "https://www.bilibili.com/video/BV1xx411c7mD".into(),
                 app.state(),
                 app.state(),
                 app.state()
@@ -876,6 +957,9 @@ echo {"id":"123","title":"Native result","formats":[{"format_id":"video","vcodec
             assert_eq!(result.unwrap().metadata.title, "Native result");
         }
         assert!(blocked, "native parsing must prevent replacing its tools");
+        let logs = std::fs::read_to_string(directory.join("logs/application_rCURRENT.log")).unwrap();
+        assert!(logs.lines().last().unwrap().contains(if failure { "parseFailed" } else { "parseCompleted" }));
+        assert!(logs.contains("parseStarted"));
         assert!(
             tools.usage.publication(directory).is_ok(),
             "finished parsing retained its tool lease"
@@ -895,6 +979,9 @@ fn process_fixture() {
             tauri::async_runtime::block_on(parse_command_tool_usage_fixture(&directory));
         }
         "sleep" => {
+            if let Some(path) = std::env::var_os("EVD_VIDEO_TEST_STARTED") {
+                std::fs::write(path, "started").unwrap();
+            }
             std::thread::sleep(Duration::from_secs(2));
             std::fs::write(
                 std::env::var("EVD_VIDEO_TEST_MARKER").unwrap(),
@@ -975,6 +1062,38 @@ async fn native_parser_timeout_stops_the_process() {
     );
     tokio::time::sleep(Duration::from_millis(2200)).await;
     assert!(!marker.exists(), "parser left a timed-out process running");
+}
+
+#[tokio::test]
+async fn dropping_comparison_parser_stops_native_process() {
+    let directory = tempfile::Builder::new()
+        .prefix("evd-comparison-cancel-")
+        .tempdir()
+        .unwrap();
+    eprintln!(
+        "Bilibili comparison cancellation owned directory: {}",
+        directory.path().display()
+    );
+    let marker = directory.path().join("must-not-exist");
+    let started = directory.path().join("started");
+    let mut command = fixture("sleep");
+    command.env("EVD_VIDEO_TEST_MARKER", &marker);
+    command.env("EVD_VIDEO_TEST_STARTED", &started);
+    let task = tokio::spawn(collect_metadata(command, Duration::from_secs(10)));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+        .await
+        .expect("native parser did not start");
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert!(
+        !marker.exists(),
+        "comparison cancellation left a native parser running"
+    );
 }
 
 #[tokio::test]

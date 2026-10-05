@@ -5,6 +5,14 @@ import type {DownloadPageState} from "./useDownloadPageState.ts";
 export {platformIds} from "./videoPlatforms.ts";
 
 export interface VideoFormat {
+    width?: number | null;
+    qualityLabel?: string | null;
+    qualityLabelSource?: string | null;
+    codecLabel?: string | null;
+    videoCodec?: string | null;
+    bitrate?: number | null;
+    watermarked?: boolean | null;
+    nativeResultId?: string | null;
     formatId: string;
     height: number | null;
     fps: number | null;
@@ -21,6 +29,7 @@ export interface VideoMetadata {
     extension: string | null;
     cookieFallback: boolean;
     formats: VideoFormat[];
+    defaultFormatId: string | null;
 }
 
 interface ParserBridge {
@@ -29,7 +38,7 @@ interface ParserBridge {
     beforeParse: (platform: VideoPlatform) => Promise<boolean>;
     saveCookie: (platform: VideoPlatform, contents: string) => Promise<boolean>;
     onChange?: (platform: VideoPlatform) => void;
-    cacheThumbnail?: (url: string) => Promise<string | null>;
+    cacheThumbnail?: (url: string, platform: VideoPlatform) => Promise<string | null>;
 }
 
 interface ParsedVideo {
@@ -57,24 +66,11 @@ interface PlatformState {
     previousResult: ResultPreview | null;
     phase: "idle" | "parsing" | "ready";
     error: ParseError | null;
-    quality: string | null;
-    frameRate: string | null;
     version: number;
     selectedFormatId: string | null;
     thumbnailCachePath: string | null;
     parsedAt: string | null;
     parserFingerprint: string | null;
-}
-
-function availableQualities(video: VideoMetadata | null) {
-    return [...new Set(video?.formats.flatMap(format => format.height ? [String(format.height)] : []) ?? [])]
-        .sort((a, b) => Number(b) - Number(a));
-}
-
-function availableFrameRates(video: VideoMetadata | null, quality: string | null) {
-    return [...new Set(video?.formats.filter(format => quality === null || String(format.height) === quality)
-        .flatMap(format => format.fps ? [String(format.fps)] : []) ?? [])]
-        .sort((a, b) => Number(b) - Number(a));
 }
 
 export function createVideoParser(bridge: ParserBridge) {
@@ -87,8 +83,6 @@ export function createVideoParser(bridge: ParserBridge) {
         previousResult: null,
         phase: "idle",
         error: null,
-        quality: null,
-        frameRate: null,
         version: 0,
         selectedFormatId: null,
         thumbnailCachePath: null,
@@ -100,17 +94,11 @@ export function createVideoParser(bridge: ParserBridge) {
     const resultLink = computed(() => draft.value.video ? draft.value.link : "");
     const phase = computed(() => draft.value.phase);
     const error = computed(() => draft.value.error);
-    const quality = computed(() => draft.value.quality);
-    const frameRate = computed(() => draft.value.frameRate);
-    const busy = computed(() => platformIds.some(id => drafts[id].phase === "parsing"));
-    const qualities = computed(() => availableQualities(video.value));
-    const frameRates = computed(() => availableFrameRates(video.value, quality.value));
-    // yt-dlp returns formats in increasing preference order. Keep that order for ties.
+    const busy = computed(() => phase.value === "parsing");
+
+    // Preserve the explicit UI selection. Rust owns the default and format order.
     function formatFor(state: PlatformState) {
-        const formats = state.video?.formats.filter(format =>
-            (state.quality === null || String(format.height) === state.quality) &&
-            (state.frameRate === null || String(format.fps) === state.frameRate)) ?? [];
-        return formats.find(format => format.formatId === state.selectedFormatId) ?? formats[formats.length - 1] ?? null;
+        return state.video?.formats.find(format => format.formatId === state.selectedFormatId) ?? null;
     }
 
     const selectedFormat = computed(() => formatFor(draft.value));
@@ -153,11 +141,6 @@ export function createVideoParser(bridge: ParserBridge) {
         for (const saved of states) {
             const state = drafts[saved.platform];
             if (!state) throw {code: "loadFailed", detail: "Unknown persisted platform"};
-            const format = saved.formats.find(item => item.formatId === saved.selectedFormatId);
-            if (saved.videoId !== null && (!format || format.height !== saved.selectedHeight || format.fps !== saved.selectedFps)) throw {
-                code: "loadFailed",
-                detail: "Invalid persisted format selection"
-            };
             state.previousResult = null;
             state.link = saved.inputLink;
             state.directory = saved.downloadDirectory;
@@ -169,10 +152,9 @@ export function createVideoParser(bridge: ParserBridge) {
                 duration: saved.durationSeconds,
                 extension: saved.extension,
                 cookieFallback: saved.cookieFallback,
-                formats: saved.formats
+                formats: saved.formats,
+                defaultFormatId: null,
             } : null;
-            state.quality = saved.selectedHeight === null ? null : String(saved.selectedHeight);
-            state.frameRate = saved.selectedFps === null ? null : String(saved.selectedFps);
             state.selectedFormatId = saved.selectedFormatId;
             state.thumbnailCachePath = saved.thumbnailCachePath;
             state.parsedAt = saved.parsedAt;
@@ -204,7 +186,6 @@ export function createVideoParser(bridge: ParserBridge) {
         state.video = null;
         state.phase = "idle";
         state.error = null;
-        state.quality = state.frameRate = null;
         state.selectedFormatId = state.thumbnailCachePath = state.parsedAt = state.parserFingerprint = null;
         changed(selected);
     }
@@ -213,13 +194,18 @@ export function createVideoParser(bridge: ParserBridge) {
         platformIds.forEach(id => reset(id));
     }
 
+    function invalidateToolFormats() {
+        reset('bilibili');
+        reset('youtube');
+    }
+
     function dispose() {
         disposed = true;
         resetAll();
     }
 
     function selectPlatform(next: VideoPlatform) {
-        if (busy.value || platform.value === next) return;
+        if (disposed || platform.value === next) return;
         cancelPaste();
         platform.value = next;
     }
@@ -274,28 +260,10 @@ export function createVideoParser(bridge: ParserBridge) {
         }
     }
 
-    function setQuality(value: string) {
-        if (busy.value || quality.value === value || !qualities.value.includes(value)) return;
-        draft.value.quality = value;
-        draft.value.frameRate = frameRates.value[0] ?? null;
-        draft.value.selectedFormatId = null;
-        changed();
-    }
-
-    function setFrameRate(value: string) {
-        if (!busy.value && frameRates.value.includes(value)) {
-            draft.value.frameRate = value;
-            draft.value.selectedFormatId = null;
-            changed();
-        }
-    }
-
     function selectFormat(formatId: string) {
         if (busy.value || disposed) return false;
         const format = video.value?.formats.find(item => item.formatId === formatId);
         if (!format) return false;
-        draft.value.quality = format.height === null ? null : String(format.height);
-        draft.value.frameRate = format.fps === null ? null : String(format.fps);
         draft.value.selectedFormatId = format.formatId;
         changed();
         return true;
@@ -304,6 +272,10 @@ export function createVideoParser(bridge: ParserBridge) {
     function updateCookie(contents: string) {
         // Keep the visible result and choices. An explicit parse reads the latest saved Cookie.
         return bridge.saveCookie(platform.value, contents);
+    }
+
+    function isCurrentError(selected: VideoPlatform, failure: ParseError) {
+        return !disposed && drafts[selected].error === failure;
     }
 
     async function parse(): Promise<ParseError | undefined> {
@@ -338,12 +310,12 @@ export function createVideoParser(bridge: ParserBridge) {
             if (current !== state.version || disposed) return;
             const result = "metadata" in response ? response.metadata : response;
             let cachePath: string | null = null;
-            if (result.thumbnail && bridge.cacheThumbnail) cachePath = await bridge.cacheThumbnail(result.thumbnail);
+            if (result.thumbnail && bridge.cacheThumbnail) cachePath = await bridge.cacheThumbnail(result.thumbnail, selected);
             if (current !== state.version || disposed) return;
             state.video = result;
-            state.quality = availableQualities(result)[0] ?? null;
-            state.frameRate = availableFrameRates(result, state.quality)[0] ?? null;
-            state.selectedFormatId = null;
+            const initial = result.formats.find(f => f.formatId === state.selectedFormatId)
+                ?? result.formats.find(f => f.formatId === result.defaultFormatId) ?? null;
+            state.selectedFormatId = initial?.formatId ?? null;
             state.thumbnailCachePath = cachePath;
             state.parsedAt = "metadata" in response ? response.parsedAt : null;
             state.parserFingerprint = "metadata" in response ? response.parserFingerprint : null;
@@ -368,11 +340,7 @@ export function createVideoParser(bridge: ParserBridge) {
         resultLink,
         phase,
         error,
-        quality,
-        frameRate,
         busy,
-        qualities,
-        frameRates,
         selectedFormat,
         pasting,
         selectPlatform,
@@ -382,13 +350,13 @@ export function createVideoParser(bridge: ParserBridge) {
         applyDefaultDirectories,
         pasteLink,
         cancelPaste,
-        setQuality,
-        setFrameRate,
         selectFormat,
         updateCookie,
+        isCurrentError,
         parse,
         reset,
         resetAll,
+        invalidateToolFormats,
         dispose,
         restore,
         snapshot

@@ -124,7 +124,12 @@ async fn probe(
 pub async fn test_proxy_connection(
     settings: ProxySettings,
 ) -> Result<ProxyTestResult, ProxyTestError> {
-    probe(&settings, TEST_URL, Duration::from_secs(10)).await
+    let result = probe(&settings, TEST_URL, Duration::from_secs(10)).await;
+    match &result {
+        Ok(probe) => log::info!("proxyTestCompleted status={} elapsedMs={}", probe.status, probe.elapsed_ms),
+        Err(error) => log::warn!("proxyTestFailed code={}", error.code),
+    }
+    result
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +142,15 @@ pub struct ProxySettings {
 
 impl ProxySettings {
     pub fn normalized(&self) -> Result<Self, StorageError> {
+        self.normalize(false)
+    }
+
+    // Keep legacy single-label hosts editable, but never validate them for a new request or save.
+    pub(crate) fn normalized_for_editing(&self) -> Result<Self, StorageError> {
+        self.normalize(true)
+    }
+
+    fn normalize(&self, for_editing: bool) -> Result<Self, StorageError> {
         let invalid =
             || StorageError::new("invalidSettings", "Invalid proxy protocol, address or port");
         if !matches!(self.protocol.as_str(), "http" | "https" | "socks5") || self.port == 0 {
@@ -159,6 +173,10 @@ impl ProxySettings {
             url::Host::Domain(domain) => {
                 let name = domain.strip_suffix('.').unwrap_or(&domain);
                 if name.len() > 253
+                    || (!for_editing && name != "localhost" && !name.contains('.'))
+                    || (!for_editing && !name.rsplit('.').next().is_some_and(|label| {
+                    label.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                }))
                     || name.split('.').any(|label| {
                     label.is_empty()
                         || label.len() > 63
@@ -173,7 +191,13 @@ impl ProxySettings {
                 }
                 domain
             }
-            url::Host::Ipv4(address) => address.to_string(),
+            url::Host::Ipv4(parsed) => {
+                // Reject the URL parser's abbreviated, octal and hexadecimal IPv4 forms.
+                if address.parse::<std::net::Ipv4Addr>().ok() != Some(parsed) {
+                    return Err(invalid());
+                }
+                parsed.to_string()
+            }
             url::Host::Ipv6(address) => address.to_string(),
         };
         Ok(Self {
@@ -223,18 +247,33 @@ pub async fn get_proxy_settings(
 }
 
 #[tauri::command]
+pub async fn get_proxy_settings_for_editing(
+    state: tauri::State<'_, Storage>,
+) -> Result<Option<ProxySettings>, StorageError> {
+    let database = state.database()?;
+    tauri::async_runtime::spawn_blocking(move || database.proxy_settings_for_editing())
+        .await
+        .map_err(|e| StorageError::new("loadFailed", e))?
+}
+
+#[tauri::command]
 pub async fn save_proxy_settings(
     settings: Option<ProxySettings>,
     state: tauri::State<'_, Storage>,
 ) -> Result<Option<ProxySettings>, StorageError> {
-    let settings = settings.map(|settings| settings.normalized()).transpose()?;
-    let database = state.database()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        database.save_proxy_settings(settings.as_ref())?;
-        Ok(settings)
-    })
-        .await
-        .map_err(|e| StorageError::new("saveFailed", e))?
+    let result: Result<Option<ProxySettings>, StorageError> = async {
+        let settings = settings.map(|settings| settings.normalized()).transpose()?;
+        let database = state.database()?;
+        tauri::async_runtime::spawn_blocking(move || {
+            database.save_proxy_settings(settings.as_ref())?;
+            Ok(settings)
+        }).await.map_err(|e| StorageError::new("saveFailed", e))?
+    }.await;
+    match &result {
+        Ok(settings) => log::info!("proxySettingsSaved configured={}", settings.is_some()),
+        Err(error) => log::warn!("proxySettingsSaveFailed code={}", error.code),
+    }
+    result
 }
 
 #[cfg(test)]

@@ -94,7 +94,6 @@ function handleMenuKeydown(event: KeyboardEvent) {
         </ElMenuItem>
       </ElMenu>
     </nav>
-
   </aside>
 </template>
 

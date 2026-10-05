@@ -1,6 +1,158 @@
 use super::page_states::DownloadPageState;
 use super::*;
 
+#[test]
+fn version_twelve_format_upgrade_keeps_history_files_snapshots_and_id_high_water() {
+    let root = tempfile::tempdir().unwrap();
+    eprintln!(
+        "owned schema twelve format migration directory: {}",
+        root.path().display()
+    );
+    let path = root.path().join("app.db");
+    let connection = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../../migrations/001_settings.sql"),
+        include_str!("../../migrations/002_settings_key_value.sql"),
+        include_str!("../../migrations/003_beijing_datetime.sql"),
+        include_str!("../../migrations/004_automatic_ytdlp.sql"),
+        include_str!("../../migrations/005_persistence.sql"),
+        include_str!("../../migrations/006_automatic_tools.sql"),
+        include_str!("../../migrations/007_single_input_link.sql"),
+        include_str!("../../migrations/008_download_history_cards.sql"),
+        include_str!("../../migrations/009_download_history_trash.sql"),
+        include_str!("../../migrations/010_shared_download_tasks.sql"),
+        include_str!("../../migrations/011_output_identity.sql"),
+        include_str!("../../migrations/012_download_format_snapshot.sql"),
+    ] {
+        connection.execute_batch(migration).unwrap();
+    }
+    let mut state = page();
+    state.download_directory = root.path().to_string_lossy().into();
+    let format = state
+        .formats
+        .iter()
+        .find(|f| Some(&f.format_id) == state.selected_format_id.as_ref())
+        .unwrap();
+    let snapshot = serde_json::to_string(format).unwrap();
+    let output = root.path().join("retained.webm");
+    std::fs::write(&output, b"retained media").unwrap();
+    connection.execute("INSERT INTO download_records(id,request_id,platform,video_id,source_link,title,format_id,download_directory,status,started_at,finished_at,output_path,file_size_bytes,format_snapshot_json,successful_format_snapshot_json,output_identity,successful_format_id,successful_directory,successful_finished_at) VALUES(41,'retained','youtube','abc','https://youtu.be/abc','Retained',?1,?2,'completed','2026-10-04 10:00:00','2026-10-04 10:01:00',?3,14,?4,?4,'retained-identity',?1,?2,'2026-10-04 10:01:00')", params![format.format_id,state.download_directory,output.to_str(),snapshot]).unwrap();
+    connection.execute_batch("UPDATE sqlite_sequence SET seq=128 WHERE name='download_records'; PRAGMA user_version=12;").unwrap();
+    drop(connection);
+    let db = Database::open(&path, &root.path().join("legacy")).unwrap();
+    let retained = db.get_download_record(41).unwrap();
+    assert_eq!(retained.request_id, "retained");
+    assert_eq!(
+        retained.output_identity.as_deref(),
+        Some("retained-identity")
+    );
+    let mut normalized = format.clone();
+    crate::video::formats::normalize(&mut normalized);
+    assert_eq!(retained.format_snapshot.as_ref(), Some(&normalized));
+    assert_eq!(
+        retained.successful_output.unwrap().format_snapshot.as_ref(),
+        Some(&normalized)
+    );
+    assert_eq!(std::fs::read(&output).unwrap(), b"retained media");
+    let other = state
+        .formats
+        .iter()
+        .find(|f| f.format_id != format.format_id)
+        .unwrap();
+    state.selected_format_id = Some(other.format_id.clone());
+    let created = db
+        .begin_download_record(
+            "other-format",
+            &super::download_records::DownloadSnapshot { page: state },
+            "2026-10-05 10:00:00",
+        )
+        .unwrap();
+    assert!(created > 128);
+    assert_eq!(
+        db.video_download_records("youtube", "abc").unwrap().len(),
+        2
+    );
+    drop(db);
+    let reopened = Database::open(&path, &root.path().join("legacy")).unwrap();
+    assert_eq!(
+        reopened
+            .video_download_records("youtube", "abc")
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn version_eleven_upgrade_preserves_legacy_record_and_output() {
+    let root = tempfile::tempdir().unwrap();
+    eprintln!(
+        "owned format migration directory: {}",
+        root.path().display()
+    );
+    let path = root.path().join("app.db");
+    let db = Database::open(&path, &root.path().join("legacy")).unwrap();
+    let mut snapshot = page();
+    snapshot.download_directory = root.path().to_string_lossy().into();
+    let row = db
+        .begin_download_record(
+            "legacy-format",
+            &super::download_records::DownloadSnapshot { page: snapshot },
+            "2026-10-05 10:00:00",
+        )
+        .unwrap();
+    let output = root.path().join("old.webm");
+    std::fs::write(&output, b"original video").unwrap();
+    db.finish_download_record(
+        "legacy-format",
+        &super::download_records::DownloadRecordOutcome::Completed {
+            path: output.to_string_lossy().into(),
+            size: 14,
+            extension: Some("webm".into()),
+        },
+    )
+        .unwrap();
+    let before = db.get_download_record(row).unwrap();
+    db.connection("test").unwrap().execute_batch("ALTER TABLE download_records DROP COLUMN format_snapshot_json; ALTER TABLE download_records DROP COLUMN successful_format_snapshot_json; PRAGMA user_version=11;").unwrap();
+    drop(db);
+    let upgraded = Database::open(&path, &root.path().join("legacy")).unwrap();
+    let after = upgraded.get_download_record(row).unwrap();
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.status, "completed");
+    assert_eq!(after.output_path, before.output_path);
+    assert_eq!(after.format_id, before.format_id);
+    assert_eq!(after.format_snapshot.unwrap().quality_label.as_deref(), Some("1080P"));
+    assert_eq!(after.successful_output.unwrap().format_snapshot.unwrap().quality_label.as_deref(), Some("1080P"));
+    assert_eq!(std::fs::read(&output).unwrap(), b"original video");
+}
+#[test]
+fn format_snapshot_migration_preserves_codec_for_history_retries() {
+    let root = tempfile::tempdir().unwrap();
+    eprintln!("format snapshot test directory: {}", root.path().display());
+    let db = Database::open(&root.path().join("app.db"), &root.path().join("legacy")).unwrap();
+    let mut p = page();
+    let mut json = serde_json::to_value(&p).unwrap();
+    json["formats"][1]["videoCodec"] = serde_json::json!("hev1");
+    p = serde_json::from_value(json).unwrap();
+    p.download_directory = root.path().to_string_lossy().into();
+    let id = db
+        .begin_download_record(
+            "snapshot-codec",
+            &super::download_records::DownloadSnapshot { page: p },
+            "2026-10-05 12:00:00",
+        )
+        .unwrap();
+    let row = serde_json::to_value(db.get_download_record(id).unwrap()).unwrap();
+    assert_eq!(row["formatSnapshot"]["videoCodec"], "hev1");
+    assert_eq!(
+        db.connection("test")
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        15
+    );
+}
+
 fn database() -> (tempfile::TempDir, Database) {
     let dir = tempfile::tempdir().unwrap();
     eprintln!(
@@ -9,6 +161,32 @@ fn database() -> (tempfile::TempDir, Database) {
     );
     let db = Database::open(&dir.path().join("app.db"), &dir.path().join("legacy.json")).unwrap();
     (dir, db)
+}
+
+#[test]
+fn legacy_page_and_history_get_native_format_labels_without_changing_selection() {
+    use super::download_records::DownloadSnapshot;
+    let (dir, db) = database();
+    let mut state = page();
+    state.formats[1].width = Some(1920);
+    state.formats[1].height = Some(1080);
+    state.formats[1].video_codec = Some("hev1.1".into());
+    state.download_directory = dir.path().to_string_lossy().into();
+    db.save_download_page_state(&state).unwrap();
+    // Simulate an old formats_json, which predates all derived fields.
+    db.connection("test").unwrap().execute("UPDATE download_page_states SET formats_json=?1", [serde_json::to_string(&state.formats).unwrap()]).unwrap();
+    let restored = db.download_page_states().unwrap().remove(0);
+    assert_eq!(restored.selected_format_id, state.selected_format_id);
+    let selected = restored.formats.iter().find(|f| f.format_id == "b").unwrap();
+    assert_eq!(selected.quality_label.as_deref(), Some("1080P"));
+    assert_eq!(selected.codec_label.as_deref(), Some("H.265"));
+    let id = db.begin_download_record("legacy-normalized", &DownloadSnapshot { page: state }, "2026-10-04 10:00:00").unwrap();
+    db.connection("test").unwrap().execute("UPDATE download_records SET format_snapshot_json=NULL WHERE id=?1", [id]).unwrap();
+    let record = db.get_download_record(id).unwrap();
+    let format = record.format_snapshot.unwrap();
+    assert_eq!(format.format_id, "b");
+    assert_eq!(format.quality_label.as_deref(), Some("1080P"));
+    assert!(format.codec_label.is_none(), "legacy columns cannot reconstruct codec");
 }
 
 #[test]
@@ -96,6 +274,18 @@ fn ui_choices_preserve_proxy_and_unknown_keys_and_reopen() {
             .unwrap(),
         "42"
     );
+}
+
+#[test]
+fn platform_settings_navigation_restores_without_changing_download_platform() {
+    let (_dir, db) = database();
+    let mut settings = db.ui_preferences().unwrap();
+    assert_eq!(settings.settings_platform, "douyin");
+    settings.download_platform = "youtube".into();
+    settings.settings_section = "platforms".into();
+    settings.settings_platform = "bilibili".into();
+    db.save_ui_preferences(&settings).unwrap();
+    assert_eq!(db.ui_preferences().unwrap(), settings);
 }
 
 #[test]
@@ -388,7 +578,8 @@ fn history_search_and_status_counts_cover_records_beyond_the_first_fifty() {
     assert_eq!(result.status_counts["completed"], 1);
     assert_eq!(result.status_counts["failed"], 1);
     assert_eq!(result.status_counts["cancelled"], 0);
-    assert_eq!(result.status_counts.len(), 6);
+    assert_eq!(result.status_counts.len(), 7);
+    assert_eq!(result.status_counts["paused"], 0);
     assert!(result.next_cursor.is_none());
 }
 
@@ -923,7 +1114,7 @@ fn history_purge_and_empty_only_remove_nonrunning_trash() {
 }
 
 #[test]
-fn history_recycle_callback_success_and_missing_preserve_completed_snapshot() {
+fn history_delete_record_and_file_success_and_missing_leave_no_record_in_trash() {
     for recycled in [true, false] {
         let (dir, db) = database();
         let id = history_record(
@@ -936,31 +1127,83 @@ fn history_recycle_callback_success_and_missing_preserve_completed_snapshot() {
         );
         let before = db.get_download_record(id).unwrap();
         assert_eq!(
-            db.recycle_download_record_file(id, |record| {
+            db.delete_download_record_and_file(id, |record, _| {
                 assert_eq!(record.output_path, before.output_path);
                 Ok(recycled)
             })
                 .unwrap(),
             recycled
         );
-        let after = db.get_download_record(id).unwrap();
-        assert!(after.deleted_at.is_some());
-        assert_eq!(after.file_deleted_at.is_some(), recycled);
-        assert_eq!(after.output_path, before.output_path);
-        assert_eq!(after.status, "completed");
-        assert_eq!(after.started_at, before.started_at);
-        assert_eq!(after.finished_at, before.finished_at);
-        assert_eq!(after.updated_at, before.updated_at);
-        db.restore_download_record(id).unwrap();
         assert_eq!(
-            db.get_download_record(id).unwrap().file_deleted_at,
-            after.file_deleted_at
+            db.get_download_record(id).unwrap_err().code,
+            "recordNotFound"
         );
+        assert_eq!(db.list_download_records(None, 50).unwrap().total_count, 0);
+        let query = super::download_records::HistoryQuery {
+            cursor: None,
+            limit: 50,
+            query: String::new(),
+            status: None,
+        };
+        assert_eq!(db.query_download_records_in_scope(&query, true).unwrap().records.len(), 0);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn history_delete_record_and_file_uses_native_permanent_deletion_and_preserves_locked_outputs() {
+    use crate::video::download::history::permanent::delete_output_file;
+    use std::os::windows::fs::OpenOptionsExt;
+    for present in [true, false] {
+        let (dir, db) = database();
+        let output = dir.path().join("video.mp4");
+        let sibling = dir.path().join("cover.jpg");
+        std::fs::write(&sibling, b"keep").unwrap();
+        if present { std::fs::write(&output, b"owned video!").unwrap(); }
+        let id = history_record(&db, dir.path(), "native-delete", "Owned", "youtube", "completed");
+        if present {
+            let player = std::fs::OpenOptions::new().read(true).share_mode(7).open(&output).unwrap();
+            assert_eq!(db.delete_download_record_and_file(id, delete_output_file).unwrap_err().code, "historyFileOccupied");
+            assert!(db.get_download_record(id).unwrap().deleted_at.is_none());
+            assert_eq!(std::fs::read(&output).unwrap(), b"owned video!");
+            drop(player);
+        }
+        assert_eq!(db.delete_download_record_and_file(id, delete_output_file).unwrap(), present);
+        assert!(!output.exists());
+        assert_eq!(db.get_download_record(id).unwrap_err().code, "recordNotFound");
+        assert_eq!(std::fs::read(sibling).unwrap(), b"keep");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn history_delete_record_and_file_removes_owned_fragments_before_dropping_their_ownership() {
+    use crate::video::download::history::actions::delete_record_files;
+    for present in [true, false] {
+        let (dir, db) = database();
+        let output = dir.path().join("video.mp4");
+        let sibling = dir.path().join("cover.jpg");
+        std::fs::write(&sibling, b"keep").unwrap();
+        if present { std::fs::write(&output, b"owned video!").unwrap(); }
+        let id = history_record(&db, dir.path(), "fragment-delete", "Owned", "youtube", "running");
+        let fragments = db.prepare_download_temporary_directory("fragment-delete", dir.path()).unwrap();
+        eprintln!("owned deletion fragments: {}", fragments.path);
+        std::fs::write(std::path::Path::new(&fragments.path).join("video.part"), b"fragment").unwrap();
+        db.finish_download_record("fragment-delete", &super::download_records::DownloadRecordOutcome::Completed {
+            path: output.to_string_lossy().into(),
+            size: 12,
+            extension: Some("mp4".into()),
+        }).unwrap();
+        assert_eq!(delete_record_files(&db, id).unwrap(), present);
+        assert!(!output.exists());
+        assert!(!std::path::Path::new(&fragments.path).exists());
+        assert_eq!(db.get_download_record(id).unwrap_err().code, "recordNotFound");
+        assert_eq!(std::fs::read(sibling).unwrap(), b"keep");
     }
 }
 
 #[test]
-fn history_recycle_validates_before_callback_and_rolls_back_callback_failure() {
+fn history_delete_record_file_validates_before_callback_and_rolls_back_callback_failure() {
     let (dir, db) = database();
     let id = history_record(
         &db,
@@ -973,19 +1216,19 @@ fn history_recycle_validates_before_callback_and_rolls_back_callback_failure() {
     let failed = history_record(&db, dir.path(), "failed", "Video", "youtube", "failed");
     let running = history_record(&db, dir.path(), "running", "Video", "youtube", "running");
     assert_eq!(
-        db.recycle_download_record_file(id, |_| panic!("busy callback"))
+        db.delete_download_record_and_file(id, |_, _| panic!("busy callback"))
             .unwrap_err()
             .code,
         "historyBusy"
     );
     assert_eq!(
-        db.recycle_download_record_file(running, |_| panic!("running callback"))
+        db.delete_download_record_and_file(running, |_, _| panic!("running callback"))
             .unwrap_err()
             .code,
         "recordRunning"
     );
     assert_eq!(
-        db.recycle_download_record_file(failed, |_| panic!("failed callback"))
+        db.delete_download_record_and_file(failed, |_, _| panic!("failed callback"))
             .unwrap_err()
             .code,
         "invalidSettings"
@@ -997,13 +1240,13 @@ fn history_recycle_validates_before_callback_and_rolls_back_callback_failure() {
         .unwrap();
     let before = serde_json::to_value(db.get_download_record(id).unwrap()).unwrap();
     assert_eq!(
-        db.recycle_download_record_file(id, |_| Err(StorageError::new(
-            "fileRecycleFailed",
+        db.delete_download_record_and_file(id, |_, _| Err(StorageError::new(
+            "historyFileDeleteFailed",
             "fixture"
         )))
             .unwrap_err()
             .code,
-        "fileRecycleFailed"
+        "historyFileDeleteFailed"
     );
     assert_eq!(
         serde_json::to_value(db.get_download_record(id).unwrap()).unwrap(),
@@ -1011,13 +1254,13 @@ fn history_recycle_validates_before_callback_and_rolls_back_callback_failure() {
     );
     db.delete_download_record(id).unwrap();
     assert_eq!(
-        db.recycle_download_record_file(id, |_| panic!("trash callback"))
+        db.delete_download_record_and_file(id, |_, _| panic!("trash callback"))
             .unwrap_err()
             .code,
         "recordTrashed"
     );
     assert_eq!(
-        db.recycle_download_record_file(99999, |_| panic!("missing callback"))
+        db.delete_download_record_and_file(99999, |_, _| panic!("missing callback"))
             .unwrap_err()
             .code,
         "recordNotFound"
@@ -1025,7 +1268,7 @@ fn history_recycle_validates_before_callback_and_rolls_back_callback_failure() {
 }
 
 #[test]
-fn history_recycle_distinguishes_file_success_from_history_save_failure() {
+fn history_delete_record_file_distinguishes_file_success_from_history_save_failure() {
     for recycled in [true, false] {
         let (dir, db) = database();
         let id = history_record(
@@ -1036,14 +1279,14 @@ fn history_recycle_distinguishes_file_success_from_history_save_failure() {
             "youtube",
             "completed",
         );
-        db.connection("test").unwrap().execute_batch("CREATE TRIGGER refuse_trash BEFORE UPDATE OF deleted_at ON download_records BEGIN SELECT RAISE(ABORT,'disk failure fixture'); END;").unwrap();
+        db.connection("test").unwrap().execute_batch("CREATE TRIGGER refuse_delete BEFORE DELETE ON download_records BEGIN SELECT RAISE(ABORT,'disk failure fixture'); END;").unwrap();
         let error = db
-            .recycle_download_record_file(id, |_| Ok(recycled))
+            .delete_download_record_and_file(id, |_, _| Ok(recycled))
             .unwrap_err();
         assert_eq!(
             error.code,
             if recycled {
-                "historyFileRecycledSaveFailed"
+                "historyFileDeletedSaveFailed"
             } else {
                 "saveFailed"
             }
@@ -1056,7 +1299,7 @@ fn history_recycle_distinguishes_file_success_from_history_save_failure() {
 }
 
 #[test]
-fn history_recycle_holds_writer_lock_before_calling_native_file_operation() {
+fn history_delete_record_file_holds_writer_lock_before_calling_native_file_operation() {
     let (dir, db) = database();
     let id = history_record(
         &db,
@@ -1068,7 +1311,7 @@ fn history_recycle_holds_writer_lock_before_calling_native_file_operation() {
     );
     let writer = Connection::open(dir.path().join("app.db")).unwrap();
     writer.busy_timeout(Duration::ZERO).unwrap();
-    db.recycle_download_record_file(id, |_| {
+    db.delete_download_record_and_file(id, |_, _| {
         let error = writer
             .execute(
                 "UPDATE download_records SET title='Changed' WHERE id=?1",
@@ -1082,12 +1325,13 @@ fn history_recycle_holds_writer_lock_before_calling_native_file_operation() {
         Ok(true)
     })
         .unwrap();
-    assert_eq!(db.get_download_record(id).unwrap().title, "Video");
+    assert_eq!(db.get_download_record(id).unwrap_err().code, "recordNotFound");
+    let another = history_record(&db, dir.path(), "another", "Video", "youtube", "completed");
     assert_eq!(
         writer
             .execute(
                 "UPDATE download_records SET title='After' WHERE id=?1",
-                [id]
+                [another]
             )
             .unwrap(),
         1
@@ -1095,7 +1339,7 @@ fn history_recycle_holds_writer_lock_before_calling_native_file_operation() {
 }
 
 #[test]
-fn history_recycle_commit_failure_reports_partial_success_and_rolls_back_history() {
+fn history_delete_record_file_commit_failure_reports_partial_success_and_rolls_back_history() {
     let (dir, db) = database();
     let id = history_record(
         &db,
@@ -1105,17 +1349,17 @@ fn history_recycle_commit_failure_reports_partial_success_and_rolls_back_history
         "youtube",
         "completed",
     );
-    // A deferred constraint lets UPDATE succeed and rejects only COMMIT.
+    // A deferred constraint lets DELETE succeed and rejects only COMMIT.
     db.connection("test").unwrap().execute_batch(
         "CREATE TABLE recycle_parent(id INTEGER PRIMARY KEY);
         CREATE TABLE recycle_child(parent_id INTEGER REFERENCES recycle_parent(id) DEFERRABLE INITIALLY DEFERRED);
-        CREATE TRIGGER reject_recycle_commit AFTER UPDATE OF deleted_at ON download_records
+        CREATE TRIGGER reject_recycle_commit AFTER DELETE ON download_records
         BEGIN INSERT INTO recycle_child(parent_id) VALUES (1); END;"
     ).unwrap();
     let error = db
-        .recycle_download_record_file(id, |_| Ok(true))
+        .delete_download_record_and_file(id, |_, _| Ok(true))
         .unwrap_err();
-    assert_eq!(error.code, "historyFileRecycledSaveFailed");
+    assert_eq!(error.code, "historyFileDeletedSaveFailed");
     let record = db.get_download_record(id).unwrap();
     assert!(record.deleted_at.is_none());
     assert!(record.file_deleted_at.is_none());
@@ -1156,7 +1400,7 @@ fn history_trash_migration_from_eight_preserves_history_and_old_null_markers() {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        11
+        15
     );
     assert_eq!(upgraded.connection("test").unwrap().query_row(
         "SELECT count(*) FROM pragma_index_list('download_records') WHERE partial=1 AND name IN ('idx_download_records_normal_started','idx_download_records_trash_started')", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
@@ -1237,7 +1481,7 @@ fn history_purged_ids_are_not_reused_across_connections_or_stale_file_confirmati
         );
         assert!(new_id > old_id, "purged {old_id} was reused as {new_id}");
         assert_eq!(
-            db.recycle_download_record_file(old_id, |_| panic!(
+            db.delete_download_record_and_file(old_id, |_, _| panic!(
                 "stale confirmation must not reach a new file"
             ))
                 .unwrap_err()

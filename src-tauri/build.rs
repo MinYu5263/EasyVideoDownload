@@ -16,6 +16,6 @@ fn main() {
         // Tauri already embeds the application's manifest in resource.lib.
         // Keep the linker-generated manifest for library test runners only;
         // generating another one for the binary duplicates resource ID 1.
-        println!("cargo:rustc-link-arg-bin=easyvideodownload=/MANIFEST:NO");
+        println!("cargo:rustc-link-arg-bin=EasyVideoDownload=/MANIFEST:NO");
     }
 }

@@ -144,6 +144,114 @@ mod tests {
         }
     }
     #[test]
+    fn platform_directories_preserve_legacy_and_reset_without_touching_page_results() {
+        let (dir, db) = fixture();
+        let old = dir.path().join("old").to_string_lossy().into_owned();
+        let mut page = super::super::page_states::DownloadPageState {
+            platform: "douyin".into(),
+            ..Default::default()
+        };
+        page.download_directory = old.clone();
+        page.directory_customized = true;
+        page.input_link = "https://www.douyin.com/video/123".into();
+        db.save_download_page_state(&page).unwrap();
+        assert_eq!(
+            db.platform_download_directory(CookiePlatform::Douyin)
+                .unwrap(),
+            Some(old)
+        );
+        assert_eq!(
+            db.platform_download_directory(CookiePlatform::Youtube)
+                .unwrap(),
+            None
+        );
+        let next = dir.path().join("new").to_string_lossy().into_owned();
+        db.save_platform_download_directory(CookiePlatform::Douyin, Some(&next))
+            .unwrap();
+        assert_eq!(
+            db.platform_download_directory(CookiePlatform::Douyin)
+                .unwrap(),
+            Some(next)
+        );
+        db.save_platform_download_directory(CookiePlatform::Douyin, None)
+            .unwrap();
+        assert_eq!(
+            db.platform_download_directory(CookiePlatform::Douyin)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.download_page_states().unwrap()[0].input_link,
+            page.input_link
+        );
+        assert_eq!(
+            db.download_page_states().unwrap()[0].download_directory,
+            page.download_directory
+        );
+        drop(db);
+        let db =
+            Database::open(&dir.path().join("app.db"), &dir.path().join("legacy.json")).unwrap();
+        assert_eq!(
+            db.platform_download_directory(CookiePlatform::Douyin)
+                .unwrap(),
+            None
+        );
+    }
+    #[test]
+    fn invalid_platform_directory_is_rejected_and_proxy_writes_do_not_change_it() {
+        let (dir, db) = fixture();
+        for invalid in ["relative", "", "bad\0path"] {
+            assert!(db
+                .save_platform_download_directory(CookiePlatform::Youtube, Some(invalid))
+                .is_err());
+        }
+        let path = dir.path().to_string_lossy().into_owned();
+        db.save_platform_download_directory(CookiePlatform::Youtube, Some(&path))
+            .unwrap();
+        db.save_platform_settings(CookiePlatform::Youtube, &PlatformSettings::default())
+            .unwrap();
+        assert_eq!(
+            db.platform_download_directory(CookiePlatform::Youtube)
+                .unwrap(),
+            Some(path)
+        );
+    }
+    #[test]
+    fn invalid_stored_directory_has_a_recoverable_error_and_explicit_reset_replaces_it() {
+        let (_dir, db) = fixture();
+        let mut page = super::super::page_states::DownloadPageState {
+            platform: "douyin".into(),
+            directory_customized: true,
+            ..Default::default()
+        };
+        for legacy in ["", "relative"] {
+            page.download_directory = legacy.into();
+            db.save_download_page_state(&page).unwrap();
+            assert_eq!(
+                db.platform_download_directory(CookiePlatform::Douyin)
+                    .unwrap_err()
+                    .code,
+                "invalidDownloadDirectory"
+            );
+        }
+        for malformed in ["{}", "42", "\"relative\""] {
+            db.connection("test").unwrap().execute("INSERT INTO app_settings(setting_key,value_json) VALUES('platform.douyin.downloadDirectory',?1) ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json", [malformed]).unwrap();
+            assert_eq!(
+                db.platform_download_directory(CookiePlatform::Douyin)
+                    .unwrap_err()
+                    .code,
+                "invalidDownloadDirectory"
+            );
+            db.save_platform_download_directory(CookiePlatform::Douyin, None)
+                .unwrap();
+            assert_eq!(
+                db.platform_download_directory(CookiePlatform::Douyin)
+                    .unwrap(),
+                None
+            );
+        }
+    }
+    #[test]
     fn platform_proxy_is_independent_and_restores_after_reopening() {
         let (dir, db) = fixture();
         db.save_proxy_settings(Some(&proxy())).unwrap();

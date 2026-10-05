@@ -699,7 +699,19 @@ pub async fn check_required_tool(
     request: RequiredToolRequest,
     state: tauri::State<'_, RequiredToolManager>,
 ) -> Result<CheckResult, RequiredToolError> {
-    check_tool(&request, &state).await
+    let result = check_tool(&request, &state).await;
+    log_check_result("toolCheckCompleted", request.tool_id, &result);
+    result
+}
+
+fn log_check_result(event: &str, tool: RequiredToolId, result: &Result<CheckResult, RequiredToolError>) {
+    let failure = match result {
+        Ok(check) => check.error.as_ref(),
+        Err(error) => Some(error)
+    };
+    let summary = serde_json::json!({"event":event, "tool":tool,
+        "code":failure.map(|error| &error.code), "success":failure.is_none()});
+    if failure.is_some() { log::warn!("{summary}"); } else { log::info!("{summary}"); }
 }
 
 async fn check_tool(

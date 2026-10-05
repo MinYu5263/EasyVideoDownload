@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CookiePlatform {
     Douyin,
@@ -120,9 +120,14 @@ pub async fn save_cookie_contents(
     state: tauri::State<'_, CookieStore>,
 ) -> Result<(), CookieError> {
     let store = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || store.save(platform, &contents))
+    let cleared = contents.is_empty();
+    let result = tauri::async_runtime::spawn_blocking(move || store.save(platform, &contents))
         .await
-        .map_err(|e| CookieError::new("saveFailed", e))?
+        .map_err(|e| CookieError::new("saveFailed", e)).and_then(|result| result);
+    let summary = serde_json::json!({"event":"cookieSaved", "platform":platform, "cleared":cleared,
+        "code":result.as_ref().err().map(|error| &error.code), "success":result.is_ok()});
+    if result.is_ok() { log::info!("{summary}"); } else { log::warn!("{summary}"); }
+    result
 }
 
 #[cfg(test)]

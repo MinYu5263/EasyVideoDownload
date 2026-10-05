@@ -92,6 +92,7 @@ async fn live_native_parser_and_download_verify_real_1080p() {
         &parsed,
         candidate,
         root.path(),
+        root.path(),
         &probe,
         &super::cancel::Cancellation::default(),
         |_, _| {},

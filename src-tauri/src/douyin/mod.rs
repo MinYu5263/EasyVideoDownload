@@ -1,11 +1,10 @@
 #[cfg(test)]
 mod tests;
 
-mod cancel;
+pub(crate) mod cancel;
 mod cookies;
-mod download;
-mod http;
-pub(crate) mod lab;
+pub(crate) mod download;
+pub(crate) mod http;
 mod parse;
 pub(crate) use parse::{normalize_link, parse_detail};
 use serde::Serialize;

@@ -11,8 +11,8 @@ interface HistoryActionBridge {
     writeClipboard: (text: string) => Promise<void>;
 }
 
-export interface RecycleFileResult {
-    fileRecycled: boolean
+export interface DeleteFileResult {
+    fileDeleted: boolean
 }
 
 export function createDownloadHistoryActions(bridge: HistoryActionBridge) {
@@ -73,7 +73,7 @@ export function createDownloadHistoryActions(bridge: HistoryActionBridge) {
         return perform(() => bridge.invoke("empty_download_record_trash"));
     }
 
-    async function removeAndFile(row: Pick<DownloadRecord, "id" | "status" | "deletedAt" | "outputPath">, downloading = false): Promise<RecycleFileResult | null> {
+    async function removeAndFile(row: Pick<DownloadRecord, "id" | "status" | "deletedAt" | "outputPath">, downloading = false): Promise<DeleteFileResult | null> {
         if (downloading) {
             error.value = {code: "historyBusy"};
             return null;
@@ -90,9 +90,9 @@ export function createDownloadHistoryActions(bridge: HistoryActionBridge) {
             error.value = {code: "historyFileUnavailable"};
             return null;
         }
-        let result: RecycleFileResult | null = null;
+        let result: DeleteFileResult | null = null;
         const ok = await perform(async () => {
-            result = await bridge.invoke<RecycleFileResult>("delete_download_record_and_file", {id: row.id});
+            result = await bridge.invoke<DeleteFileResult>("delete_download_record_and_file", {id: row.id});
         });
         return ok ? result : null;
     }

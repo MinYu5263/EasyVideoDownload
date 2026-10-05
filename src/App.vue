@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import {computed, defineAsyncComponent, onMounted, onUnmounted, ref} from "vue";
-import {ElButton, ElConfigProvider} from "element-plus";
+import {computed, nextTick, onMounted, onUnmounted, ref, watch} from "vue";
+import {ElConfigProvider} from "element-plus";
 import {useI18n} from "vue-i18n";
 import AppSidebar from "./components/AppSidebar.vue";
 import DownloadPage from "./components/DownloadPage.vue";
 import SettingsPage from "./components/SettingsPage.vue";
 import HistoryPage from "./components/HistoryPage.vue";
+import ContentMotion from "./components/ContentMotion.vue";
 import {createPageNavigation} from "./composables/usePageNavigation";
 import CloseWindowDialog from "./components/CloseWindowDialog.vue";
 import {elementPlusLocale} from "./i18n";
@@ -16,14 +17,16 @@ import {useAppAppearance} from "./composables/useAppAppearance";
 import {listen, type UnlistenFn} from "@tauri-apps/api/event";
 import {useDownloadHistory} from "./composables/useDownloadHistory";
 import {useDownloadTasks} from "./composables/useDownloadTasks";
-
-const DouyinLabPage = defineAsyncComponent(() => import("./components/DouyinLabPage.vue"));
+import {useFeedback} from "./composables/useFeedback";
+import {usePlatformDirectories} from "./composables/usePlatformDirectories";
+import {platformIds} from "./composables/videoPlatforms";
 
 const uiPreferences = useUiPreferences();
 const appearance = useAppAppearance();
 const appSettings = useAppSettings();
 const nativeError = ref<{ code: string; detail: string } | null>(null);
 let unlistenNativeError: UnlistenFn | undefined;
+let unlistenDownloadNotice: UnlistenFn | undefined;
 let disposed = false;
 onMounted(async () => {
   if (!appSettings.desktop) return;
@@ -36,33 +39,84 @@ onMounted(async () => {
   } catch (error) {
     nativeError.value = {code: "listenFailed", detail: String(error)};
   }
+  try {
+    const unlisten = await listen<{
+      requestId: string;
+      notice: { title: string; body: string; kind: "success" | "error"; detail: string | null };
+    }>("app-download-notice", ({payload}) => {
+      if (disposed) return;
+      const options = {detail: payload.notice.detail ?? undefined, key: `download-outcome:${payload.requestId}`};
+      if (payload.notice.kind === 'error') notifyDownloadFailure(t('download.errors.downloadFailed'), options);
+      else notify(payload.notice.body, 'success', {...options, downloadOutcome: 'completed'});
+    });
+    if (disposed) unlisten();
+    else unlistenDownloadNotice = unlisten;
+  } catch (error) {
+    nativeError.value = {code: "downloadNoticeListenFailed", detail: String(error)};
+  }
+  if (!disposed) await tasks.connect();
 });
 onUnmounted(() => {
   disposed = true;
   unlistenNativeError?.();
+  unlistenDownloadNotice?.();
 });
 
 const tasks = useDownloadTasks();
-onMounted(tasks.connect);
 onUnmounted(tasks.dispose);
 const historyPage = ref<InstanceType<typeof HistoryPage>>();
+const pageMotion = ref<InstanceType<typeof ContentMotion>>();
+let historyNavigation = 0;
 
-async function viewHistory(id: number) {
+async function viewHistory(id: number, trashed = false) {
   activePageId.value = "history";
-  await historyPage.value?.revealRecord(id);
+  const navigation = ++historyNavigation;
+  await nextTick();
+  await pageMotion.value?.whenIdle();
+  if (navigation !== historyNavigation || activePageId.value !== 'history') return;
+  await historyPage.value?.revealRecord(id, trashed);
 }
 
 const history = useDownloadHistory();
 const downloadBusy = ref(true);
 onMounted(history.refresh);
 onUnmounted(history.dispose);
-const {activePageId, labVisited} = createPageNavigation(uiPreferences);
+const {activePageId} = createPageNavigation(uiPreferences);
+watch(activePageId, () => {
+  historyNavigation++;
+}, {flush: 'sync'});
 
-async function retryPreferences() {
-  if (!uiPreferences.ready.value) await uiPreferences.load();
-  else await uiPreferences.update({...uiPreferences.draft});
-}
 const {t} = useI18n({useScope: "global"});
+const {watchError, notifyError, notify, notifyDownloadFailure} = useFeedback();
+watchError(uiPreferences.loadError, () => t('persistence.loadFailed'), () => ({key: 'preferences:load'}));
+watchError(uiPreferences.saveError, () => t('persistence.saveFailed'), () => ({key: 'preferences:save'}));
+watchError(tasks.error, error => t(error.code === 'cancelFailed' ? 'download.errors.cancelFailed' :
+    ['pauseFailed', 'resumeFailed'].includes(error.code) ? `tasks.${error.code}` : 'tasks.connectionFailed'), error => ({
+  key: 'tasks:service', downloadOutcome: error.code === 'resumeFailed' ? 'failed' : undefined,
+}));
+watchError(history.connectionError, () => t('history.listenFailed'), () => ({key: 'history:connection'}));
+watchError(() => appearance.error.value ? {
+  code: 'applyFailed',
+  detail: appearance.error.value
+} : null, () => t('settings.theme.applyFailed'), () => ({key: 'appearance'}));
+watchError(nativeError, error => t(`settings.nativeErrors.${error.code}`), () => ({key: 'native'}));
+watchError(appSettings.loadError, error => t(`settings.persistence.errors.${error.code}`), () => ({key: 'app-settings:load'}));
+watchError(appSettings.saveError, error => t(`settings.persistence.errors.${error.code}`), () => ({key: 'app-settings:save'}));
+const directories = usePlatformDirectories();
+for (const platform of platformIds) watchError(() => directories.error[platform], error => t(error.code === 'invalidDownloadDirectory' ? 'settings.platforms.invalidDirectory' : 'settings.platforms.directoryFailed'), () => ({
+  key: `directory:${platform}`,
+  title: t('download.configuration.title', {platform: t(`download.platforms.${platform}`)}),
+}));
+watch(tasks.tasks, (current, previous = {}) => {
+  for (const [id, task] of Object.entries(current)) if (task.storageError &&
+      JSON.stringify(task.storageError) !== JSON.stringify(previous[Number(id)]?.storageError)) {
+    notifyError(t('history.saveFailed'), {
+      key: `task-storage:${id}`,
+      title: task.record.title,
+      detail: task.storageError.detail
+    });
+  }
+}, {immediate: true});
 const activePage = computed(
     () => appPages.find((page) => page.id === activePageId.value) ?? appPages[0],
 );
@@ -77,42 +131,15 @@ const activePage = computed(
     <div class="app-shell">
       <AppSidebar v-model="activePageId"/>
 
-      <main id="main-content" class="app-main" tabindex="-1">
-        <header class="page-heading">
-          <h1 id="page-title">{{ t(activePage.labelKey) }}</h1>
-        </header>
-        <div v-if="uiPreferences.loadError.value || uiPreferences.saveError.value" class="persistence-error"
-             role="alert">
-          {{ t(uiPreferences.loadError.value ? 'persistence.loadFailed' : 'persistence.saveFailed') }}
-          <ElButton size="small" @click="retryPreferences">{{ t('persistence.retry') }}</ElButton>
-        </div>
-        <div v-if="tasks.error.value" class="persistence-error" role="alert">
-          {{ t('tasks.connectionFailed') }}
-          <ElButton size="small" @click="tasks.connect">{{ t('persistence.retry') }}</ElButton>
-        </div>
-        <div v-if="history.connectionError.value" class="persistence-error" role="alert">
-          {{ t('history.listenFailed') }}
-          <ElButton size="small" @click="history.refresh">{{ t('persistence.retry') }}</ElButton>
-        </div>
-        <div v-if="appearance.error.value" class="persistence-error" role="alert">
-          {{ t('settings.theme.applyFailed') }}
-          <ElButton size="small" @click="appearance.start(appSettings.settings.theme)">{{
-              t('persistence.retry')
-            }}
-          </ElButton>
-        </div>
-        <div v-if="nativeError" class="persistence-error" role="alert">
-          {{ t(`settings.nativeErrors.${nativeError.code}`) }}
-          <ElButton size="small" @click="nativeError = null">{{ t('download.command.close') }}</ElButton>
-        </div>
-
+      <main id="main-content" :aria-label="t(activePage.labelKey)" class="app-main" tabindex="-1">
+        <ContentMotion ref="pageMotion" :position="appPages.findIndex(page => page.id === activePage.id)"
+                       :view-key="activePage.id" axis="vertical">
         <DownloadPage v-show="activePage.id === 'download'" :active="activePage.id === 'download'"
                       @busy-change="downloadBusy = $event" @view-history="viewHistory"/>
         <SettingsPage v-show="activePage.id === 'settings'"/>
-        <DouyinLabPage v-if="labVisited" v-show="activePage.id === 'douyin-lab'"
-                       :active="activePage.id === 'douyin-lab'"/>
         <HistoryPage v-show="activePage.id === 'history'" ref="historyPage" :active="activePage.id === 'history'"
                      :downloading="downloadBusy"/>
+        </ContentMotion>
         <CloseWindowDialog/>
       </main>
     </div>
@@ -152,16 +179,11 @@ const activePage = computed(
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  padding-top: 30px;
+  padding-top: 16px;
 }
 
 .app-main:focus {
   outline: none;
-}
-
-.page-heading {
-  flex-shrink: 0;
-  margin: 0 var(--app-page-padding-x) 24px;
 }
 
 .page-scrollbar {
@@ -171,15 +193,6 @@ const activePage = computed(
 
 .page-scrollbar :deep(.page-content) {
   padding: 0 var(--app-page-padding-x) var(--app-page-padding-bottom);
-}
-
-.page-heading h1 {
-  margin: 0;
-  color: var(--app-text);
-  font-size: 24px;
-  font-weight: 650;
-  line-height: 1.4;
-  letter-spacing: -0.6px;
 }
 
 .page-placeholder {
@@ -225,7 +238,7 @@ const activePage = computed(
     --app-page-padding-x: 24px;
     --app-page-padding-bottom: 24px;
 
-    padding-top: 27px;
+    padding-top: 16px;
   }
 }
 </style>

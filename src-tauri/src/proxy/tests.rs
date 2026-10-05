@@ -16,6 +16,11 @@ fn proxy_addresses_are_normalized_with_remote_dns_for_socks() {
         ("https", "127.0.0.1", "https://127.0.0.1:7890"),
         ("socks5", "::1", "socks5h://[::1]:7890"),
         ("socks5", "[::1]", "socks5h://[::1]:7890"),
+        ("http", " LocalHost ", "http://localhost:7890"),
+        ("http", "255.255.255.255", "http://255.255.255.255:7890"),
+        ("http", "2001:db8::1", "http://[2001:db8::1]:7890"),
+        ("http", "代理.例子", "http://xn--mnq481g.xn--fsqu00a:7890"),
+        ("http", "Proxy.Example.com.", "http://proxy.example.com.:7890"),
     ] {
         let settings = ProxySettings {
             protocol: protocol.into(),
@@ -239,6 +244,16 @@ fn proxy_validation_rejects_urls_credentials_paths_and_invalid_ports() {
         "host name",
         "-bad.example",
         "host%20name",
+        "anything",
+        "a",
+        "12345",
+        "127.1",
+        "0x7f000001",
+        "0177.0.0.1",
+        "256.0.0.1",
+        "proxy..example.com",
+        "proxy.example-",
+        "proxy.123",
     ] {
         let settings = ProxySettings {
             protocol: "http".into(),

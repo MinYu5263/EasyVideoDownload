@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn two_slots_dispatch_fifo_and_cancelled_queue_never_starts() {
     let mut queue = tasks::scheduler::Scheduler::default();
+    queue.set_limit(2);
     assert_eq!(queue.enqueue("a".into()), vec!["a"]);
     assert_eq!(queue.enqueue("b".into()), vec!["b"]);
     assert!(queue.enqueue("c".into()).is_empty());
@@ -369,7 +370,15 @@ fn process_fixture() {
                 serde_json::json!({"filepath": path, "__real_download": true})
             );
         }
-        "controlled" => {
+        mode @ ("controlled" | "pausable") => {
+            if mode == "pausable" {
+                use std::io::Write;
+                println!(r#"__EVD_PLAN__{{"formats":[],"formatId":"video","size":10}}"#);
+                println!(
+                    r#"__EVD_PROGRESS__{{"formatId":"video","progress":{{"status":"downloading","downloaded_bytes":5,"total_bytes":10}}}}"#
+                );
+                std::io::stdout().flush().unwrap();
+            }
             let marker = path.with_extension("started");
             std::fs::write(marker, b"started").unwrap();
             let release = path.with_extension("release");

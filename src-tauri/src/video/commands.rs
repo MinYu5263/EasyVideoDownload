@@ -1,8 +1,13 @@
-use super::{error, normalize_link, VideoError};
+#[cfg(test)]
+use super::normalize_link;
+use super::{error, VideoError};
+#[cfg(test)]
 use crate::cookies::{CookiePlatform, CookieStore};
 use crate::proxy::ProxySettings;
 use crate::required_tools::{RequiredToolId, RequiredToolSettings};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+#[cfg(test)]
+use serde::Serialize;
 use std::path::Path;
 use tokio::process::Command;
 
@@ -121,18 +126,24 @@ pub(super) fn download_command(
     options: &DownloadCommandOptions,
     proxy: Option<&ProxySettings>,
 ) -> Result<Command, VideoError> {
+    download_command_with_temporary_directory(settings, url, cookie, options, proxy, None)
+}
+
+pub(super) fn download_command_with_temporary_directory(
+    settings: &RequiredToolSettings,
+    url: &str,
+    cookie: Option<&Path>,
+    options: &DownloadCommandOptions,
+    proxy: Option<&ProxySettings>,
+    temporary_directory: Option<&Path>,
+) -> Result<Command, VideoError> {
     if !Path::new(&options.directory).is_absolute() {
         return Err(error(
             "invalidDownloadDirectory",
             "Choose an absolute output directory",
         ));
     }
-    if options.format_id.is_empty()
-        || !options
-            .format_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_.-:".contains(c))
-    {
+    if !super::formats::valid_id(&options.format_id) {
         return Err(error("invalidDownloadOptions", "Invalid native format ID"));
     }
     if options
@@ -200,6 +211,17 @@ pub(super) fn download_command(
         .arg(&options.directory)
         // Different quality/codec choices must not reuse another format's file.
         .args(["--output", "%(title)s [%(id)s] [%(format_id)s].%(ext)s"]);
+    if let Some(directory) = temporary_directory {
+        if !directory.is_absolute() {
+            return Err(error(
+                "invalidDownloadDirectory",
+                "Temporary directory must be absolute",
+            ));
+        }
+        command
+            .arg("--paths")
+            .arg(format!("temp:{}", directory.display()));
+    }
     command.arg("--").arg(url);
     Ok(command)
 }
@@ -267,12 +289,14 @@ fn download_format_selector(options: &DownloadCommandOptions, source: &str) -> S
         .join("/")
 }
 
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 pub struct VideoCommand {
     pub(super) text: String,
     pub(super) shell: &'static str,
 }
 
+#[cfg(test)]
 pub(super) fn render_command(command: &Command, windows: bool) -> Result<VideoCommand, VideoError> {
     let command = command.as_std();
     let arguments = std::iter::once(command.get_program())
@@ -298,6 +322,7 @@ pub(super) fn render_command(command: &Command, windows: bool) -> Result<VideoCo
     })
 }
 
+#[cfg(test)]
 pub(super) fn command_preview(
     settings: &RequiredToolSettings,
     store: &CookieStore,
@@ -317,6 +342,7 @@ pub(super) fn command_preview(
     render_command(&command, cfg!(windows))
 }
 
+#[cfg(test)]
 pub(super) fn download_command_preview(
     settings: &RequiredToolSettings,
     store: &CookieStore,

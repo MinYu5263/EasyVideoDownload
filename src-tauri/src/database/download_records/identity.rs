@@ -1,6 +1,10 @@
 use std::{fs::File, path::Path};
 
 pub(crate) fn capture(path: &Path) -> Option<String> {
+    capture_checked(path).ok()
+}
+
+pub(crate) fn capture_checked(path: &Path) -> std::io::Result<String> {
     let mut options = std::fs::OpenOptions::new();
     #[cfg(windows)]
     {
@@ -16,7 +20,7 @@ pub(crate) fn capture(path: &Path) -> Option<String> {
     }
     #[cfg(not(windows))]
     options.read(true);
-    from_file(&options.open(path).ok()?).ok()
+    from_file(&options.open(path)?)
 }
 
 pub(crate) fn from_file(file: &File) -> std::io::Result<String> {

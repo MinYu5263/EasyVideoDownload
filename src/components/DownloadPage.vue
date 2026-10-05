@@ -1,54 +1,56 @@
 <script lang="ts" setup>
-import {computed, h, nextTick, onMounted, onUnmounted, ref, watch} from "vue";
+import {computed, nextTick, onMounted, onUnmounted, ref, watch} from "vue";
 import {
   ElButton,
   ElIcon,
   ElInput,
-  ElMessage,
-  ElMessageBox,
-  ElNotification,
-  ElOption,
+  ElTable,
+  ElTableColumn,
   ElScrollbar,
-  ElSelect,
   ElSkeleton,
   ElSkeletonItem,
   ElTooltip,
   type InputInstance,
   type NotificationHandle
 } from "element-plus";
-import {CloseBold, Download, FolderOpened, RefreshRight} from "@element-plus/icons-vue";
+import {CircleCheck, Clock, CloseBold, Download, InfoFilled, Loading, RefreshRight} from "@element-plus/icons-vue";
 import {invoke, isTauri} from "@tauri-apps/api/core";
 import {useI18n} from "vue-i18n";
-import PlatformSettingsPanel from "./PlatformSettingsPanel.vue";
-import CommandViewer from "./CommandViewer.vue";
+import PlatformSettings from "./PlatformSettings.vue";
+import DownloadProgressControl from "./DownloadProgressControl.vue";
 import SegmentedToolbar from "./SegmentedToolbar.vue";
-import {createVideoParser} from "../composables/useVideoParser";
-import {formatVideoSize} from "../composables/videoFormatDisplay";
-import {type DownloadCommandOptions} from "../composables/useVideoCommand";
+import ContentMotion from "./ContentMotion.vue";
+import {createVideoParser, type VideoFormat} from "../composables/useVideoParser";
+import {videoCodecLabel, videoQualityLabel} from "../composables/videoFormatTable";
+import {formatVideoBitrate, formatVideoSize} from "../composables/videoFormatDisplay";
 import {platformIds, type VideoPlatform} from "../composables/videoPlatforms";
 import {useDesktopActions} from "../composables/useDesktopActions";
 import {useCookieSettings} from "../composables/useCookieSettings";
 import {usePlatformSettings} from "../composables/usePlatformSettings";
+import {usePlatformDirectories} from "../composables/usePlatformDirectories";
 import {videoToolRevision} from "../composables/useRequiredTools";
 import {proxySettingsRevision} from "../composables/useProxySettings";
 import {useDownloadTasks} from "../composables/useDownloadTasks";
-import {useDownloadHistoryActions} from "../composables/downloadHistoryActions";
-import {createHistoryFileRecovery} from "../composables/useHistoryFileRecovery";
-import DownloadTaskList from "./DownloadTaskList.vue";
 import {createDownloadPageState} from "../composables/useDownloadPageState";
 import {useUiPreferences} from "../composables/useUiPreferences";
 import {useThumbnail} from "../composables/useThumbnail";
-import {createHistoryRedownload} from "../composables/useHistoryRedownload";
-import type {DownloadRecord} from "../composables/useDownloadHistory";
+import {taskIsActive} from "../composables/downloadTaskTypes";
+import {useFeedback} from "../composables/useFeedback";
+import {persistenceError, type PersistenceError} from "../composables/useUiPreferences";
 
 const props = defineProps<{ active: boolean }>();
-const emit = defineEmits<{ busyChange: [busy: boolean]; viewHistory: [id: number] }>();
+const emit = defineEmits<{ busyChange: [busy: boolean]; viewHistory: [id: number, trashed?: boolean] }>();
 const {t, te} = useI18n({useScope: "global"});
+const {notify, notifyError, notifyDownloadFailure, watchError} = useFeedback();
 const cookies = useCookieSettings();
 const platformSettings = usePlatformSettings();
+const directories = usePlatformDirectories();
 const desktop = useDesktopActions();
 const pagePersistence = createDownloadPageState({desktop: desktop.desktop, invoke});
 const uiPreferences = useUiPreferences();
+const configurationOpen = ref(false), configurationButton = ref<HTMLButtonElement>();
+const contentMotion = ref<InstanceType<typeof ContentMotion>>();
+let configurationVersion = 0;
 const initialized = ref(false);
 const parser = createVideoParser({
   desktop: isTauri(),
@@ -59,15 +61,13 @@ const parser = createVideoParser({
   },
   saveCookie: cookies.update,
   onChange: selected => {
-    if (initialized.value) void pagePersistence.save(parser.snapshot(selected)).then(saved => {
-      if (!saved) ElMessage({type: "error", message: t("persistence.saveFailed"), grouping: true});
-    });
+    if (initialized.value) void pagePersistence.save(parser.snapshot(selected));
   },
-  cacheThumbnail: async url => {
+  cacheThumbnail: async (url, platform) => {
     try {
-      return await invoke<string>("cache_video_thumbnail", {url});
-    } catch {
-      ElMessage({type: "error", message: t("persistence.thumbnailFailed"), grouping: true});
+      return await invoke<string>("cache_video_thumbnail", {url, platform});
+    } catch (error) {
+      notifyError(t("persistence.thumbnailFailed"), {detail: persistenceError(error).detail});
       return null;
     }
   },
@@ -82,64 +82,118 @@ const {
   resultLink,
   phase,
   error,
-  quality,
-  frameRate,
   busy: parserBusy,
-  qualities,
-  frameRates,
-  selectedFormat,
   pasting
 } = parser;
 const tasks = useDownloadTasks();
 const submitting = ref(false);
-const busy = computed(() => parserBusy.value || submitting.value || platformSettings.saving[platform.value] || !initialized.value || !uiPreferences.ready.value);
-const fileActions = useDownloadHistoryActions();
-const redownload = createHistoryRedownload({tasks});
-const recovery = createHistoryFileRecovery({
-  actions: fileActions, confirmRedownload: async () => {
-    try {
-      await ElMessageBox.confirm(t('tasks.missingMessage'), t('tasks.missingTitle'), {
-        confirmButtonText: t('history.prepare'),
-        cancelButtonText: t('history.cancel'),
-        type: 'warning'
-      });
-      return true;
-    } catch {
-      return false;
-    }
-  }, redownload: record => redownload.run(record)
-});
-const coverSource = useThumbnail(displayThumbnailCachePath, computed(() => displayVideo.value?.thumbnail ?? null), () => ElMessage({
-  type: "error",
-  message: t("persistence.thumbnailReadFailed"),
-  grouping: true
-}));
+const startingFormatId = ref<string | null>(null);
+const controllingRequests = ref(new Set<string>());
+const recordLoadError = ref<PersistenceError | null>(null);
+// Parse and download entry points await proxy saves without locking navigation.
+const navigationDisabled = computed(() => !initialized.value || !uiPreferences.ready.value || submitting.value);
+const pageBusy = computed(() => parserBusy.value || !initialized.value || !uiPreferences.ready.value);
+const busy = computed(() => pageBusy.value || submitting.value);
+const coverSource = useThumbnail(displayThumbnailCachePath, computed(() => displayVideo.value?.thumbnail ?? null), error => notifyError(t("persistence.thumbnailReadFailed"), {detail: error.detail}));
 const platformOptions = computed(() => platformIds.map(value => ({label: t(`download.platforms.${value}`), value})));
-const cookieOpen = ref(false);
-const cookieButton = ref<HTMLButtonElement>();
-const choosingDirectory = ref(false);
-const resettingDirectory = ref(false);
-watch(() => busy.value || choosingDirectory.value || resettingDirectory.value, value => emit('busyChange', value), {immediate: true});
+watch(navigationDisabled, value => emit('busyChange', value), {immediate: true});
+const downloadUnavailable = computed(() => pageBusy.value || !desktop.desktop || !video.value ||
+    !directories.ready[platform.value] || directories.working.value === platform.value || !directories.settings[platform.value].directory.trim());
+const downloadDisabled = computed(() => submitting.value || downloadUnavailable.value);
 
-function chooseQuality(value: string) {
-  parser.setQuality(value);
+const formatRows = computed(() => displayVideo.value?.formats ?? []);
+
+async function refreshFormatRecords() {
+  const selected = platform.value, id = video.value?.id;
+  if (!id) return;
+  try {
+    await tasks.connect();
+    await tasks.lookupFormats(selected, id);
+    if (platform.value === selected && video.value?.id === id) recordLoadError.value = null;
+  } catch (failure) {
+    if (platform.value === selected && video.value?.id === id) recordLoadError.value = persistenceError(failure);
+  }
 }
 
-function chooseFrameRate(value: string) {
-  parser.setFrameRate(value);
+watch([platform, () => video.value?.id, tasks.recordsRevision], () => {
+  recordLoadError.value = null;
+  void refreshFormatRecords();
+}, {immediate: true});
+
+function formatRecord(row: VideoFormat) {
+  return video.value ? tasks.recordForFormat(platform.value, video.value.id, row.formatId) : null;
+}
+
+function rowState(row: VideoFormat) {
+  if (startingFormatId.value === row.formatId) return 'submitting';
+  const record = formatRecord(row);
+  if (!record || record.deletedAt) return 'ready';
+  const task = tasks.taskFor(record.id);
+  if (task && task.record.requestId === record.requestId && taskIsActive(task.phase)) return task.phase;
+  if (record.status === 'completed' && (!record.outputPath || record.fileAvailability === 'missing')) return 'ready';
+  return record.status === 'running' ? 'downloading' : record.status;
+}
+
+function rowIcon(row: VideoFormat) {
+  const state = rowState(row);
+  return state === 'completed' ? CircleCheck : state === 'queued' ? Clock :
+      state === 'submitting' || taskIsActive(state) ? Loading :
+          ['failed', 'cancelled', 'interrupted'].includes(state) ? RefreshRight : Download;
+}
+
+function rowHint(row: VideoFormat) {
+  const state = rowState(row), record = formatRecord(row);
+  if (state === 'completed') return t('download.row.completed');
+  if (state === 'ready') return t('download.row.start');
+  if (state === 'submitting') return t('download.row.submitting');
+  const label = t(`tasks.phase.${state}`);
+  const task = record ? tasks.taskFor(record.id) : null;
+  if (state === 'paused' || state === 'downloading') {
+    const progress = task?.percent == null ? label : `${label} · ${Math.min(100, task.percent).toFixed(1)}%`;
+    return `${progress} · ${t(state === 'paused' ? 'tasks.resume' : 'tasks.pause')}`;
+  }
+  if (taskIsActive(state)) return task?.percent == null ? label : `${label} · ${Math.min(100, task.percent).toFixed(1)}%`;
+  return `${label} · ${t('download.row.retry')}`;
+}
+
+function rowDisabled(row: VideoFormat) {
+  const state = rowState(row);
+  if (state === 'downloading' || state === 'paused') {
+    const record = formatRecord(row);
+    return !record || (state === 'downloading' && !tasks.taskFor(record.id)) || controllingRequests.value.has(record.requestId);
+  }
+  return state === 'submitting' || taskIsActive(state) || (state === 'completed' ? busy.value : downloadDisabled.value);
+}
+
+function rowSubmissionLocked(row: VideoFormat) {
+  const state = rowState(row);
+  return submitting.value && !pageBusy.value && state !== 'submitting' && !taskIsActive(state)
+      && (state === 'completed' || !downloadUnavailable.value);
+}
+
+function rowPercent(row: VideoFormat) {
+  if (['submitting', 'queued', 'preparing'].includes(rowState(row))) return null;
+  const record = formatRecord(row);
+  return record ? tasks.taskFor(record.id)?.percent ?? null : null;
+}
+
+function selectFormatRow(row: VideoFormat) {
+  if (busy.value) return;
+  const record = formatRecord(row);
+  if (record) {
+    if (record.deletedAt) emit('viewHistory', record.id, true);
+    else emit('viewHistory', record.id);
+    return;
+  }
+  parser.selectFormat(row.formatId);
+}
+
+function formatRowClass({row}: { row: VideoFormat }) {
+  return row.formatId === displayFormat.value?.formatId ? 'selected-format-row' : '';
 }
 const coverFailed = ref(false);
 const videoLinkInput = ref<InputInstance>();
 let parseFailureNotification: NotificationHandle | undefined;
-const downloadOptions = computed<DownloadCommandOptions>(() => {
-  const extension = selectedFormat.value?.extension?.toLowerCase();
-  return {
-    directory: draft.value.directory,
-    formatId: selectedFormat.value?.formatId ?? "",
-    container: extension === "mp4" ? "mp4" : undefined,
-    cookieFallback: video.value?.cookieFallback ?? false,
-  };
-});
 const duration = computed(() => {
   if (displayVideo.value?.duration == null) return "";
   const seconds = Math.floor(displayVideo.value.duration);
@@ -153,79 +207,72 @@ function messageForError(failure: { code: string } | null, selected: VideoPlatfo
   if (failure?.code === "pageSaveFailed") return t("persistence.saveFailed");
   if (failure?.code === "historyCreateFailed") return t("history.createFailed");
   if (failure && te(`history.${failure.code}`)) return t(`history.${failure.code}`);
-  const known = ["invalidLink", "platformMismatch", "desktopOnly", "cookieSaveFailed", "cookieReadFailed", "cookieRequired", "youtubeReloadRequired", "toolMissing", "toolSettingsFailed", "proxySettingsFailed", "spawnFailed", "timeout", "readFailed", "outputTooLarge", "parseFailed", "invalidResult", "unsupportedVideo", "noFormats", "bridgeFailed", "commandUnavailable", "clipboardWriteFailed", "invalidDownloadDirectory", "invalidDownloadOptions", "ffmpegMissing", "denoMissing", "downloadFailed", "downloadResultMissing", "downloadDirectoryFailed", "defaultDirectoryFailed", "downloadTimeout", "downloadBusy", "cancelFailed"];
+  const known = ["invalidLink", "platformMismatch", "desktopOnly", "cookieSaveFailed", "cookieReadFailed", "cookieRequired", "youtubeReloadRequired", "toolMissing", "toolSettingsFailed", "proxySettingsFailed", "spawnFailed", "timeout", "readFailed", "outputTooLarge", "parseFailed", "invalidResult", "unsupportedVideo", "noFormats", "bridgeFailed", "clipboardWriteFailed", "invalidDownloadDirectory", "invalidDownloadOptions", "ffmpegMissing", "denoMissing", "downloadFailed", "downloadResultMissing", "downloadDirectoryFailed", "defaultDirectoryFailed", "downloadTimeout", "downloadBusy", "cancelFailed"];
+  if (selected === 'douyin' && failure && !known.includes(failure.code) && te(`download.douyinErrors.${failure.code}`)) return t(`download.douyinErrors.${failure.code}`);
   const code = failure && known.includes(failure.code) ? failure.code : "bridgeFailed";
   return t(`download.errors.${code}`, {platform: t(`download.platforms.${selected}`)});
 }
 
-function failureNotificationMessage(failure: {
+function notifyFailure(failure: {
   code: string;
   detail?: string
-} | null, selected: VideoPlatform = platform.value) {
-  const configureTools = failure && ["toolMissing", "ffmpegMissing", "denoMissing", "toolSettingsFailed", "spawnFailed"].includes(failure.code);
-  return h("div", [
-    h("p", messageForError(failure, selected)),
-    failure?.detail ? h("pre", failure.detail) : null,
-    configureTools ? h(ElButton, {
-      type: "primary", size: "small", class: "tool-settings-action", onClick: openToolSettings,
-    }, () => t("download.configureTools")) : null,
-  ]);
+}, title: string, selected: VideoPlatform, downloadFailure = false) {
+  if (downloadFailure) return notifyDownloadFailure(messageForError(failure, selected), {
+    detail: failure.detail,
+    key: 'download:operation'
+  });
+  return notifyError(messageForError(failure, selected), {
+    title, detail: failure.detail, key: 'download:operation',
+  });
 }
 
-async function startDownload() {
-  if (busy.value || choosingDirectory.value || resettingDirectory.value || !selectedFormat.value || !resultLink.value) return;
+async function startDownload(row: VideoFormat) {
+  if (rowDisabled(row)) return;
+  const record = formatRecord(row);
+  const state = rowState(row);
+  if (record && (state === 'downloading' || state === 'paused')) {
+    controllingRequests.value = new Set([...controllingRequests.value, record.requestId]);
+    try {
+      await (state === 'paused' ? tasks.resume(record.requestId) : tasks.pause(record.requestId));
+    } finally {
+      const next = new Set(controllingRequests.value);
+      next.delete(record.requestId);
+      controllingRequests.value = next;
+    }
+    return;
+  }
+  if (!resultLink.value) return;
+  if (rowState(row) === 'completed' && record) {
+    emit('viewHistory', record.id);
+    return;
+  }
+  if (!video.value?.formats.some(format => format.formatId === row.formatId)) return;
+  parser.selectFormat(row.formatId);
   closeParseFailureNotification();
   const selected = platform.value;
+  const captured = JSON.parse(JSON.stringify(parser.snapshot(selected)));
+  startingFormatId.value = row.formatId;
   submitting.value = true;
   try {
     if (!await platformSettings.whenIdle(selected)) throw {code: 'platformSettingsFailed'};
     if (!await pagePersistence.whenIdle(selected)) throw {code: 'pageSaveFailed'};
     if (!await cookies.whenIdle(selected)) throw {code: 'cookieSaveFailed'};
-    const snapshot = JSON.parse(JSON.stringify(parser.snapshot(selected)));
-    const request = {snapshot, restoreTrashed: false, redownload: true};
-    let result;
+    if (!await directories.whenIdle(selected)) throw {code: 'invalidDownloadDirectory'};
+    const snapshot = directories.applyToSnapshot(captured);
+    if (!await pagePersistence.save(snapshot) || !await pagePersistence.whenIdle(selected)) throw {code: 'pageSaveFailed'};
+    const request = {snapshot, restoreTrashed: false, redownload: false};
     try {
-      result = await tasks.submit(request);
+      await tasks.submit(request);
     } catch (failure) {
       if ((failure as { code: string })?.code !== 'recordTrashed') throw failure;
-      try {
-        await ElMessageBox.confirm(t('tasks.restoreMessage'), t('history.restore'), {
-          confirmButtonText: t('history.restore'),
-          cancelButtonText: t('history.cancel'),
-          type: 'warning'
-        });
-      } catch {
-        return;
-      }
-      result = await tasks.submit({...request, restoreTrashed: true});
+      await tasks.submit({...request, restoreTrashed: true});
     }
-    if (result.kind === 'existing') ElMessage.info(t('tasks.alreadyActive'));
   } catch (failure) {
-    parseFailureNotification = ElNotification.error({
-      title: t('download.transfer.failed'),
-      message: failureNotificationMessage(failure as { code: string; detail?: string }),
-      duration: 0,
-      customClass: 'parse-failure-notification'
-    });
+    parseFailureNotification = notifyFailure(persistenceError(failure), t('download.transfer.failed'), selected, true);
   } finally {
     submitting.value = false;
+    startingFormatId.value = null;
   }
-}
-
-async function taskAction(name: string, record: DownloadRecord) {
-  if (name === 'cancel') {
-    if (!await tasks.cancel(record.requestId)) ElMessage.error(t('download.errors.cancelFailed'));
-  } else if (name === 'prepare') await redownload.run(record);
-  else if (name === 'details') emit('viewHistory', record.id);
-  else if (name === 'openFile') {
-    await recovery.openFile(record);
-    await tasks.lookupRecord(record.platform, record.videoId);
-  } else if (name === 'openFolder') {
-    await recovery.openFolder(record);
-    await tasks.lookupRecord(record.platform, record.videoId);
-  } else if (name === 'copyLink') await fileActions.copyLink(record);
-  else if (name === 'openSource') await fileActions.openSource(record);
-  if (fileActions.error.value) ElMessage.error(t(`history.${fileActions.error.value.code}`));
 }
 
 let restoring = false;
@@ -234,7 +281,8 @@ async function restorePageState() {
   if (restoring) return;
   restoring = true;
   try {
-    const configurationRevision = `${videoToolRevision.value}:${proxySettingsRevision.value}`;
+    const toolRevision = videoToolRevision.value;
+    const proxyRevision = proxySettingsRevision.value;
     initialized.value = false;
     if (!await uiPreferences.load() || !await pagePersistence.load()) return;
     try {
@@ -245,14 +293,8 @@ async function restorePageState() {
     }
     parser.selectPlatform(uiPreferences.draft.downloadPlatform);
     initialized.value = true;
-    if (configurationRevision !== `${videoToolRevision.value}:${proxySettingsRevision.value}`) parser.resetAll();
-  if (!desktop.desktop) return;
-  try {
-    const directories = await invoke<Record<VideoPlatform, string>>("get_default_download_directories");
-    parser.applyDefaultDirectories(directories);
-  } catch {
-    ElMessage.error(t("download.errors.defaultDirectoryFailed"));
-  }
+    if (proxyRevision !== proxySettingsRevision.value) parser.resetAll();
+    else if (toolRevision !== videoToolRevision.value) parser.invalidateToolFormats();
   } finally {
     restoring = false;
   }
@@ -263,15 +305,18 @@ onMounted(() => {
   void platformSettings.loadProxy();
   platformIds.forEach(selected => {
     void platformSettings.load(selected);
+    void directories.load(selected);
   });
 });
 watch(uiPreferences.ready, ready => {
   if (ready && !initialized.value) void restorePageState();
 });
 
-async function retryPageSave() {
-  if (!await pagePersistence.whenIdle(platform.value)) ElMessage.error(t("persistence.saveFailed"));
-}
+watchError(pagePersistence.loadError, () => t('persistence.loadFailed'), () => ({key: 'download:load'}));
+for (const selected of platformIds) watchError(() => pagePersistence.saveErrors.value[selected], () => t('persistence.saveFailed'), () => ({
+  key: `download:save:${selected}`
+}));
+watchError(recordLoadError, () => t('history.loadFailed'), () => ({key: 'download:records'}));
 
 function closeParseFailureNotification() {
   parseFailureNotification?.close();
@@ -284,14 +329,14 @@ async function parseVideo() {
   const selected = platform.value;
   // Use this attempt's outcome so cached or cancelled errors cannot trigger a notification.
   const failure = await parser.parse();
-  if (!failure || parser.error.value !== failure) return;
-  parseFailureNotification = ElNotification.error({
-    title: t("download.empty.failed"),
-    message: failureNotificationMessage(failure, selected),
-    position: "top-right",
-    duration: 0,
-    customClass: "parse-failure-notification",
-  });
+  if (!failure) {
+    if (platform.value !== selected) return;
+    if (video.value?.cookieFallback) notify(t('download.result.cookieFallback'), 'warning', {key: 'download:cookie-fallback'});
+    return;
+  }
+  if (!parser.isCurrentError(selected, failure)) return;
+  parseFailureNotification = notifyFailure(failure,
+      `${t(`download.platforms.${selected}`)} · ${t('download.empty.failed')}`, selected);
 }
 
 function selectPlatform(value: VideoPlatform) {
@@ -299,72 +344,39 @@ function selectPlatform(value: VideoPlatform) {
   if (platform.value === value) void uiPreferences.update({downloadPlatform: value});
 }
 
-async function closeCookie() {
-  cookieOpen.value = false;
-  await nextTick();
-  cookieButton.value?.focus();
-}
-
-async function updateCookieContents(contents: string) {
-  const currentPlatform = platform.value;
-  const saved = await parser.updateCookie(contents);
-  if (!saved && cookies.saveError[currentPlatform]) {
-    ElMessage({type: "error", message: t("download.cookie.saveFailed"), grouping: true});
-  }
-}
-
 watch(() => props.active, active => {
   if (!active) {
-    cookieOpen.value = false;
     parser.cancelPaste();
-  }
-});
-watch(() => [cookieOpen.value, platform.value] as const, async ([open, currentPlatform]) => {
-  if (!open) return;
-  void platformSettings.load(currentPlatform);
-  void platformSettings.loadProxy();
-  if (!await cookies.load(currentPlatform)) {
-    const key = cookies.saveError[currentPlatform] ? "saveFailed" : "loadFailed";
-    ElMessage({type: "error", message: t(`download.cookie.${key}`), grouping: true});
-  }
-});
-watch(cookieOpen, async open => {
-  if (open) {
-    parser.cancelPaste();
-    await nextTick();
-    document.getElementById("platform-settings-title")?.focus();
+    configurationOpen.value = false;
   }
 });
 watch(displayVideo, () => {
   coverFailed.value = false;
 });
-watch(videoToolRevision, parser.resetAll);
+watch(videoToolRevision, parser.invalidateToolFormats);
 watch(proxySettingsRevision, parser.resetAll);
 watch(proxySettingsRevision, () => {
   void platformSettings.loadProxy();
 });
 
-async function openToolSettings() {
-  closeParseFailureNotification();
-  await navigateToToolSettings();
+async function openPlatformSettings() {
+  const version = ++configurationVersion;
+  configurationOpen.value = !configurationOpen.value;
+  parser.cancelPaste();
+  await nextTick();
+  await contentMotion.value?.whenIdle();
+  if (version !== configurationVersion || !props.active) return;
+  if (configurationOpen.value) document.getElementById('download-platform-settings')?.focus();
+  else configurationButton.value?.focus();
 }
 
-async function navigateToToolSettings() {
-  if (!await uiPreferences.update({
-    activePage: "settings",
-    settingsSection: "tools"
-  })) ElMessage.error(t("persistence.saveFailed"));
-}
-
-async function openProxySettings() {
-  if (!await uiPreferences.update({
-    activePage: "settings",
-    settingsSection: "proxy"
-  })) ElMessage.error(t("persistence.saveFailed"));
-}
-
-async function retryPlatformSettings() {
-  await Promise.all([platformSettings.load(platform.value), platformSettings.loadProxy()]);
+async function closePlatformSettings() {
+  const version = ++configurationVersion;
+  configurationOpen.value = false;
+  await nextTick();
+  await contentMotion.value?.whenIdle();
+  if (version !== configurationVersion || !props.active) return;
+  configurationButton.value?.focus();
 }
 
 async function pasteLink() {
@@ -373,36 +385,8 @@ async function pasteLink() {
       await nextTick();
       videoLinkInput.value?.focus();
     }
-  } catch {
-    ElMessage.error(t("download.link.clipboardReadFailed"));
-  }
-}
-
-async function chooseDirectory() {
-  if (busy.value || choosingDirectory.value || resettingDirectory.value || !desktop.desktop) return;
-  const selected = platform.value;
-  choosingDirectory.value = true;
-  try {
-    const directory = await desktop.chooseDirectory();
-    if (directory !== null && platform.value === selected && !busy.value) parser.setDirectory(directory);
-  } catch {
-    ElMessage.error(t("download.directoryFailed"));
-  } finally {
-    choosingDirectory.value = false;
-  }
-}
-
-async function resetDirectory() {
-  if (busy.value || choosingDirectory.value || resettingDirectory.value || !desktop.desktop) return;
-  const selected = platform.value;
-  resettingDirectory.value = true;
-  try {
-    const directories = await invoke<Record<VideoPlatform, string>>("get_default_download_directories");
-    if (platform.value === selected && !busy.value) parser.resetDirectory(directories[selected]);
-  } catch {
-    ElMessage.error(t("download.errors.defaultDirectoryFailed"));
-  } finally {
-    resettingDirectory.value = false;
+  } catch (error) {
+    notifyError(t("download.link.clipboardReadFailed"), {detail: persistenceError(error).detail});
   }
 }
 
@@ -415,48 +399,37 @@ onUnmounted(() => {
 <template>
   <div class="download-page">
     <div class="platform-toolbar">
-      <SegmentedToolbar :ariaLabel="t('download.choosePlatform')" :disabled="busy" :model-value="platform"
+      <SegmentedToolbar :ariaLabel="t('download.choosePlatform')" :disabled="navigationDisabled" :model-value="platform"
                         :options="platformOptions" @update:model-value="selectPlatform">
         <template #actions>
-          <button ref="cookieButton" :aria-expanded="cookieOpen"
-                  :aria-label="t('download.configuration.title', {platform: t(`download.platforms.${platform}`)})"
-                  :class="{active: cookieOpen}"
-                  :disabled="busy" aria-controls="cookie-inline-panel"
+          <button ref="configurationButton" :aria-expanded="configurationOpen"
+                  :aria-label="configurationOpen ? t('download.configuration.back') : t('download.configuration.title', {platform: t(`download.platforms.${platform}`)})" :class="{active: configurationOpen}"
+                  :disabled="navigationDisabled"
+                  aria-controls="download-platform-settings"
                   class="cookie-trigger"
                   type="button"
-                  @click="cookieOpen = !cookieOpen">
-            {{ t("download.configuration.configure") }}
+                  @click="openPlatformSettings">
+            {{ t(configurationOpen ? 'download.configuration.back' : 'download.configuration.configure') }}
           </button>
         </template>
       </SegmentedToolbar>
     </div>
 
-    <div v-if="pagePersistence.loadError.value" class="persistence-error" role="alert">
-      {{ t('persistence.loadFailed') }}
-      <ElButton size="small" @click="restorePageState">{{ t('persistence.retry') }}</ElButton>
-    </div>
-    <div v-if="pagePersistence.saveErrors.value[platform]" class="persistence-error" role="alert">
-      {{ t('persistence.saveFailed') }}
-      <ElButton size="small" @click="retryPageSave">{{ t('persistence.retry') }}</ElButton>
-    </div>
 
-
-    <ElScrollbar :aria-label="t('download.title')" :tabindex="0" class="download-scrollbar"
-                 height="100%" role="region" view-class="download-content">
-      <div v-if="cookieOpen" id="cookie-inline-panel" @keydown.esc="closeCookie">
-        <PlatformSettingsPanel :key="platform" :contents="cookies.contents[platform]"
-                               :cookie-disabled="!cookies.desktop || !cookies.ready[platform]"
-                               :load-error="platformSettings.loadError[platform] || platformSettings.proxyLoadError.value" :platform="platform"
-                               :proxy="platformSettings.proxy.value" :proxy-enabled="platformSettings.settings[platform].proxyEnabled"
-                               :save-error="platformSettings.saveError[platform]"
-                               :saving="platformSettings.saving[platform]"
-                               :settings-disabled="!platformSettings.desktop || !platformSettings.ready[platform] || (!platformSettings.proxyReady.value && !platformSettings.settings[platform].proxyEnabled)"
-                               @change="updateCookieContents" @close="closeCookie"
-                               @retry="retryPlatformSettings"
-                               @proxy-change="platformSettings.updateProxy(platform, $event)" @open-proxy="openProxySettings"/>
-      </div>
-
-      <div v-else class="download-card download-workflow">
+    <div class="download-content">
+      <ContentMotion ref="contentMotion" :active="props.active"
+                     :flip-key="configurationOpen"
+                     :position="platformIds.indexOf(platform) * 2 + (configurationOpen ? 1 : 0)" :view-key="`${platform}:${configurationOpen}`">
+        <div class="download-panel">
+          <ElScrollbar v-if="configurationOpen"
+                       :aria-label="t('download.configuration.title', {platform: t(`download.platforms.${platform}`)})"
+                       :tabindex="0" class="configuration-scrollbar" height="100%" role="region"
+                       view-class="configuration-content">
+            <PlatformSettings id="download-platform-settings" :platform="platform" tabindex="-1"
+                              @keydown.esc="closePlatformSettings"/>
+          </ElScrollbar>
+          <div v-else :aria-busy="parserBusy" :class="{'is-parsing': parserBusy}" :inert="parserBusy"
+               class="download-card download-workflow">
         <section :aria-label="t('download.link.title')" class="workflow-section link-card">
           <form @submit.prevent="parseVideo">
             <div class="link-row">
@@ -493,9 +466,7 @@ onUnmounted(() => {
 
         <section :aria-label="t('download.result.title')" class="workflow-section result-card">
           <div class="result-layout">
-            <div :aria-busy="phase === 'parsing'"
-                 :class="{'is-refreshing': Boolean(displayVideo) && phase === 'parsing'}"
-                 :inert="Boolean(displayVideo) && phase === 'parsing'" class="result-content">
+            <div class="result-content">
               <div class="result-media">
                 <ElSkeleton v-if="!displayVideo" :animated="phase === 'parsing'" :aria-busy="phase === 'parsing'"
                             :aria-label="t(phase === 'parsing' ? 'download.empty.parsing' : 'download.empty.waitingParse')"
@@ -526,7 +497,7 @@ onUnmounted(() => {
                           class="video-duration">{{ duration }}</span>
                   </div>
                   <div class="video-details">
-                    <h2 id="parsed-video-title">{{ displayVideo.title }}</h2>
+                    <h2 id="parsed-video-title" :title="displayVideo.title">{{ displayVideo.title }}</h2>
                     <div aria-live="polite" class="format-meta">
                       <span>{{
                           t('download.result.format')
@@ -543,82 +514,79 @@ onUnmounted(() => {
                 </div>
               </div>
               <div class="result-options">
-                <div class="format-fields">
-                  <div>
-                    <label class="field-label" for="video-quality">{{ t("download.result.quality") }}</label>
-                    <ElSelect id="video-quality" :disabled="busy" :model-value="quality"
-                              :no-data-text="t('download.result.noOptions')" placeholder=""
-                              @update:model-value="chooseQuality">
-                      <ElOption v-for="value in qualities" :key="value" :label="value + 'p'" :value="value"/>
-                    </ElSelect>
-                  </div>
-                  <div>
-                    <label class="field-label" for="video-frame-rate">{{ t("download.result.frameRate") }}</label>
-                    <ElSelect id="video-frame-rate" :disabled="busy" :model-value="frameRate"
-                              :no-data-text="t('download.result.noOptions')" placeholder=""
-                              @update:model-value="chooseFrameRate">
-                      <ElOption v-for="value in frameRates" :key="value" :label="value + ' fps'" :value="value"/>
-                    </ElSelect>
-                  </div>
-                </div>
+                <ElTable :data="formatRows" :empty-text="t('download.result.noOptions')" :row-class-name="formatRowClass"
+                         class="format-table"
+                         height="100%" row-key="formatId"
+                         @row-click="selectFormatRow">
+                  <ElTableColumn :label="t('download.row.action')" align="center" fixed="left" width="56">
+                    <template #default="{row}">
+                      <span class="format-download-control">
+                          <DownloadProgressControl
+                              v-if="taskIsActive(rowState(row as VideoFormat)) || rowState(row as VideoFormat) === 'submitting'"
+                              :disabled="rowDisabled(row as VideoFormat)"
+                              :label="`${rowHint(row as VideoFormat)} · ${row.formatId}`"
+                              :paused="rowState(row as VideoFormat) === 'paused'"
+                              :percent="rowPercent(row as VideoFormat)"
+                              @click="startDownload(row as VideoFormat)"/>
+                          <ElButton v-else :aria-label="`${rowHint(row as VideoFormat)} · ${row.formatId}`"
+                                    :class="{'is-submission-locked': rowSubmissionLocked(row as VideoFormat)}" :disabled="rowDisabled(row as VideoFormat)"
+                                    :icon="rowIcon(row as VideoFormat)"
+                                    :type="rowState(row as VideoFormat) === 'completed' ? 'success' : 'primary'"
+                                    circle
+                                    @click.stop="startDownload(row as VideoFormat)"/>
+                      </span>
+                    </template>
+                  </ElTableColumn>
+                  <ElTableColumn :label="t('download.result.quality')" min-width="90" show-overflow-tooltip>
+                    <template #default="{row}">{{
+                        videoQualityLabel(row as VideoFormat) ?? t('download.result.unknown')
+                      }}<span v-if="row.watermarked === true"
+                              class="watermark-label"> · {{ t('download.result.watermarked') }}</span></template>
+                  </ElTableColumn>
+                  <ElTableColumn :label="t('download.result.resolution')" min-width="104" show-overflow-tooltip>
+                    <template #default="{row}">
+                      {{ row.width && row.height ? `${row.width} × ${row.height}` : t('download.result.unknown') }}
+                    </template>
+                  </ElTableColumn>
+                  <ElTableColumn :label="t('download.result.frameRate')" min-width="90" show-overflow-tooltip>
+                    <template #default="{row}">{{
+                        row.fps == null ? t('download.result.unknown') : `${row.fps} fps`
+                      }}
+                    </template>
+                  </ElTableColumn>
+                  <ElTableColumn :label="t('download.result.codec')" min-width="90" show-overflow-tooltip>
+                    <template #default="{row}">{{
+                        videoCodecLabel(row as VideoFormat) ?? t('download.result.unknown')
+                      }}
+                    </template>
+                  </ElTableColumn>
+                  <ElTableColumn :label="t('download.result.bitrate')" min-width="90" show-overflow-tooltip>
+                    <template #default="{row}">{{
+                        formatVideoBitrate(row.bitrate) ?? t('download.result.unknown')
+                      }}
+                    </template>
+                  </ElTableColumn>
+                  <ElTableColumn min-width="90" show-overflow-tooltip>
+                    <template #header>
+                      <span class="size-column-header">{{ t('download.result.fileSize') }}<ElTooltip
+                          :content="t('download.result.tableSizeHint')" placement="top"><ElIcon :aria-label="t('download.result.tableSizeHint')"
+                                                                                                tabindex="0"><InfoFilled/></ElIcon></ElTooltip></span>
+                    </template>
+                    <template #default="{row}">{{
+                        formatVideoSize(row.sizeBytes) ?? t('download.result.unknown')
+                      }}
+                    </template>
+                  </ElTableColumn>
+                </ElTable>
               </div>
             </div>
-            <div class="parse-command">
-              <CommandViewer :active="active" :disabled="!desktop.desktop || !video" :input="resultLink"
-                             :platform="platform" :title="t('download.command.title')"/>
-            </div>
           </div>
-          <p v-if="displayVideo?.cookieFallback" class="format-note" role="status">{{
-              t('download.result.cookieFallback')
-            }}</p>
         </section>
 
-        <section :aria-label="t('download.title')" class="workflow-section download-dock">
-          <header class="progress-heading">
-            <div class="download-header-actions">
-              <ElButton
-                  :disabled="busy || choosingDirectory || resettingDirectory || !desktop.desktop || !selectedFormat || !draft.directory.trim()"
-                  :icon="Download"
-                  :loading="submitting"
-                        class="download-action-button" type="primary" @click="startDownload">
-                {{ t('download.actions.start') }}
-              </ElButton>
-
-            </div>
-            <CommandViewer :active="active" :disabled="!desktop.desktop || !selectedFormat"
-                           :download-options="downloadOptions"
-                           :input="resultLink" :platform="platform"
-                           :title="t('download.command.downloadTitle')"/>
-          </header>
-          <label class="field-label" for="save-directory">{{ t("download.saveDirectory") }}</label>
-          <div class="directory-row">
-            <ElInput id="save-directory" :disabled="busy || choosingDirectory || resettingDirectory"
-                     :model-value="draft.directory"
-                     :placeholder="t('download.directoryPlaceholder')" readonly>
-              <template #append>
-                <div class="directory-actions">
-                  <ElTooltip :content="t('download.chooseDirectory')" placement="top">
-                    <ElButton :aria-label="t('download.chooseDirectory')"
-                              :disabled="busy || choosingDirectory || resettingDirectory || !desktop.desktop"
-                              :icon="FolderOpened"
-                              :loading="choosingDirectory" native-type="button" @click="chooseDirectory"/>
-                  </ElTooltip>
-                  <ElTooltip :content="t('download.resetDirectory')" placement="top">
-                    <ElButton :aria-label="t('download.resetDirectory')"
-                              :disabled="busy || choosingDirectory || resettingDirectory || !desktop.desktop"
-                              :icon="RefreshRight"
-                              :loading="resettingDirectory" native-type="button" @click="resetDirectory"/>
-                  </ElTooltip>
-                </div>
-              </template>
-            </ElInput>
           </div>
-
-        </section>
-      </div>
-      <DownloadTaskList :active="active" :busy="fileActions.busy.value" :desktop="desktop.desktop"
-                        @action="taskAction"/>
-    </ElScrollbar>
+        </div>
+      </ContentMotion>
+    </div>
   </div>
 </template>
 
@@ -632,14 +600,43 @@ onUnmounted(() => {
   min-height: 0;
 }
 
-.download-scrollbar {
+.download-content {
+  display: flex;
   flex: 1;
   min-height: 0;
+  overflow: hidden;
 }
 
-.download-scrollbar :deep(.download-content) {
-  padding: 0 var(--app-page-padding-x) var(--app-page-padding-bottom);
+.download-panel {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  box-sizing: border-box;
+  padding: 0 var(--app-page-padding-x) 16px;
 }
+
+.configuration-scrollbar {
+  width: 100%;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius);
+  background: var(--app-surface);
+}
+
+.configuration-scrollbar :deep(.platform-settings) {
+  border: 0;
+  border-radius: 0;
+}
+
+.configuration-scrollbar :deep(.configuration-content) {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
 
 .platform-toolbar {
   flex-shrink: 0;
@@ -685,7 +682,11 @@ onUnmounted(() => {
 
 .download-workflow {
   display: flex;
+  flex: 1;
   flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .download-card {
@@ -698,6 +699,17 @@ onUnmounted(() => {
 .workflow-section + .workflow-section {
   margin-top: 20px;
   padding-top: 20px;
+}
+
+.link-card {
+  flex-shrink: 0;
+}
+
+.result-card {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
 }
 
 .link-row {
@@ -737,50 +749,32 @@ onUnmounted(() => {
   outline-offset: 1px;
 }
 
-:global(.parse-failure-notification) {
-  max-width: calc(100vw - 32px);
-}
 
-:global(.parse-failure-notification p) {
-  margin: 0;
-}
 
-:global(.parse-failure-notification .tool-settings-action) {
-  margin-top: 12px;
-}
 
-:global(.parse-failure-notification pre) {
-  margin: 6px 0 0;
-  max-height: 180px;
-  overflow: auto;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  font: inherit;
-}
 
 .result-layout {
-  position: relative;
-}
-
-.parse-command {
-  position: absolute;
-  top: 0;
-  right: 0;
   display: flex;
+  flex: 1;
+  min-height: 0;
 }
 
 .result-content {
-  display: grid;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
   gap: 20px;
 }
 
-.result-content.is-refreshing {
+.download-card.is-parsing {
   opacity: .55;
 }
 
 .result-media {
   min-height: 88px;
-  padding-right: 44px;
+  flex-shrink: 0;
 }
 
 .parsed-media {
@@ -839,6 +833,10 @@ onUnmounted(() => {
 
 .video-details h2 {
   margin: 0;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
   font-size: 17px;
   font-weight: 600;
   line-height: 1.5;
@@ -910,8 +908,84 @@ onUnmounted(() => {
 }
 
 .result-options {
-  display: grid;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
   gap: 10px;
+}
+
+.format-table {
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+}
+
+.format-table :deep(.cell) {
+  padding: 0 8px;
+}
+
+.format-table :deep(.el-table__row) {
+  cursor: pointer;
+}
+
+.format-table :deep(.selected-format-row) {
+  --el-table-tr-bg-color: var(--app-accent-soft);
+}
+
+.format-download-control {
+  display: inline-flex;
+  vertical-align: middle;
+}
+
+.format-download-control .el-button {
+  width: 32px;
+  height: 32px;
+}
+
+.format-download-control .el-button.is-submission-locked:disabled {
+  color: var(--el-button-text-color);
+  background-color: var(--el-button-bg-color);
+  border-color: var(--el-button-border-color);
+}
+
+.format-download-control .is-active-task :deep(.el-icon) {
+  animation: download-spin 1.2s linear infinite;
+}
+
+@keyframes download-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .format-download-control .is-active-task :deep(.el-icon) {
+    animation: none;
+  }
+}
+
+.size-column-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.watermark-label {
+  color: var(--app-text-secondary);
+  font-size: 11px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .format-meta,

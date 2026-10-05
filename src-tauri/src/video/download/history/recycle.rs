@@ -1,55 +1,8 @@
-use crate::database::{download_records::DownloadRecord, StorageError};
+use crate::database::StorageError;
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
 mod windows;
-
-pub(crate) fn recycle_output_file(record: &DownloadRecord) -> Result<bool, StorageError> {
-    let output = record
-        .output_path
-        .as_deref()
-        .filter(|path| !path.is_empty())
-        .ok_or_else(|| StorageError::new("historyFileUnsafe", "No recorded output file"))?;
-    let Some(path) = validated_output(
-        Path::new(output),
-        Path::new(
-            record
-                .successful_output
-                .as_ref()
-                .map(|s| s.directory.as_str())
-                .unwrap_or(&record.download_directory),
-        ),
-        record.file_size_bytes,
-    )?
-    else {
-        return Ok(false);
-    };
-    validate_identity(&path, record.output_identity.as_deref())?;
-    #[cfg(windows)]
-    {
-        windows::recycle(
-            path,
-            PathBuf::from(
-                record
-                    .successful_output
-                    .as_ref()
-                    .map(|s| s.directory.as_str())
-                    .unwrap_or(&record.download_directory),
-            ),
-            record.file_size_bytes,
-            record.output_identity.clone(),
-        )?;
-        Ok(true)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        Err(StorageError::new(
-            "historyRecycleFailed",
-            "System recycle-bin support is not available on this operating system",
-        ))
-    }
-}
 
 fn unsafe_file(detail: impl ToString) -> StorageError {
     StorageError::new("historyFileUnsafe", detail)
@@ -60,41 +13,10 @@ fn access_failure(error: std::io::Error) -> StorageError {
         if super::super::failure::file_is_occupied(&error) {
             "historyFileOccupied"
         } else {
-            "historyRecycleFailed"
+            "historyFileDeleteFailed"
         },
         error,
     )
-}
-
-fn validate_identity(path: &Path, expected: Option<&str>) -> Result<(), StorageError> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
-    let mut options = std::fs::OpenOptions::new();
-    #[cfg(windows)]
-    {
-        use ::windows::Win32::Storage::FileSystem::{
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE,
-        };
-        use std::os::windows::fs::OpenOptionsExt;
-        options
-            .access_mode(FILE_READ_ATTRIBUTES.0)
-            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
-    }
-    #[cfg(not(windows))]
-    options.read(true);
-    let file = options.open(path).map_err(access_failure)?;
-    let actual =
-        crate::database::download_records::identity::from_file(&file).map_err(access_failure)?;
-    if actual != expected {
-        return Err(StorageError::new(
-            "historyFileChanged",
-            "The completed file was replaced or modified",
-        ));
-    }
-    Ok(())
 }
 
 fn metadata(path: &Path) -> Result<Option<std::fs::Metadata>, StorageError> {
@@ -105,7 +27,7 @@ fn metadata(path: &Path) -> Result<Option<std::fs::Metadata>, StorageError> {
     }
 }
 
-fn reject_links(path: &Path) -> Result<(), StorageError> {
+pub(crate) fn reject_links(path: &Path) -> Result<(), StorageError> {
     let mut ancestor = PathBuf::new();
     for component in path.components() {
         if matches!(
@@ -121,7 +43,7 @@ fn reject_links(path: &Path) -> Result<(), StorageError> {
         if let Some(value) = metadata(&ancestor)? {
             if value.file_type().is_symlink() || is_reparse_point(&value) {
                 return Err(unsafe_file(
-                    "Symbolic links and reparse points cannot be recycled",
+                    "Symbolic links and reparse points cannot be deleted",
                 ));
             }
         }

@@ -25,12 +25,21 @@ async fn native_cache_reads_real_bytes_and_rejects_nonimages() {
             .unwrap();
         stream.write_all(&payload).unwrap();
     });
-    let path = store.cache(&url, None).await.unwrap();
+    let storage = Storage::new(&dir.path().join("app.db"), &dir.path().join("legacy.json"));
+    let closed_proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = closed_proxy.local_addr().unwrap().port();
+    drop(closed_proxy);
+    let database = storage.database().unwrap();
+    database.save_proxy_settings(Some(&ProxySettings { protocol: "http".into(), address: "127.0.0.1".into(), port })).unwrap();
+    // A saved global proxy must not affect a platform whose proxy switch is off.
+    let path = store.cache_for_platform(&url, crate::cookies::CookiePlatform::Youtube, &storage).await.unwrap();
     server.join().unwrap();
     assert!(path.starts_with("thumbnails/"));
     let actual = store.read(&path).unwrap();
     assert_eq!(actual.mime, "image/png");
     assert_eq!(actual.bytes, expected);
+    database.save_platform_settings(crate::cookies::CookiePlatform::Youtube, &crate::database::platform_settings::PlatformSettings { proxy_enabled: true }).unwrap();
+    assert!(store.cache_for_platform(&format!("{url}/uncached"), crate::cookies::CookiePlatform::Youtube, &storage).await.is_err());
     assert!(store.read("thumbnails/../outside").is_err());
     assert!(store.read("C:/Windows/file").is_err());
     assert!(image_mime(b"<html>not a cover</html>").is_none());

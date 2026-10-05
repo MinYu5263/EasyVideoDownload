@@ -11,15 +11,18 @@ import {
   Picture,
   RefreshRight,
   Remove,
+  VideoPause,
   Warning
 } from "@element-plus/icons-vue";
 import {useI18n} from "vue-i18n";
 import type {DownloadRecord} from "../composables/useDownloadHistory";
-import {historyDuration, historyOperationMessage, historySize} from "../composables/downloadHistoryDisplay";
+import {historyDuration, historySize} from "../composables/downloadHistoryDisplay";
 import DownloadTaskProgress from './DownloadTaskProgress.vue';
+import DownloadTaskPauseButton from './DownloadTaskPauseButton.vue';
 import {taskIsActive, type DownloadTaskSnapshot} from '../composables/downloadTaskTypes';
-import {historyFailureKey} from '../composables/downloadHistoryDisplay';
 import {useThumbnail} from "../composables/useThumbnail";
+import {videoQualityLabel} from '../composables/videoFormatTable';
+import {formatVideoSize} from '../composables/videoFormatDisplay';
 
 const props = withDefaults(defineProps<{
   record: DownloadRecord;
@@ -28,11 +31,11 @@ const props = withDefaults(defineProps<{
   busy: boolean;
   fileDeletionSupported?: boolean;
   task?: DownloadTaskSnapshot | null;
-  retryError?: { code: string; detail?: string } | null;
   mode?: 'history' | 'current'
-}>(), {fileDeletionSupported: false, task: null, retryError: null, mode: 'history'});
+}>(), {fileDeletionSupported: false, task: null, mode: 'history'});
 const emit = defineEmits<{ action: [name: string, record: DownloadRecord] }>();
-const {t, te} = useI18n({useScope: "global"});
+const {t} = useI18n({useScope: "global"});
+const recordedFormat = computed(() => props.record.formatSnapshot);
 const cache = computed(() => props.record.thumbnailCachePath), remote = computed(() => props.record.thumbnailUrl);
 const thumbnail = useThumbnail(cache, remote), fallback = ref(false), failed = ref(false);
 watch(thumbnail, () => {
@@ -48,16 +51,30 @@ function imageError() {
 const size = computed(() => historySize(props.record));
 const extension = computed(() => props.record.status === 'completed' ? props.record.outputExtension ?? props.record.formatExtension : props.record.formatExtension);
 const duration = computed(() => historyDuration(props.record.durationSeconds));
+const status = computed(() => props.task?.phase ?? props.record.status);
+const statusLabel = computed(() => t(props.task ? `tasks.phase.${props.task.phase}` : `history.status.${props.record.status}`));
+const speed = computed(() => {
+  const value = props.task?.speed;
+  return value != null && Number.isFinite(value) && value >= 0 ? `${formatVideoSize(Math.round(value)) ?? '0 B'}/s` : '—';
+});
+const eta = computed(() => {
+  const value = props.task?.eta;
+  return value != null && Number.isFinite(value) && value >= 0 ? Math.ceil(value) : null;
+});
 const icon = computed(() => ({
   queued: Clock,
   running: Clock,
+  preparing: Clock,
+  downloading: Clock,
+  paused: VideoPause,
+  processing: Clock,
+  cancelling: Clock,
   completed: CircleCheck,
   failed: CircleClose,
   cancelled: Remove,
   interrupted: Warning
-})[props.record.status]);
+})[status.value]);
 const active = computed(() => props.task ? taskIsActive(props.task.phase) : ['queued', 'running'].includes(props.record.status));
-const retryMessage = computed(() => historyOperationMessage(props.retryError, t, te, props.record?.platform ?? 'youtube'));
 const systemDisabled = computed(() => !props.desktop || props.busy);
 const trashed = computed(() => Boolean(props.record.deletedAt));
 const prepareDisabled = computed(() => systemDisabled.value);
@@ -69,7 +86,7 @@ function action(name: string) {
 }
 </script>
 <template>
-  <article :aria-label="`${record.title || t('history.unknownTitle')} · ${t(`history.status.${record.status}`)}`"
+  <article :aria-label="`${record.title || t('history.unknownTitle')} · ${statusLabel}`"
            class="history-card">
     <button :aria-label="`${t('history.details')} · ${record.title || t('history.unknownTitle')}`" class="card-main"
             type="button"
@@ -85,10 +102,11 @@ function action(name: string) {
         <span :title="record.title || t('history.unknownTitle')"
               class="title">{{ record.title || t('history.unknownTitle') }}</span>
         <span class="specs">
-          <span v-if="record.height">{{ record.height }}p</span><span v-if="record.fps">{{ record.fps }} FPS</span>
+          <span v-if="videoQualityLabel(recordedFormat)">{{ videoQualityLabel(recordedFormat) }}</span><span
+            v-if="record.fps">{{ record.fps }} fps</span>
           <span v-if="extension">{{ extension?.toUpperCase() }}</span>
           <span>{{
-              size.kind === 'unknown' ? t('history.unknownSize') : size.kind === 'stream' ? t('history.streamSize', {size: size.text}) : size.text
+              size.kind === 'unknown' ? t('history.unknownSize') : size.text
             }}</span>
         </span>
         <span class="source">{{ t(`download.platforms.${record.platform}`) }} · {{
@@ -97,13 +115,17 @@ function action(name: string) {
       </span>
     </button>
     <DownloadTaskProgress v-if="task" :task="task"/>
-    <p v-if="!retryMessage && (record.status==='failed'||record.status==='interrupted')" class="failure-reason">
-      {{ t(historyFailureKey(record)) }}</p>
-    <p v-if="retryMessage" class="failure-reason" role="alert">{{ retryMessage }}</p>
     <div class="record-controls">
-      <span :class="record.status" class="status"><ElIcon><component
-          :is="icon"/></ElIcon>{{ t(`history.status.${record.status}`) }}</span>
+      <div class="record-state">
+        <span :class="status" class="status" role="status"><ElIcon><component
+            :is="icon"/></ElIcon>{{ statusLabel }}</span>
+        <span v-if="task?.phase === 'downloading'" class="transfer-stats">{{ speed }}<template
+            v-if="eta !== null"> · {{ t('tasks.eta', {seconds: eta}) }}</template></span>
+      </div>
       <div class="actions">
+        <ElButton v-if="!trashed&&status==='cancelled'" :disabled="systemDisabled" size="small"
+                  @click="action('cancel')">{{ t('download.actions.cancel') }}
+        </ElButton>
         <ElButton v-if="trashed" :disabled="systemDisabled||active" size="small" type="primary"
                   @click="action('restore')">{{ t('history.restore') }}
         </ElButton>
@@ -113,14 +135,24 @@ function action(name: string) {
                                                                                                     @click="action('purge')">{{
             t('history.purge')
           }}</ElButton></span></ElTooltip>
-        <ElTooltip v-if="!trashed&&!active&&Boolean(record.outputPath)" :content="t('history.desktopOnly')"
+        <template v-if="!trashed&&!active&&record.status==='paused'">
+          <ElButton :disabled="systemDisabled" size="small" @click="action('resume')">{{ t('tasks.resume') }}</ElButton>
+          <ElButton :disabled="systemDisabled" size="small" @click="action('cancel')">{{
+              t('download.actions.cancel')
+            }}
+          </ElButton>
+        </template>
+        <ElTooltip v-else-if="!trashed&&!active&&Boolean(record.outputPath)" :content="t('history.desktopOnly')"
                    :disabled="desktop">
           <span><ElButton :disabled="systemDisabled || !record.outputPath" size="small" type="primary"
                           @click="action('openFile')">{{ t('history.openFile') }}</ElButton></span>
         </ElTooltip>
-        <ElButton v-else-if="!trashed&&active&&task" :disabled="systemDisabled||task.phase==='cancelling'" size="small"
+        <template v-else-if="!trashed&&active&&task">
+          <DownloadTaskPauseButton :disabled="systemDisabled" :task="task" size="small"/>
+          <ElButton :disabled="systemDisabled||task.phase==='cancelling'" size="small"
                   @click="action('cancel')">{{ t('download.actions.cancel') }}
-        </ElButton>
+          </ElButton>
+        </template>
         <ElButton v-else-if="!trashed&&active" size="small" @click="action('details')">{{
             t('history.details')
           }}
@@ -296,6 +328,21 @@ function action(name: string) {
   border-top: 1px solid var(--app-border);
 }
 
+.record-state {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  min-width: 0;
+}
+
+.transfer-stats {
+  color: var(--app-text-secondary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .status {
   display: flex;
   gap: 5px;
@@ -305,7 +352,7 @@ function action(name: string) {
   white-space: nowrap;
 }
 
-.status.queued, .status.running {
+.status.queued, .status.running, .status.preparing, .status.downloading, .status.processing, .status.cancelling {
   color: #268b7b;
 }
 
@@ -317,12 +364,12 @@ function action(name: string) {
   color: var(--el-color-danger);
 }
 
-.status.cancelled {
+.status.cancelled, .status.paused {
   color: var(--app-text-muted);
 }
 
 .status.interrupted {
-  color: #a57628;
+  color: var(--el-color-warning);
 }
 
 .actions {
@@ -343,11 +390,6 @@ function action(name: string) {
   font-size: 11px;
 }
 
-.failure-reason {
-  margin: 0;
-  font-size: 12px;
-  color: var(--el-color-danger);
-}
 
 button:focus-visible {
   outline: 2px solid var(--app-accent);

@@ -11,7 +11,7 @@ pub(super) const OCCUPIED_FILE_OS_ERRORS: [u32; 4] = {
     ]
 };
 
-pub(super) fn file_is_occupied(error: &std::io::Error) -> bool {
+pub(crate) fn file_is_occupied(error: &std::io::Error) -> bool {
     #[cfg(windows)]
     {
         error
@@ -27,7 +27,8 @@ pub(super) fn file_is_occupied(error: &std::io::Error) -> bool {
 
 pub(super) fn failure_kind(code: &str, detail: &str, stage: &str) -> &'static str {
     match code {
-        "toolMissing" | "toolSettingsFailed" | "ffmpegMissing" | "denoMissing" => return "tools",
+        "toolMissing" | "toolSettingsFailed" | "ffmpegMissing" | "ffprobeMissing"
+        | "denoMissing" => return "tools",
         "cookieReadFailed" | "cookieRequired" | "cookieSaveFailed" => return "cookie",
         "invalidDownloadDirectory"
         | "downloadDirectoryFailed"
@@ -38,11 +39,19 @@ pub(super) fn failure_kind(code: &str, detail: &str, stage: &str) -> &'static st
         | "historyFileChanged"
         | "historyFileUnsafe"
         | "historyFileInUse"
-        | "historyFileDeletedSaveFailed" => return "filesystem",
-        "invalidDownloadOptions" => return "format",
+        | "historyFileDeletedSaveFailed"
+        | "fileFailed" => return "filesystem",
+        "invalidDownloadOptions" | "formatExpired" | "formatMismatch" => return "format",
+        "verifyFailed" => return "processing",
         "downloadResultMissing" => return "output",
         "spawnFailed" | "readFailed" | "outputTooLarge" | "bridgeFailed" => return "execution",
-        "downloadTimeout" | "proxySettingsFailed" => return "network",
+        "downloadTimeout"
+        | "proxySettingsFailed"
+        | "networkFailed"
+        | "httpFailed"
+        | "signatureExpired"
+        | "timeout"
+        | "proxyFailed" => return "network",
         _ => {}
     }
     let text = detail.to_lowercase();
@@ -109,7 +118,7 @@ pub(super) fn failure_kind(code: &str, detail: &str, stage: &str) -> &'static st
     "unknown"
 }
 
-pub(super) fn sanitize_diagnostic(detail: &str) -> String {
+pub(crate) fn sanitize_diagnostic(detail: &str) -> String {
     let mut output = String::new();
     for line in detail.lines() {
         // Strip every URL (including signed media URLs and proxy credentials).
@@ -117,7 +126,7 @@ pub(super) fn sanitize_diagnostic(detail: &str) -> String {
         let mut remainder = line;
         loop {
             let lower = remainder.to_ascii_lowercase();
-            let start = ["https://", "http://", "socks5://", "socks4://"]
+            let start = ["https://", "http://", "socks5://", "socks5h://", "socks4://"]
                 .iter()
                 .filter_map(|prefix| lower.find(prefix))
                 .min();
@@ -137,12 +146,14 @@ pub(super) fn sanitize_diagnostic(detail: &str) -> String {
         if [
             "cookie",
             "authorization",
+            "authentication",
+            "signature",
             "password",
             "passwd",
             "token",
             "secret",
-            "proxy",
             "api_key",
+            "api-key",
             "apikey",
         ]
             .iter()
@@ -167,6 +178,16 @@ mod tests {
     use super::*;
     #[test]
     fn classifications_require_specific_evidence() {
+        for (code, kind) in [
+            ("ffprobeMissing", "tools"),
+            ("formatExpired", "format"),
+            ("formatMismatch", "format"),
+            ("fileFailed", "filesystem"),
+            ("verifyFailed", "processing"),
+            ("signatureExpired", "network"),
+        ] {
+            assert_eq!(failure_kind(code, "", "preparing"), kind);
+        }
         assert_eq!(
             failure_kind("downloadFailed", "HTTP Error 403: Forbidden", "downloading"),
             "unknown"
@@ -216,6 +237,13 @@ mod tests {
             assert!(!safe.contains(secret), "{safe}");
         }
         assert!(safe.contains("connection refused"));
+    }
+    #[test]
+    fn diagnostic_redacts_signatures_and_authentication_headers_without_hiding_network_errors() {
+        for text in ["signature=private", "X-Api-Key: private", "Authentication: private"] {
+            assert!(!sanitize_diagnostic(text).contains("private"));
+        }
+        assert_eq!(sanitize_diagnostic("proxy connection refused"), "proxy connection refused");
     }
 }
 

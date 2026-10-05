@@ -19,7 +19,9 @@ fn io_failure(error: std::io::Error) -> StorageError {
     }
 }
 
-fn validate(record: &DownloadRecord) -> Result<Option<PathBuf>, StorageError> {
+pub(crate) fn validated_record_output(
+    record: &DownloadRecord,
+) -> Result<Option<PathBuf>, StorageError> {
     let Some(output) = record.output_path.as_deref() else {
         return Ok(None);
     };
@@ -29,7 +31,7 @@ fn validate(record: &DownloadRecord) -> Result<Option<PathBuf>, StorageError> {
             "Only confirmed final output files may be deleted",
         ));
     }
-    super::recycle::validated_output(
+    let path = super::recycle::validated_output(
         Path::new(output),
         Path::new(
             record
@@ -39,21 +41,25 @@ fn validate(record: &DownloadRecord) -> Result<Option<PathBuf>, StorageError> {
                 .unwrap_or(&record.download_directory),
         ),
         record.file_size_bytes,
-    )
-        .map_err(|error| {
-            if error.code == "historyRecycleFailed" {
-                failure(error.detail)
-            } else {
-                error
-            }
-        })
+    )?;
+    if let (Some(path), Some(expected)) = (&path, &record.output_identity) {
+        let actual = crate::database::download_records::identity::capture_checked(path)
+            .map_err(io_failure)?;
+        if &actual != expected {
+            return Err(StorageError::new(
+                "historyFileChanged",
+                "The completed file was replaced or modified",
+            ));
+        }
+    }
+    Ok(path)
 }
 
 pub(crate) fn delete_output_file(
     record: &DownloadRecord,
     protected: &[String],
 ) -> Result<bool, StorageError> {
-    let Some(path) = validate(record)? else {
+    let Some(path) = validated_record_output(record)? else {
         return Ok(false);
     };
     // A later normal record may refer to this same output. Do not delete its video
@@ -81,21 +87,67 @@ pub(crate) fn delete_output_file(
     }
 }
 
+pub(crate) fn delete_download_files(
+    record: &DownloadRecord,
+    protected: &[String],
+) -> Result<bool, StorageError> {
+    let deleted = delete_download_fragments(record, protected)?;
+    Ok(delete_output_file(record, protected)? || deleted)
+}
+
+pub(crate) fn delete_download_fragments(
+    record: &DownloadRecord,
+    protected: &[String],
+) -> Result<bool, StorageError> {
+    for directory in &record.temporary_directories {
+        if let Ok(root) = Path::new(&directory.path).canonicalize() {
+            if protected.iter().any(|path| {
+                Path::new(path)
+                    .canonicalize()
+                    .is_ok_and(|path| path.starts_with(&root))
+            }) {
+                return Err(StorageError::new(
+                    "historyFileInUse",
+                    "A temporary directory contains another record's final output",
+                ));
+            }
+        }
+    }
+    let mut deleted = false;
+    for directory in &record.temporary_directories {
+        deleted |= crate::database::download_records::temporary::delete(directory)?;
+    }
+    Ok(deleted)
+}
+
 #[cfg(windows)]
 fn delete_windows(record: &DownloadRecord, path: &Path) -> Result<bool, StorageError> {
-    use std::os::windows::{ffi::OsStringExt, fs::OpenOptionsExt, io::AsRawHandle};
-    use windows::{
-        Wdk::Storage::FileSystem::{
-            FileDispositionInformation, NtSetInformationFile, FILE_DISPOSITION_INFORMATION,
+    delete_validated_file(
+        path,
+        record.file_size_bytes,
+        record.output_identity.as_deref(),
+        || {
+            if validated_record_output(record)?.as_deref() != Some(path) {
+                return Err(StorageError::new(
+                    "historyFileChanged",
+                    "The output moved or changed before deletion",
+                ));
+            }
+            Ok(())
         },
-        Win32::{
-            Foundation::{RtlNtStatusToDosError, HANDLE, STATUS_CANNOT_DELETE},
-            Storage::FileSystem::{
-                GetFinalPathNameByHandleW, DELETE, FILE_FLAG_OPEN_REPARSE_POINT,
-                FILE_READ_ATTRIBUTES, VOLUME_NAME_DOS,
-            },
-            System::IO::IO_STATUS_BLOCK,
-        },
+    )
+}
+
+#[cfg(windows)]
+pub(crate) fn delete_validated_file(
+    path: &Path,
+    size: Option<u64>,
+    identity: Option<&str>,
+    revalidate: impl FnOnce() -> Result<(), StorageError>,
+) -> Result<bool, StorageError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
     };
     // Hold the actual file exclusively: readers must not defer deletion until after restart.
     // Delete via this handle, never by launching a shell or resolving the name again.
@@ -110,26 +162,41 @@ fn delete_windows(record: &DownloadRecord, path: &Path) -> Result<bool, StorageE
         Err(error) => return Err(io_failure(error)),
     };
     let metadata = file.metadata().map_err(io_failure)?;
-    if !metadata.is_file()
-        || record
-        .file_size_bytes
-        .is_some_and(|size| metadata.len() != size)
-    {
+    if !metadata.is_file() || size.is_some_and(|size| metadata.len() != size) {
         return Err(StorageError::new(
             "historyFileChanged",
             "The opened output does not match the completed download",
         ));
     }
-    if let Some(expected) = &record.output_identity {
+    if let Some(expected) = identity {
         let actual =
             crate::database::download_records::identity::from_file(&file).map_err(io_failure)?;
-        if &actual != expected {
+        if actual != expected {
             return Err(StorageError::new(
                 "historyFileChanged",
                 "The completed file was replaced or modified",
             ));
         }
     }
+    if native_file_path(&file)? != path {
+        return Err(StorageError::new(
+            "historyFileChanged",
+            "The output moved or changed before deletion",
+        ));
+    }
+    revalidate()?;
+    delete_open_file(&file)?;
+    drop(file);
+    Ok(true)
+}
+
+#[cfg(windows)]
+pub(crate) fn native_file_path(file: &std::fs::File) -> Result<PathBuf, StorageError> {
+    use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_DOS},
+    };
     let handle = HANDLE(file.as_raw_handle());
     let needed = unsafe { GetFinalPathNameByHandleW(handle, &mut [], VOLUME_NAME_DOS) };
     if needed == 0 {
@@ -140,13 +207,24 @@ fn delete_windows(record: &DownloadRecord, path: &Path) -> Result<bool, StorageE
     if written == 0 || written as usize >= buffer.len() {
         return Err(io_failure(std::io::Error::last_os_error()));
     }
-    let actual = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..written as usize]));
-    if actual != path || validate(record)?.as_deref() != Some(path) {
-        return Err(StorageError::new(
-            "historyFileChanged",
-            "The output moved or changed before deletion",
-        ));
-    }
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(
+        &buffer[..written as usize],
+    )))
+}
+
+#[cfg(windows)]
+pub(crate) fn delete_open_file(file: &std::fs::File) -> Result<(), StorageError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::{
+        Wdk::Storage::FileSystem::{
+            FileDispositionInformation, NtSetInformationFile, FILE_DISPOSITION_INFORMATION,
+        },
+        Win32::{
+            Foundation::{RtlNtStatusToDosError, HANDLE, STATUS_CANNOT_DELETE},
+            System::IO::IO_STATUS_BLOCK,
+        },
+    };
+    let handle = HANDLE(file.as_raw_handle());
     let disposition = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
     let mut io_status = IO_STATUS_BLOCK::default();
     // Preserve NTSTATUS: Win32 collapses a live mapped view and permission denial
@@ -180,8 +258,7 @@ fn delete_windows(record: &DownloadRecord, path: &Path) -> Result<bool, StorageE
         }
         return Err(io_failure(detail));
     }
-    drop(file);
-    Ok(true)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -199,6 +276,8 @@ mod tests {
         let output = root.join("video.mp4");
         std::fs::write(&output, b"owned video!").unwrap();
         let record = DownloadRecord {
+            temporary_directories: Vec::new(),
+            format_snapshot: None,
             id: 1,
             request_id: "fixture".into(),
             platform: "youtube".into(),

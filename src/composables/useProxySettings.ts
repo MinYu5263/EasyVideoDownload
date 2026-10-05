@@ -33,6 +33,9 @@ interface ProxyBridge {
 
 export const proxySettingsRevision = ref(0);
 
+const ipv4Address = /^(?:(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)$/;
+const domainAddress = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\.?$/i;
+
 function normalizedAddress(input: string): string | undefined {
     const text = input.trim();
     if (!text || /[\s/\\?#@%]/.test(text)) return;
@@ -41,8 +44,14 @@ function normalizedAddress(input: string): string | undefined {
         const host = text.includes(":") && !text.startsWith("[") ? `[${text}]` : text;
         const url = new URL(`http://${host}`);
         const address = url.hostname;
-        if (!address.startsWith("[") && (address.replace(/\.$/, "").length > 253 ||
-            address.replace(/\.$/, "").split(".").some(label => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label)))) return;
+        if (!address.startsWith("[")) {
+            // URL parsing accepts numeric shortcuts such as 127.1 and 0x7f000001.
+            // Require the original input to be a complete decimal IPv4 address.
+            if (ipv4Address.test(address)) {
+                if (!ipv4Address.test(text)) return;
+            } else if (address.replace(/\.$/, "").length > 253 ||
+                (address !== "localhost" && address !== "localhost." && !domainAddress.test(address))) return;
+        }
         return address.startsWith("[") ? address.slice(1, -1) : address;
     } catch {
         return;
@@ -76,8 +85,7 @@ export function createProxySettings(bridge: ProxyBridge) {
     const testResult = ref<ProxyTestResult | null>(null);
     const candidate = computed(() => proxyCandidate(draft));
     const dirty = computed(() => candidate.value === undefined || configurationKey(candidate.value) !== configurationKey(saved.value));
-    const addressInvalid = computed(() => draft.address.trim() !== "" && !normalizedAddress(draft.address));
-    const portInvalid = computed(() => draft.port !== "" && (!/^\d+$/.test(draft.port) || Number(draft.port) < 1 || Number(draft.port) > 65535));
+    const addressInvalid = computed(() => (draft.address.trim() !== "" || draft.port !== "") && !normalizedAddress(draft.address));
     const canSave = computed(() => bridge.desktop && ready.value && !saving.value && !testing.value &&
         candidate.value !== undefined && (candidate.value !== null || dirty.value));
     const canTest = computed(() => bridge.desktop && ready.value && !testing.value && !saving.value && Boolean(candidate.value));
@@ -99,7 +107,7 @@ export function createProxySettings(bridge: ProxyBridge) {
         loading.value = true;
         ready.value = false;
         try {
-            const settings = bridge.desktop ? await bridge.invoke<ProxySettings | null>("get_proxy_settings") : null;
+            const settings = bridge.desktop ? await bridge.invoke<ProxySettings | null>("get_proxy_settings_for_editing") : null;
             if (disposed) return;
             saved.value = settings;
             Object.assign(draft, settings ? {...settings, port: String(settings.port)} : {
@@ -165,7 +173,7 @@ export function createProxySettings(bridge: ProxyBridge) {
     }
 
     return {
-        desktop: bridge.desktop, draft, saved, ready, loading, saving, testing, dirty, addressInvalid, portInvalid,
+        desktop: bridge.desktop, draft, saved, ready, loading, saving, testing, dirty, addressInvalid,
         canSave, canTest, proxyAddress, loadError, saveError, testError, testResult, load, save, testConnection, dispose
     };
 }

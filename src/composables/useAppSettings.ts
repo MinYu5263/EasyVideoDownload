@@ -4,13 +4,18 @@ import {invoke, isTauri} from "@tauri-apps/api/core";
 export type AppLocale = "zh-CN" | "en";
 export type AppTheme = "system" | "light" | "dark";
 export type CloseAction = "ask" | "tray" | "exit";
+export type CloseBackgroundMode = "tray" | "window";
 
 export interface AppSettings {
     locale: AppLocale;
     theme: AppTheme;
     notifyOnCompletion: boolean;
-    notifyOnFailure: boolean;
     closeAction: CloseAction;
+    maxConcurrentDownloads: number;
+}
+
+interface AppSettingsResponse extends AppSettings {
+    closeBackgroundMode?: CloseBackgroundMode;
 }
 
 interface SettingsError {
@@ -30,10 +35,10 @@ function bridgeError(error: unknown): SettingsError {
 
 export function createAppSettings(bridge: SettingsBridge) {
     const settings = reactive<AppSettings>({
-        locale: "en", theme: "system", notifyOnCompletion: false,
-        notifyOnFailure: true, closeAction: "ask",
+        locale: "en", theme: "system", notifyOnCompletion: true, closeAction: "ask", maxConcurrentDownloads: 3,
     });
     const draft = reactive<AppSettings>({...settings});
+    const closeBackgroundMode = ref<CloseBackgroundMode>("tray");
     const ready = ref(false);
     const loading = ref(false);
     const saving = ref(false);
@@ -57,7 +62,11 @@ export function createAppSettings(bridge: SettingsBridge) {
         refreshDraft();
         try {
             if (bridge.desktop) {
-                const saved = await bridge.invoke<AppSettings>("get_app_settings", {initialLocale});
+                const {
+                    closeBackgroundMode: mode,
+                    ...saved
+                } = await bridge.invoke<AppSettingsResponse>("get_app_settings", {initialLocale});
+                closeBackgroundMode.value = mode ?? "tray";
                 Object.assign(settings, saved);
             }
             loadError.value = null;
@@ -80,9 +89,11 @@ export function createAppSettings(bridge: SettingsBridge) {
             try {
                 // Build from the last committed settings, including preceding queued changes.
                 const next = {...settings, ...queuedPatch};
-                const saved = bridge.desktop
-                    ? await bridge.invoke<AppSettings>("save_app_settings", {settings: next})
+                const response = bridge.desktop
+                    ? await bridge.invoke<AppSettingsResponse>("save_app_settings", {settings: next})
                     : next;
+                const {closeBackgroundMode: mode, ...saved} = response as AppSettingsResponse;
+                if (mode) closeBackgroundMode.value = mode;
                 Object.assign(settings, saved);
                 saveError.value = null;
                 hasSaved.value = bridge.desktop;
@@ -104,6 +115,7 @@ export function createAppSettings(bridge: SettingsBridge) {
 
     return {
         desktop: bridge.desktop,
+        closeBackgroundMode,
         settings,
         draft,
         ready,

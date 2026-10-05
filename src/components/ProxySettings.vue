@@ -1,8 +1,9 @@
 <script lang="ts" setup>
-import {computed} from "vue";
-import {ElAlert, ElButton, ElInput, ElOption, ElSelect} from "element-plus";
+import {ref, watch} from "vue";
+import {ElButton, ElInput, ElOption, ElSelect} from "element-plus";
 import {useI18n} from "vue-i18n";
 import {useProxySettings} from "../composables/useProxySettings";
+import {useFeedback} from "../composables/useFeedback";
 
 const {t} = useI18n({useScope: "global"});
 const protocols = [
@@ -11,14 +12,47 @@ const protocols = [
   {value: "socks5", label: "SOCKS5"},
 ] as const;
 const {
-  desktop, draft, saved, ready, loading, saving, testing, dirty, addressInvalid, portInvalid, canSave, canTest,
+  desktop, draft, ready, loading, saving, testing, addressInvalid, canSave, canTest,
   proxyAddress, loadError, saveError, testError, testResult, save, testConnection, load
 } = useProxySettings();
-const failures = computed(() => [
-  {error: loadError.value, title: "settings.proxy.loadFailedTitle"},
-  {error: saveError.value, title: "settings.proxy.saveFailedTitle"},
-  {error: testError.value, title: "settings.proxy.testFailedTitle"},
-].flatMap(item => item.error ? [{error: item.error, title: item.title}] : []));
+const addressErrorVisible = ref(false);
+watch(() => draft.address, () => {
+  addressErrorVisible.value = false;
+}, {flush: "sync"});
+watch(addressInvalid, invalid => {
+  if (!invalid) addressErrorVisible.value = false;
+}, {flush: "sync"});
+
+function validateAddress() {
+  addressErrorVisible.value = addressInvalid.value;
+}
+
+function updatePort(value: string) {
+  if (value === "" || (/^\d{1,5}$/.test(value) && Number(value) >= 1 && Number(value) <= 65535)) draft.port = value;
+}
+
+const {watchError, inform} = useFeedback();
+watchError(loadError, error => errorMessage(error.code), () => ({
+  key: 'proxy:load',
+  title: t('settings.proxy.loadFailedTitle')
+}));
+watchError(saveError, error => errorMessage(error.code), () => ({
+  key: 'proxy:save',
+  title: t('settings.proxy.saveFailedTitle')
+}));
+watchError(testError, error => errorMessage(error.code), () => ({
+  key: 'proxy:test',
+  title: t('settings.proxy.testFailedTitle')
+}));
+watch(testing, (value, previous) => {
+  if (!value && previous && testResult.value) inform(t('settings.proxy.testSuccessDetails', {
+    target: testResult.value.target, elapsed: testResult.value.elapsedMs
+  }));
+});
+
+async function saveProxy() {
+  if (await save()) inform(t('settings.proxy.saved'));
+}
 
 function errorMessage(code: string) {
   const known = ["loadFailed", "saveFailed", "invalidSettings", "bridgeFailed", "timeout", "connectionRefused",
@@ -28,80 +62,61 @@ function errorMessage(code: string) {
 </script>
 
 <template>
-  <section :aria-busy="loading || saving || testing" :aria-label="t('settings.proxy.title')"
+  <section v-loading="testing" :aria-busy="loading || saving || testing" :aria-label="t('settings.proxy.title')"
+           :inert="testing"
            class="proxy-settings-card">
     <div class="proxy-fields">
       <div class="proxy-field">
         <label for="proxy-protocol">{{ t("settings.proxy.protocol") }}</label>
         <ElSelect id="proxy-protocol" v-model="draft.protocol" :aria-label="t('settings.proxy.protocol')"
-                  :disabled="!ready"
-                  aria-describedby="proxy-protocol-hint">
+                  :aria-describedby="draft.protocol === 'socks5' ? 'proxy-protocol-hint' : undefined"
+                  :disabled="!ready || saving || testing">
           <ElOption v-for="protocol in protocols" :key="protocol.value" :label="protocol.label"
                     :value="protocol.value"/>
         </ElSelect>
-        <p id="proxy-protocol-hint" class="field-hint">
-          {{ t(draft.protocol === 'socks5' ? "settings.proxy.socksHint" : "settings.proxy.protocolHint") }}
+        <p v-if="draft.protocol === 'socks5'" id="proxy-protocol-hint" class="field-hint">
+          {{ t("settings.proxy.socksHint") }}
         </p>
       </div>
 
-      <div :class="{'is-invalid': addressInvalid}" class="proxy-field">
+      <div :class="{'is-invalid': addressErrorVisible}" class="proxy-field">
         <label for="proxy-address">{{ t("settings.proxy.address") }}</label>
-        <ElInput id="proxy-address" v-model="draft.address" :aria-invalid="addressInvalid" :aria-label="t('settings.proxy.address')"
-                 :disabled="!ready"
-                 :placeholder="t('settings.proxy.addressPlaceholder')" aria-describedby="proxy-address-hint"
-                 autocomplete="off" clearable spellcheck="false"/>
-        <p id="proxy-address-hint" :role="addressInvalid ? 'alert' : undefined" class="field-hint">
-          {{ t(addressInvalid ? "settings.proxy.addressInvalid" : "settings.proxy.addressHint") }}
-        </p>
+        <ElInput id="proxy-address" v-model="draft.address" :aria-describedby="addressErrorVisible ? 'proxy-address-hint' : undefined"
+                 :aria-invalid="addressErrorVisible"
+                 :aria-label="t('settings.proxy.address')"
+                 :disabled="!ready || saving || testing"
+                 :placeholder="t('settings.proxy.addressPlaceholder')"
+                 autocomplete="off" clearable spellcheck="false" @blur="validateAddress"/>
       </div>
 
-      <div :class="{'is-invalid': portInvalid}" class="proxy-field">
+      <div class="proxy-field">
         <label for="proxy-port">{{ t("settings.proxy.port") }}</label>
-        <ElInput id="proxy-port" v-model="draft.port" :aria-invalid="portInvalid" :aria-label="t('settings.proxy.port')"
-                 :disabled="!ready"
-                 :placeholder="t('settings.proxy.portPlaceholder')" aria-describedby="proxy-port-hint"
-                 autocomplete="off" inputmode="numeric" maxlength="5"/>
-        <p id="proxy-port-hint" :role="portInvalid ? 'alert' : undefined" class="field-hint">
-          {{ t(portInvalid ? "settings.proxy.portInvalid" : "settings.proxy.portHint") }}
-        </p>
+        <ElInput id="proxy-port" :aria-label="t('settings.proxy.port')" :disabled="!ready || saving || testing"
+                 :model-value="draft.port"
+                 :placeholder="t('settings.proxy.portPlaceholder')"
+                 autocomplete="off" inputmode="numeric" @update:model-value="updatePort"/>
       </div>
     </div>
 
-    <div class="proxy-preview">
+    <div :class="{'is-invalid': addressErrorVisible}" class="proxy-preview">
       <span id="proxy-preview-label">{{ t("settings.proxy.addressPreview") }}</span>
-      <div aria-labelledby="proxy-preview-label" aria-live="polite" class="proxy-preview-value" role="status">
-        <code v-if="proxyAddress">{{ proxyAddress }}</code>
+      <div :title="addressErrorVisible ? t('settings.proxy.addressInvalid') : proxyAddress || undefined"
+           aria-labelledby="proxy-preview-label" aria-live="polite" class="proxy-preview-value" role="status">
+        <span v-if="addressErrorVisible" id="proxy-address-hint">{{ t("settings.proxy.addressInvalid") }}</span>
+        <code v-else-if="proxyAddress">{{ proxyAddress }}</code>
         <span v-else class="preview-placeholder">{{ t("settings.proxy.previewPlaceholder") }}</span>
       </div>
     </div>
 
     <p v-if="!desktop" class="proxy-notice">{{ t("settings.proxy.desktopOnly") }}</p>
-    <p v-if="testing" class="proxy-notice" role="status">
-      {{ t(saving ? "settings.proxy.saving" : "settings.proxy.testing") }}</p>
-    <ElAlert v-else-if="testResult" :closable="false" :description="t('settings.proxy.testSuccessDetails', {target: testResult.target, elapsed: testResult.elapsedMs})" :title="t(!dirty && !saveError ? 'settings.proxy.testSuccessSaved' : 'settings.proxy.testSuccess')" class="proxy-alert" role="status"
-             show-icon
-             type="success"/>
-    <template v-for="({error, title}, index) in failures" :key="index">
-      <ElAlert :closable="false" :description="errorMessage(error.code)" :title="t(title)"
-               class="proxy-alert" show-icon type="error"/>
-      <details v-if="error.detail" class="proxy-error-details">
-        <summary>{{ t("settings.requiredTools.errorDetails") }}</summary>
-        <p>{{ error.detail }}</p>
-      </details>
-    </template>
 
     <footer class="proxy-actions">
-      <span v-if="desktop && ready" class="proxy-save-status" role="status">
-        {{
-          t(saving ? 'settings.proxy.saving' : dirty ? 'settings.proxy.unsaved' : saved ? 'settings.proxy.saved' : 'settings.proxy.disabled')
-        }}
-      </span>
       <ElButton v-if="loadError" :loading="loading" @click="load">{{ t("settings.proxy.retryLoad") }}</ElButton>
       <ElButton :disabled="!canTest" :loading="testing" @click="testConnection">{{
           t("settings.proxy.testConnection")
         }}
       </ElButton>
-      <ElButton :disabled="!canSave" :loading="saving" type="primary" @click="save">{{
+      <ElButton :disabled="!canSave" :loading="saving" type="primary" @click="saveProxy">{{
           t("settings.proxy.save")
         }}
       </ElButton>
@@ -116,6 +131,11 @@ function errorMessage(code: string) {
   border: 1px solid var(--app-border);
   border-radius: var(--app-radius);
   background: var(--app-surface);
+}
+
+.proxy-settings-card :deep(.el-loading-mask) {
+  border-radius: inherit;
+  background: var(--el-mask-color, rgba(255, 255, 255, .8));
 }
 
 .proxy-fields {
@@ -144,10 +164,6 @@ function errorMessage(code: string) {
   box-shadow: 0 0 0 1px var(--app-danger) inset;
 }
 
-.proxy-field.is-invalid .field-hint {
-  color: var(--app-danger);
-}
-
 .field-hint {
   margin: 8px 0 0;
   color: var(--app-text-secondary);
@@ -157,8 +173,7 @@ function errorMessage(code: string) {
 
 .proxy-preview {
   display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
+  align-items: center;
   gap: 8px 20px;
   margin-top: 22px;
   padding: 14px 16px;
@@ -166,6 +181,17 @@ function errorMessage(code: string) {
   border-radius: 8px;
   background: var(--app-background);
   font-size: 12px;
+  line-height: 18px;
+}
+
+.proxy-preview.is-invalid {
+  border-color: var(--app-danger);
+  background: var(--app-danger-soft);
+}
+
+.proxy-preview.is-invalid > span,
+.proxy-preview.is-invalid .proxy-preview-value {
+  color: var(--app-danger);
 }
 
 .proxy-preview > span {
@@ -174,8 +200,12 @@ function errorMessage(code: string) {
 }
 
 .proxy-preview-value {
+  flex: 1;
   min-width: 0;
-  overflow-wrap: anywhere;
+  height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .proxy-preview code {
@@ -198,44 +228,11 @@ function errorMessage(code: string) {
   line-height: 1.7;
 }
 
-.proxy-alert {
-  min-height: 64px;
-  margin-top: 14px;
-  border-radius: 8px;
-}
 
-.proxy-alert :deep(.el-alert__content) {
-  min-width: 0;
-}
 
-.proxy-alert :deep(.el-alert__title),
-.proxy-alert :deep(.el-alert__description) {
-  font-size: 12px;
-  line-height: 1.7;
-  overflow-wrap: anywhere;
-}
 
-.proxy-error-details {
-  margin: 8px 16px 0 56px;
-  color: var(--app-text-secondary);
-  font-size: 12px;
-  line-height: 1.7;
-  overflow-wrap: anywhere;
-}
 
-.proxy-error-details p {
-  margin: 10px 0 0;
-}
 
-.proxy-error-details summary {
-  cursor: pointer;
-}
-
-.proxy-save-status {
-  margin-right: auto;
-  color: var(--app-text-secondary);
-  font-size: 12px;
-}
 
 .proxy-actions {
   display: flex;
@@ -244,8 +241,6 @@ function errorMessage(code: string) {
   justify-content: flex-end;
   gap: 10px;
   margin-top: 20px;
-  padding-top: 18px;
-  border-top: 1px solid var(--app-border);
 }
 
 .proxy-actions :deep(.el-button) {

@@ -32,6 +32,15 @@
     "active": true,
     "targets": "all",
     "windows": {
+      "nsis": {
+        "installMode": "both",
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
+        "displayLanguageSelector": true,
+        "startMenuFolder": "EasyVideoDownload"
+      },
       "wix": {
         "upgradeCode": "30a2acde-6f70-5b60-8293-d17ee28f83f7"
       }

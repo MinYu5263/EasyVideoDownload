@@ -84,9 +84,14 @@ impl DownloadPageState {
             }
             let mut ids = std::collections::HashSet::new();
             for f in &self.formats {
-                if f.format_id.trim().is_empty()
+                if !crate::video::formats::valid_id(&f.format_id)
                     || !ids.insert(&f.format_id)
                     || f.height == Some(0)
+                    || f.width == Some(0)
+                    || f.bitrate.is_some_and(|v| v == 0 || v > crate::video::formats::MAX_EXACT_INTEGER)
+                    || f.native_result_id
+                    .as_ref()
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
                     || f.fps.is_some_and(|v| !v.is_finite() || v <= 0.0)
                     || f.size_bytes
                     .is_some_and(|v| v == 0 || v > 9_007_199_254_740_991)
@@ -143,11 +148,22 @@ pub fn parser_fingerprint(settings: &RequiredToolSettings) -> Result<String, Sto
         .collect();
     serde_json::to_string(&value).map_err(|e| StorageError::new("loadFailed", e))
 }
+pub fn parser_fingerprint_for_platform(
+    settings: &RequiredToolSettings,
+    platform: &str,
+) -> Result<String, StorageError> {
+    if platform == "douyin" {
+        Ok("douyin-rust-v1".into())
+    } else {
+        parser_fingerprint(settings)
+    }
+}
 pub(super) fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadPageState> {
     let json: String = row.get("formats_json")?;
-    let formats = serde_json::from_str(&json).map_err(|e| {
+    let mut formats: Vec<VideoFormat> = serde_json::from_str(&json).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
     })?;
+    crate::video::formats::normalize_all(&mut formats);
     Ok(DownloadPageState {
         platform: row.get("platform")?,
         input_link: row.get("input_link")?,
@@ -203,6 +219,7 @@ impl Database {
             .optional()
             .map_err(|e| StorageError::new("saveFailed", e))?;
         let mut next = state.clone();
+        crate::video::formats::normalize_all(&mut next.formats);
         if let Some(old) = old {
             next.updated_at = old.updated_at.clone();
             if next == old {
@@ -225,9 +242,10 @@ pub async fn get_download_page_states(
 ) -> Result<Vec<DownloadPageState>, StorageError> {
     let db = state.database()?;
     tauri::async_runtime::spawn_blocking(move || {
-        let fingerprint = parser_fingerprint(&db.tools()?)?;
+        let settings = db.tools()?;
         let mut states = db.download_page_states()?;
         for state in &mut states {
+            let fingerprint = parser_fingerprint_for_platform(&settings, &state.platform)?;
             if state
                 .parser_fingerprint
                 .as_ref()

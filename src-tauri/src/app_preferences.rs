@@ -3,18 +3,26 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Mutex,
 };
+#[cfg(not(target_os = "macos"))]
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::Menu,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager,
 };
+use tauri::{menu::MenuItem, Emitter, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
-use tauri_plugin_notification::NotificationExt;
+
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(target_os = "macos")]
+pub(crate) fn install_native_quit_handler(app: &tauri::AppHandle) -> Result<(), String> {
+    macos::install(app)
+}
 
 #[derive(Default)]
 pub(crate) struct AppPreferences {
     settings: Mutex<Option<AppSettings>>,
-    prompt_open: AtomicBool,
+    close_prompt: Mutex<ClosePromptState>,
     exiting: AtomicBool,
     tray_menu: Mutex<Option<(MenuItem<tauri::Wry>, MenuItem<tauri::Wry>)>>,
 }
@@ -39,7 +47,7 @@ pub(crate) fn update(app: &tauri::AppHandle, settings: &AppSettings) {
 
 fn report_error(app: &tauri::AppHandle, code: &str, detail: impl ToString) {
     let detail = detail.to_string();
-    eprintln!("{code}: {detail}");
+    log::error!("{code}: {detail}");
     let _ = app.emit(
         "app-native-error",
         serde_json::json!({"code": code, "detail": detail}),
@@ -53,22 +61,26 @@ pub(crate) enum DownloadOutcome<'a> {
     },
     Failed {
         code: &'a str,
+        title: &'a str,
+        detail: &'a str,
     },
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 struct Notice {
     title: String,
     body: String,
+    kind: &'static str,
+    detail: Option<String>,
 }
 
-fn download_notice(settings: &AppSettings, outcome: DownloadOutcome<'_>) -> Option<Notice> {
-    let zh = settings.locale == "zh-CN";
-    let (title, body) = match outcome {
+fn download_notice(settings: Option<&AppSettings>, outcome: DownloadOutcome<'_>) -> Option<Notice> {
+    let zh = settings.is_some_and(|settings| settings.locale == "zh-CN");
+    let (title, body, kind, detail) = match outcome {
         DownloadOutcome::Completed {
             path,
             already_downloaded: false,
-        } if settings.notify_on_completion => (
+        } if settings.is_none_or(|settings| settings.notify_on_completion) => (
             if zh {
                 "下载完成"
             } else {
@@ -80,13 +92,17 @@ fn download_notice(settings: &AppSettings, outcome: DownloadOutcome<'_>) -> Opti
                 .chars()
                 .take(180)
                 .collect(),
+            "success",
+            None,
         ),
-        DownloadOutcome::Failed { code }
-        if settings.notify_on_failure
-            && !matches!(
-                    code,
-                    "downloadCancelled" | "downloadBusy" | "applicationExiting"
-                ) =>
+        DownloadOutcome::Failed {
+            code,
+            title,
+            detail,
+        } if !matches!(
+            code,
+            "downloadCancelled" | "downloadBusy" | "applicationExiting"
+        ) =>
             {
                 (
                     if zh {
@@ -94,12 +110,9 @@ fn download_notice(settings: &AppSettings, outcome: DownloadOutcome<'_>) -> Opti
                     } else {
                         "Download failed"
                     },
-                    if zh {
-                        "请打开 EasyVideoDownload 查看错误详情。"
-                    } else {
-                        "Open EasyVideoDownload to view the error details."
-                    }
-                        .into(),
+                    title.chars().take(180).collect(),
+                    "error",
+                    Some(detail.to_string()),
                 )
             }
         _ => return None,
@@ -107,27 +120,31 @@ fn download_notice(settings: &AppSettings, outcome: DownloadOutcome<'_>) -> Opti
     Some(Notice {
         title: title.into(),
         body,
+        kind,
+        detail,
     })
 }
 
-pub(crate) fn notify_download(app: &tauri::AppHandle, outcome: DownloadOutcome<'_>) {
+pub(crate) fn notify_download(
+    app: &tauri::AppHandle,
+    request_id: &str,
+    outcome: DownloadOutcome<'_>,
+) {
     let state = app.state::<AppPreferences>();
     if state.exiting.load(Ordering::SeqCst) {
         return;
     }
-    let notice = state.settings.lock().ok().and_then(|settings| {
-        settings
-            .as_ref()
-            .and_then(|settings| download_notice(settings, outcome))
-    });
+    let settings = state
+        .settings
+        .lock()
+        .ok()
+        .and_then(|settings| settings.clone());
+    let notice = download_notice(settings.as_ref(), outcome);
     if let Some(notice) = notice {
-        if let Err(error) = app
-            .notification()
-            .builder()
-            .title(notice.title)
-            .body(notice.body)
-            .show()
-        {
+        if let Err(error) = app.emit(
+            "app-download-notice",
+            serde_json::json!({"requestId": request_id, "notice": notice}),
+        ) {
             report_error(app, "notificationFailed", error);
         }
     }
@@ -136,65 +153,179 @@ pub(crate) fn notify_download(app: &tauri::AppHandle, outcome: DownloadOutcome<'
 #[derive(Debug, PartialEq, Eq)]
 enum CloseChoice {
     Ask,
-    Tray,
+    Background,
     Exit,
     Cancel,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClosePromptState {
+    revision: u64,
+    pub open: bool,
+    allow_background: bool,
+    has_active_tasks: bool,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum CloseBackgroundMode {
+    Tray,
+    Window,
+}
+
+pub(crate) fn close_background_mode() -> CloseBackgroundMode {
+    if cfg!(target_os = "macos") {
+        CloseBackgroundMode::Window
+    } else {
+        CloseBackgroundMode::Tray
+    }
+}
+
+fn background_error_code() -> &'static str {
+    match close_background_mode() {
+        CloseBackgroundMode::Window => "windowFailed",
+        CloseBackgroundMode::Tray => "trayFailed",
+    }
+}
+
 fn close_choice(settings: Option<&AppSettings>) -> CloseChoice {
     match settings.map(|settings| settings.close_action.as_str()) {
-        Some("tray") => CloseChoice::Tray,
+        // Keep the persisted value compatible with existing settings on both platforms.
+        Some("tray") => CloseChoice::Background,
         Some("exit") => CloseChoice::Exit,
         _ => CloseChoice::Ask,
     }
 }
 
-fn take_close_response(state: &AppPreferences, action: &str) -> Result<CloseChoice, String> {
+fn take_close_response(
+    state: &AppPreferences,
+    action: &str,
+    has_active_tasks: bool,
+    revision: u64,
+) -> Result<CloseChoice, String> {
     let choice = match action {
         "exit" => CloseChoice::Exit,
-        "tray" => CloseChoice::Tray,
+        "tray" => CloseChoice::Background,
         "cancel" => CloseChoice::Cancel,
         _ => return Err("Invalid close response".into()),
     };
-    if !state.prompt_open.swap(false, Ordering::SeqCst) {
+    let mut prompt = state.close_prompt.lock().map_err(|e| e.to_string())?;
+    if revision != prompt.revision {
+        // A delayed reply must not acknowledge a newer warning or consume its request.
+        return Ok(CloseChoice::Ask);
+    }
+    if !prompt.open {
         return Err("No pending close request".into());
     }
+    if choice == CloseChoice::Background && !prompt.allow_background {
+        return Err("This request only confirms quitting the application".into());
+    }
+    if choice == CloseChoice::Exit && has_active_tasks && !prompt.has_active_tasks {
+        // New work started after the dialog opened. Require its warning to be acknowledged.
+        prompt.allow_background = false;
+        prompt.has_active_tasks = true;
+        prompt.revision += 1;
+        return Ok(CloseChoice::Ask);
+    }
+    prompt.open = false;
     Ok(choice)
 }
 
 #[tauri::command]
-pub(crate) fn get_close_prompt_state(window: tauri::WebviewWindow) -> bool {
-    window.label() == "main"
-        && window
-        .state::<AppPreferences>()
-        .prompt_open
-        .load(Ordering::SeqCst)
+pub(crate) fn get_close_prompt_state(
+    window: tauri::WebviewWindow,
+) -> Result<ClosePromptState, String> {
+    if window.label() != "main" {
+        return Ok(ClosePromptState::default());
+    }
+    let state = window.state::<AppPreferences>();
+    let prompt = *state.close_prompt.lock().map_err(|e| e.to_string())?;
+    Ok(prompt)
+}
+
+fn has_active_tasks(app: &tauri::AppHandle) -> Result<bool, String> {
+    let downloads = app
+        .state::<crate::video::download::DownloadManager>()
+        .is_active()?;
+    let tools = app
+        .state::<crate::required_tools::managed::ConfigureManager>()
+        .is_active()?;
+    Ok(downloads || tools)
+}
+
+fn emit_close_prompt(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<AppPreferences>();
+    let prompt = *state.close_prompt.lock().map_err(|e| e.to_string())?;
+    app.emit_to("main", "app-close-requested", prompt)
+        .map_err(|e| e.to_string())
+}
+
+fn open_close_prompt(
+    app: &tauri::AppHandle,
+    allow_background: bool,
+    has_active_tasks: bool,
+) -> Result<(), String> {
+    let state = app.state::<AppPreferences>();
+    {
+        let mut prompt = state.close_prompt.lock().map_err(|e| e.to_string())?;
+        if prompt.open && (allow_background || !prompt.allow_background) {
+            return Ok(());
+        }
+        *prompt = ClosePromptState {
+            revision: prompt.revision + 1,
+            open: true,
+            allow_background,
+            has_active_tasks,
+        };
+        log::info!(
+            "closePromptOpened: revision={} allowBackground={} hasActiveTasks={}",
+            prompt.revision,
+            prompt.allow_background,
+            prompt.has_active_tasks
+        );
+    }
+    // An explicit Quit may originate from the tray or the macOS application menu.
+    show_window(app);
+    if let Err(error) = emit_close_prompt(app) {
+        state.close_prompt.lock().map_err(|e| e.to_string())?.open = false;
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub(crate) fn respond_to_close_request(
     window: tauri::WebviewWindow,
     action: String,
-) -> Result<(), String> {
+    revision: u64,
+) -> Result<ClosePromptState, String> {
     if window.label() != "main" {
         return Err("Only the main window can respond to close requests".into());
     }
     let state = window.state::<AppPreferences>();
-    match take_close_response(&state, &action)? {
-        CloseChoice::Exit => request_exit(window.app_handle()),
-        CloseChoice::Tray => {
-            if let Err(error) = try_hide_to_tray(window.app_handle()) {
-                state.prompt_open.store(true, Ordering::SeqCst);
-                report_error(window.app_handle(), "trayFailed", &error);
+    let active = action == "exit" && has_active_tasks(window.app_handle())?;
+    let choice = take_close_response(&state, &action, active, revision)?;
+    log::info!(
+        "closePromptResponded: revision={revision} action={action} result={choice:?} exitTaskRecheck={:?}",
+        (action == "exit").then_some(active)
+    );
+    match choice {
+        CloseChoice::Exit => exit_after_confirmation(window.app_handle()),
+        CloseChoice::Background => {
+            if let Err(error) = try_hide_in_background(window.app_handle()) {
+                state.close_prompt.lock().map_err(|e| e.to_string())?.open = true;
+                report_error(window.app_handle(), background_error_code(), &error);
                 return Err(error.to_string());
             }
         }
+        CloseChoice::Ask => {}
         _ => {}
     }
-    Ok(())
+    get_close_prompt_state(window)
 }
 
-fn show_window(app: &tauri::AppHandle) {
+pub(crate) fn show_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let result = window
             .show()
@@ -206,6 +337,7 @@ fn show_window(app: &tauri::AppHandle) {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn ensure_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     if app.tray_by_id("main-tray").is_some() {
         return Ok(());
@@ -266,17 +398,19 @@ fn ensure_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-fn try_hide_to_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
-    ensure_tray(app).and_then(|_| {
-        app.get_webview_window("main")
-            .ok_or(tauri::Error::WindowNotFound)?
-            .hide()
-    })
+fn try_hide_in_background(app: &tauri::AppHandle) -> tauri::Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    ensure_tray(app)?;
+    app.get_webview_window("main")
+        .ok_or(tauri::Error::WindowNotFound)?
+        .hide()?;
+    log::info!("windowHidden: mode={:?}", close_background_mode());
+    Ok(())
 }
 
-fn hide_to_tray(app: &tauri::AppHandle) {
-    if let Err(error) = try_hide_to_tray(app) {
-        report_error(app, "trayFailed", error);
+fn hide_in_background(app: &tauri::AppHandle) {
+    if let Err(error) = try_hide_in_background(app) {
+        report_error(app, background_error_code(), error);
     }
 }
 
@@ -288,8 +422,16 @@ pub(crate) fn close_requested(window: &tauri::Window, event: &tauri::WindowEvent
         api.prevent_close();
         let app = window.app_handle();
         let state = app.state::<AppPreferences>();
-        if state.exiting.load(Ordering::SeqCst) || state.prompt_open.load(Ordering::SeqCst) {
+        if state.exiting.load(Ordering::SeqCst) {
             return;
+        }
+        match state.close_prompt.lock() {
+            Ok(prompt) if prompt.open => return,
+            Err(error) => {
+                report_error(app, "windowFailed", error);
+                return;
+            }
+            _ => {}
         }
         let settings = state
             .settings
@@ -297,14 +439,12 @@ pub(crate) fn close_requested(window: &tauri::Window, event: &tauri::WindowEvent
             .ok()
             .and_then(|settings| settings.clone());
         match close_choice(settings.as_ref()) {
-            CloseChoice::Tray => hide_to_tray(app),
+            CloseChoice::Background => hide_in_background(app),
             CloseChoice::Exit => request_exit(app),
             CloseChoice::Ask => {
-                if state.prompt_open.swap(true, Ordering::SeqCst) {
-                    return;
-                }
-                if let Err(error) = app.emit_to("main", "app-close-requested", ()) {
-                    state.prompt_open.store(false, Ordering::SeqCst);
+                if let Err(error) =
+                    has_active_tasks(app).and_then(|active| open_close_prompt(app, true, active))
+                {
                     report_error(app, "windowFailed", error);
                 }
             }
@@ -314,6 +454,21 @@ pub(crate) fn close_requested(window: &tauri::Window, event: &tauri::WindowEvent
 }
 
 pub(crate) fn request_exit(app: &tauri::AppHandle) {
+    if app.state::<AppPreferences>().exiting.load(Ordering::SeqCst) {
+        return;
+    }
+    match has_active_tasks(app) {
+        Ok(true) => {
+            if let Err(error) = open_close_prompt(app, false, true) {
+                report_error(app, "windowFailed", error);
+            }
+        }
+        Ok(false) => exit_after_confirmation(app),
+        Err(error) => report_error(app, "exitFailed", error),
+    }
+}
+
+fn exit_after_confirmation(app: &tauri::AppHandle) {
     if app
         .state::<AppPreferences>()
         .exiting
@@ -321,18 +476,17 @@ pub(crate) fn request_exit(app: &tauri::AppHandle) {
     {
         return;
     }
+    log::info!("applicationExitStarted: stopping active tasks");
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let downloads = app.state::<crate::video::download::DownloadManager>();
         let tools = app.state::<crate::required_tools::managed::ConfigureManager>();
-        let lab = app.state::<crate::douyin::lab::LabManager>();
         let result = async {
             downloads.begin_exit()?;
             tools.begin_exit()?;
-            lab.begin_exit()?;
             // Let process trees stop and real terminal records/installation rollback settle.
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                while downloads.is_active()? || tools.is_active()? || lab.is_active()? {
+                while downloads.is_active()? || tools.is_active()? {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 Ok::<_, String>(())
@@ -342,11 +496,13 @@ pub(crate) fn request_exit(app: &tauri::AppHandle) {
         }
             .await;
         match result {
-            Ok(()) => app.exit(0),
+            Ok(()) => {
+                log::info!("applicationExitReady: task cleanup completed");
+                app.exit(0);
+            }
             Err(error) => {
                 downloads.abort_exit();
                 tools.abort_exit();
-                lab.abort_exit();
                 app.state::<AppPreferences>()
                     .exiting
                     .store(false, Ordering::SeqCst);
@@ -367,16 +523,14 @@ pub(crate) fn settle_on_native_exit(app: &tauri::AppHandle) {
     // still exists during this callback; drain Rust work before Tauri cleans up.
     let downloads = app.state::<crate::video::download::DownloadManager>();
     let tools = app.state::<crate::required_tools::managed::ConfigureManager>();
-    let lab = app.state::<crate::douyin::lab::LabManager>();
     app.state::<AppPreferences>()
         .exiting
         .store(true, Ordering::SeqCst);
     let result = tauri::async_runtime::block_on(async {
         downloads.begin_exit()?;
         tools.begin_exit()?;
-        lab.begin_exit()?;
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            while downloads.is_active()? || tools.is_active()? || lab.is_active()? {
+            while downloads.is_active()? || tools.is_active()? {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             Ok::<_, String>(())
@@ -385,7 +539,7 @@ pub(crate) fn settle_on_native_exit(app: &tauri::AppHandle) {
             .map_err(|_| "Timed out while draining native termination".to_string())?
     });
     if let Err(error) = result {
-        eprintln!("Native exit cleanup failed: {error}");
+        log::error!("Native exit cleanup failed: {error}");
     }
 }
 
@@ -398,8 +552,8 @@ mod tests {
             locale: "en".into(),
             theme: "system".into(),
             notify_on_completion: false,
-            notify_on_failure: true,
             close_action: "ask".into(),
+            max_concurrent_downloads: crate::database::DEFAULT_DOWNLOAD_LIMIT,
         }
     }
 
@@ -407,7 +561,7 @@ mod tests {
     fn notices_obey_preferences_and_exclude_cancelled_busy_and_skipped_downloads() {
         let mut preferences = settings();
         assert!(download_notice(
-            &preferences,
+            Some(&preferences),
             DownloadOutcome::Completed {
                 path: "C:/videos/test.mp4",
                 already_downloaded: false
@@ -417,7 +571,7 @@ mod tests {
         preferences.notify_on_completion = true;
         assert_eq!(
             download_notice(
-                &preferences,
+                Some(&preferences),
                 DownloadOutcome::Completed {
                     path: "C:/videos/test.mp4",
                     already_downloaded: false
@@ -425,11 +579,13 @@ mod tests {
             ),
             Some(Notice {
                 title: "Download complete".into(),
-                body: "test.mp4".into()
+                body: "test.mp4".into(),
+                kind: "success",
+                detail: None,
             })
         );
         assert!(download_notice(
-            &preferences,
+            Some(&preferences),
             DownloadOutcome::Completed {
                 path: "C:/videos/test.mp4",
                 already_downloaded: true
@@ -437,28 +593,59 @@ mod tests {
         )
             .is_none());
         for code in ["downloadCancelled", "downloadBusy", "applicationExiting"] {
-            assert!(download_notice(&preferences, DownloadOutcome::Failed { code }).is_none());
+            assert!(download_notice(
+                Some(&preferences),
+                DownloadOutcome::Failed {
+                    code,
+                    title: "Video",
+                    detail: "cancelled",
+                }
+            )
+                .is_none());
         }
         assert_eq!(
             download_notice(
-                &preferences,
+                Some(&preferences),
                 DownloadOutcome::Failed {
-                    code: "downloadFailed"
+                    code: "downloadFailed",
+                    title: "Video",
+                    detail: "Network disconnected",
                 }
             ),
             Some(Notice {
                 title: "Download failed".into(),
-                body: "Open EasyVideoDownload to view the error details.".into()
+                body: "Video".into(),
+                kind: "error",
+                detail: Some("Network disconnected".into()),
             })
         );
-        preferences.notify_on_failure = false;
+        preferences.notify_on_completion = false;
         assert!(download_notice(
-            &preferences,
+            Some(&preferences),
             DownloadOutcome::Failed {
-                code: "spawnFailed"
+                code: "spawnFailed",
+                title: "Video",
+                detail: "Tool failed to start",
             }
         )
-            .is_none());
+            .is_some());
+        assert!(download_notice(
+            None,
+            DownloadOutcome::Failed {
+                code: "spawnFailed",
+                title: "Video",
+                detail: "Tool failed to start",
+            }
+        )
+            .is_some());
+        assert!(download_notice(
+            None,
+            DownloadOutcome::Completed {
+                path: "C:/videos/test.mp4",
+                already_downloaded: false,
+            }
+        )
+            .is_some());
     }
 
     #[test]
@@ -468,7 +655,7 @@ mod tests {
         preferences.notify_on_completion = true;
         assert_eq!(
             download_notice(
-                &preferences,
+                Some(&preferences),
                 DownloadOutcome::Completed {
                     path: r"C:\private\视频.mp4",
                     already_downloaded: false
@@ -476,14 +663,18 @@ mod tests {
             ),
             Some(Notice {
                 title: "下载完成".into(),
-                body: "视频.mp4".into()
+                body: "视频.mp4".into(),
+                kind: "success",
+                detail: None,
             })
         );
         assert_eq!(
             download_notice(
-                &preferences,
+                Some(&preferences),
                 DownloadOutcome::Failed {
-                    code: "cookieReadFailed"
+                    code: "cookieReadFailed",
+                    title: "视频",
+                    detail: "Cookie file missing",
                 }
             )
                 .unwrap()
@@ -498,7 +689,7 @@ mod tests {
         let mut preferences = settings();
         assert_eq!(close_choice(Some(&preferences)), CloseChoice::Ask);
         preferences.close_action = "tray".into();
-        assert_eq!(close_choice(Some(&preferences)), CloseChoice::Tray);
+        assert_eq!(close_choice(Some(&preferences)), CloseChoice::Background);
         preferences.close_action = "exit".into();
         assert_eq!(close_choice(Some(&preferences)), CloseChoice::Exit);
     }
@@ -506,25 +697,131 @@ mod tests {
     #[test]
     fn responses_require_a_pending_prompt_and_consume_it_once() {
         let state = AppPreferences::default();
-        assert!(take_close_response(&state, "exit").is_err());
+        assert!(take_close_response(&state, "exit", false, 0).is_err());
         for (action, expected) in [
             ("cancel", CloseChoice::Cancel),
-            ("tray", CloseChoice::Tray),
+            ("tray", CloseChoice::Background),
             ("exit", CloseChoice::Exit),
         ] {
-            state.prompt_open.store(true, Ordering::SeqCst);
-            assert_eq!(take_close_response(&state, action).unwrap(), expected);
-            assert!(!state.prompt_open.load(Ordering::SeqCst));
-            assert!(take_close_response(&state, action).is_err());
+            *state.close_prompt.lock().unwrap() = ClosePromptState {
+                revision: 0,
+                open: true,
+                allow_background: true,
+                has_active_tasks: false,
+            };
+            assert_eq!(
+                take_close_response(&state, action, false, 0).unwrap(),
+                expected
+            );
+            assert!(!state.close_prompt.lock().unwrap().open);
+            assert!(take_close_response(&state, action, false, 0).is_err());
         }
-        state.prompt_open.store(true, Ordering::SeqCst);
-        assert!(take_close_response(&state, "unexpected").is_err());
-        assert!(state.prompt_open.load(Ordering::SeqCst));
+        *state.close_prompt.lock().unwrap() = ClosePromptState {
+            revision: 0,
+            open: true,
+            allow_background: true,
+            has_active_tasks: false,
+        };
+        assert!(take_close_response(&state, "unexpected", false, 0).is_err());
+        assert!(state.close_prompt.lock().unwrap().open);
+    }
+
+    #[test]
+    fn newly_started_tasks_require_a_warning_but_acknowledged_warnings_do_not_repeat() {
+        let state = AppPreferences::default();
+        *state.close_prompt.lock().unwrap() = ClosePromptState {
+            revision: 0,
+            open: true,
+            allow_background: true,
+            has_active_tasks: false,
+        };
+        assert_eq!(
+            take_close_response(&state, "exit", true, 0).unwrap(),
+            CloseChoice::Ask
+        );
+        assert_eq!(
+            *state.close_prompt.lock().unwrap(),
+            ClosePromptState {
+                revision: 1,
+                open: true,
+                allow_background: false,
+                has_active_tasks: true
+            }
+        );
+        assert_eq!(
+            take_close_response(&state, "exit", true, 1).unwrap(),
+            CloseChoice::Exit
+        );
+        assert!(!state.close_prompt.lock().unwrap().open);
+    }
+
+    #[test]
+    fn exit_only_prompts_reject_background_responses_without_consuming_the_request() {
+        let state = AppPreferences::default();
+        *state.close_prompt.lock().unwrap() = ClosePromptState {
+            revision: 0,
+            open: true,
+            allow_background: false,
+            has_active_tasks: true,
+        };
+        assert!(take_close_response(&state, "tray", true, 0).is_err());
+        assert!(state.close_prompt.lock().unwrap().open);
+        assert_eq!(
+            take_close_response(&state, "cancel", true, 0).unwrap(),
+            CloseChoice::Cancel
+        );
+        assert!(!state.close_prompt.lock().unwrap().open);
+    }
+
+    #[test]
+    fn runtime_close_metadata_does_not_change_persisted_preferences() {
+        let mut saved = settings();
+        saved.close_action = "tray".into();
+        let response =
+            serde_json::to_value(crate::database::AppSettingsResponse::from(saved.clone()))
+                .unwrap();
+        assert_eq!(response["closeAction"], "tray");
+        assert_eq!(
+            response["closeBackgroundMode"],
+            if cfg!(target_os = "macos") {
+                "window"
+            } else {
+                "tray"
+            }
+        );
+        assert!(serde_json::to_value(saved)
+            .unwrap()
+            .get("closeBackgroundMode")
+            .is_none());
+    }
+
+    #[test]
+    fn delayed_replies_cannot_acknowledge_a_newer_task_warning() {
+        let state = AppPreferences::default();
+        let request = ClosePromptState {
+            revision: 2,
+            open: true,
+            allow_background: false,
+            has_active_tasks: true,
+        };
+        *state.close_prompt.lock().unwrap() = request;
+        for action in ["exit", "tray", "cancel"] {
+            assert_eq!(
+                take_close_response(&state, action, true, 1).unwrap(),
+                CloseChoice::Ask
+            );
+            assert_eq!(*state.close_prompt.lock().unwrap(), request);
+        }
+        assert_eq!(
+            take_close_response(&state, "exit", true, 2).unwrap(),
+            CloseChoice::Exit
+        );
+        assert!(!state.close_prompt.lock().unwrap().open);
     }
 
     #[cfg(windows)]
     #[test]
-    #[ignore = "opens a real native window and sends a diagnostic system notification"]
+    #[ignore = "opens a real native window and dispatches an in-app notification event"]
     fn native_window_tray_theme_notification_and_exit_smoke() {
         use std::{
             os::windows::process::CommandExt,
@@ -605,6 +902,12 @@ mod tests {
         );
         let mut context = tauri::generate_context!();
         context.config_mut().app.windows.clear();
+        // The Rust test runner does not embed the application binary's Windows icon resource.
+        context.set_default_window_icon(Some(tauri::image::Image::new_owned(
+            vec![255; 32 * 32 * 4],
+            32,
+            32,
+        )));
         let database_path = profile_path.join("settings.db");
         let setup_database_path = database_path.clone();
         let close_events = Arc::new(AtomicUsize::new(0));
@@ -612,11 +915,9 @@ mod tests {
         let output = results.clone();
         let app = tauri::Builder::default()
             .any_thread()
-            .plugin(tauri_plugin_notification::init())
             .plugin(tauri_plugin_dialog::init())
             .manage(AppPreferences::default())
             .manage(crate::video::download::DownloadManager::default())
-            .manage(crate::douyin::lab::LabManager::default())
             .manage(crate::required_tools::managed::ConfigureManager::default())
             .on_window_event(close_requested)
             .setup(move |app| {
@@ -661,7 +962,7 @@ mod tests {
                         window.show().map_err(|e| e.to_string())?;
                         window.close().map_err(|e| e.to_string())?;
                         let until = Instant::now() + Duration::from_secs(5);
-                        while !get_close_prompt_state(window.clone()) {
+                        while !get_close_prompt_state(window.clone())?.open {
                             if Instant::now() > until { return Err("native close request did not open the application prompt".into()); }
                             std::thread::sleep(Duration::from_millis(25));
                         }
@@ -672,13 +973,13 @@ mod tests {
                         if !window.is_visible().map_err(|e| e.to_string())? || close_events.load(Ordering::SeqCst) != 1 {
                             return Err("a repeated native close request duplicated the prompt".into());
                         }
-                        respond_to_close_request(window.clone(), "cancel".into())?;
-                        if get_close_prompt_state(window.clone()) || !window.is_visible().map_err(|e| e.to_string())? {
+                        respond_to_close_request(window.clone(), "cancel".into(), get_close_prompt_state(window.clone())?.revision)?;
+                        if get_close_prompt_state(window.clone())?.open || !window.is_visible().map_err(|e| e.to_string())? {
                             return Err("cancelling did not keep the real window open".into());
                         }
                         window.close().map_err(|e| e.to_string())?;
                         let until = Instant::now() + Duration::from_secs(5);
-                        while !get_close_prompt_state(window.clone()) {
+                        while !get_close_prompt_state(window.clone())?.open {
                             if Instant::now() > until { return Err("cancelled prompt could not be reopened".into()); }
                             std::thread::sleep(Duration::from_millis(25));
                         }
@@ -686,6 +987,7 @@ mod tests {
                         preferences.close_action = "tray".into();
                         tauri::async_runtime::block_on(crate::database::save_app_settings(
                             handle.clone(), preferences, handle.state::<crate::database::Storage>(),
+                            handle.state::<crate::video::download::DownloadManager>(),
                         )).map_err(|error| error.detail)?;
                         let restored = crate::database::Database::open(&database_path, &database_path.with_file_name("legacy.json")).map_err(|error| error.detail)?;
                         if restored.app_settings("en").map_err(|error| error.detail)?.close_action != "tray" {
@@ -695,7 +997,7 @@ mod tests {
                         if !window.is_visible().map_err(|e| e.to_string())? {
                             return Err("saving a choice bypassed the pending prompt".into());
                         }
-                        respond_to_close_request(window.clone(), "tray".into())?;
+                        respond_to_close_request(window.clone(), "tray".into(), get_close_prompt_state(window.clone())?.revision)?;
                         let until = Instant::now() + Duration::from_secs(5);
                         while handle.tray_by_id("main-tray").is_none() || window.is_visible().map_err(|e| e.to_string())? {
                             if Instant::now() > until { return Err("close-to-tray did not hide the live window".into()); }
@@ -711,24 +1013,38 @@ mod tests {
                         }
                         if close_events.load(Ordering::SeqCst) != 2 { return Err("remembered choice emitted another prompt".into()); }
                         show_window(&handle);
-                        handle.notification().builder().title("EasyVideoDownload · 通知测试")
-                            .body("系统通知原生接口测试。This is a native notification interface test.")
-                            .show().map_err(|e| e.to_string())?;
+                        let notice_received = Arc::new(AtomicBool::new(false));
+                        let received = notice_received.clone();
+                        let listener = handle.listen_any("app-download-notice", move |event| {
+                            let payload: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+                            assert_eq!(payload["requestId"], "native-notice-test");
+                            assert_eq!(payload["notice"]["kind"], "error");
+                            received.store(true, Ordering::SeqCst);
+                        });
+                        notify_download(&handle, "native-notice-test", DownloadOutcome::Failed {
+                            code: "downloadFailed",
+                            title: "Test video",
+                            detail: "Native event dispatch test",
+                        });
+                        handle.unlisten(listener);
+                        if !notice_received.load(Ordering::SeqCst) {
+                            return Err("in-app notification event was not delivered".into());
+                        }
                         update(&handle, &settings());
                         window.close().map_err(|e| e.to_string())?;
                         let until = Instant::now() + Duration::from_secs(5);
-                        while !get_close_prompt_state(window.clone()) {
+                        while !get_close_prompt_state(window.clone())?.open {
                             if Instant::now() > until { return Err("native quit prompt did not open".into()); }
                             std::thread::sleep(Duration::from_millis(25));
                         }
-                        eprintln!("real native close requests, cancel, remembered choice, tray, theme and notification dispatch succeeded");
+                        eprintln!("real native close requests, cancel, remembered choice, tray, theme and in-app notification dispatch succeeded");
                         Ok(())
                     })();
                     let succeeded = result.is_ok();
                     *output.lock().unwrap() = Some(result);
                     if succeeded {
                         let window = handle.get_webview_window("main").unwrap();
-                        if let Err(error) = respond_to_close_request(window, "exit".into()) {
+                        if let Err(error) = respond_to_close_request(window.clone(), "exit".into(), get_close_prompt_state(window).unwrap().revision) {
                             *output.lock().unwrap() = Some(Err(error));
                             request_exit(&handle);
                         }
