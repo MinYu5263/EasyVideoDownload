@@ -11,6 +11,7 @@ dependencies = [
  "libc",
  "log",
  "objc2",
+ "objc2-foundation",
  "reqwest",
  "rusqlite",
  "serde",

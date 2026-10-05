@@ -9,6 +9,11 @@ fn unsafe_file(detail: impl ToString) -> StorageError {
 }
 
 fn access_failure(error: std::io::Error) -> StorageError {
+    #[cfg(target_os = "macos")]
+    {
+        return super::permanent::io_failure(error);
+    }
+    #[cfg(not(target_os = "macos"))]
     StorageError::new(
         if super::super::failure::file_is_occupied(&error) {
             "historyFileOccupied"

@@ -2,19 +2,25 @@ use crate::database::{download_records::DownloadRecord, StorageError};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn supported() -> bool {
-    cfg!(windows)
+    cfg!(any(windows, target_os = "macos"))
 }
 
 fn failure(error: impl ToString) -> StorageError {
     StorageError::new("historyFileDeleteFailed", error)
 }
 
-fn io_failure(error: std::io::Error) -> StorageError {
+pub(super) fn io_failure(error: std::io::Error) -> StorageError {
     if super::super::failure::file_is_occupied(&error) {
         StorageError::new("historyFileOccupied", error)
-    } else if cfg!(windows) && error.raw_os_error() == Some(5) {
+    } else if error.kind() == std::io::ErrorKind::PermissionDenied {
         StorageError::new("historyFilePermissionDenied", error)
     } else {
+        #[cfg(target_os = "macos")]
+        match error.raw_os_error() {
+            Some(libc::EROFS) => return StorageError::new("historyFileReadOnly", error),
+            Some(libc::EBUSY) => return StorageError::new("historyFileOccupied", error),
+            _ => {}
+        }
         failure(error)
     }
 }
@@ -78,7 +84,11 @@ pub(crate) fn delete_output_file(
     {
         delete_windows(record, &path)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        super::macos::delete(record, &path)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Err(StorageError::new(
             "historyFileDeletionUnsupported",
@@ -315,9 +325,10 @@ mod tests {
         (dir, record)
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn permanent_native_delete_removes_only_the_owned_final_file_and_missing_is_idempotent() {
+        assert!(supported());
         let (dir, record) = fixture();
         let sibling = dir.path().join("cover.jpg");
         std::fs::write(&sibling, b"keep cover").unwrap();
@@ -327,7 +338,7 @@ mod tests {
         assert!(!delete_output_file(&record, &[]).unwrap());
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn unsupported_native_deletion_keeps_existing_files_and_allows_missing_record_cleanup() {
         let (dir, record) = fixture();
@@ -382,6 +393,46 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join("video.mp4")).unwrap(),
             b"owned video!"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_native_delete_preserves_a_replacement_with_the_same_size() {
+        let (dir, mut record) = fixture();
+        let output = dir.path().join("video.mp4");
+        record.output_identity = crate::database::download_records::identity::capture(&output);
+        std::fs::rename(&output, dir.path().join("original.mp4")).unwrap();
+        std::fs::write(&output, b"replacement!").unwrap();
+        assert_eq!(
+            delete_output_file(&record, &[]).unwrap_err().code,
+            "historyFileChanged"
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"replacement!");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_native_delete_rejects_a_symlink_and_classifies_permission_errors() {
+        let (dir, record) = fixture();
+        let output = dir.path().join("video.mp4");
+        let saved = dir.path().join("original.mp4");
+        std::fs::rename(&output, &saved).unwrap();
+        std::os::unix::fs::symlink(&saved, &output).unwrap();
+        assert_eq!(
+            delete_output_file(&record, &[]).unwrap_err().code,
+            "historyFileUnsafe"
+        );
+        assert_eq!(std::fs::read(&saved).unwrap(), b"owned video!");
+        for code in [libc::EACCES, libc::EPERM] {
+            assert_eq!(
+                io_failure(std::io::Error::from_raw_os_error(code)).code,
+                "historyFilePermissionDenied"
+            );
+        }
+        assert_eq!(
+            io_failure(std::io::Error::from_raw_os_error(libc::EROFS)).code,
+            "historyFileReadOnly"
         );
     }
 

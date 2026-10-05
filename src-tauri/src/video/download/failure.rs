@@ -230,6 +230,29 @@ mod tests {
         assert!(!error.detail.contains("private"));
     }
     #[test]
+    fn fresh_cookie_extractor_failure_reports_an_actionable_safe_error() {
+        let error = super::super::download_failure(
+            "ERROR: [Douyin] 123: Fresh cookies (not necessarily logged in) are needed; session=private",
+        );
+        assert_eq!(error.code, "cookieRequired");
+        assert_eq!(error.failure_kind, Some("cookie"));
+        assert_eq!(error.detail, "Platform authentication must be refreshed");
+        assert!(!error.detail.contains("private"));
+    }
+    #[test]
+    fn a_video_title_mentioning_fresh_cookies_is_not_an_authentication_error() {
+        let error = super::super::download_failure(
+            "[download] Destination: Fresh cookies recipe.mp4\nERROR: unable to download video data: HTTP Error 403",
+        );
+        assert_eq!(error.code, "downloadFailed");
+        assert_eq!(error.failure_kind, None);
+        let permission_error = super::super::download_failure(
+            "ERROR: unable to open /Movies/Fresh Cookies.mp4.part: Permission denied",
+        );
+        assert_eq!(permission_error.code, "downloadFailed");
+        assert_eq!(permission_error.failure_kind, Some("filesystem"));
+    }
+    #[test]
     fn diagnostic_redacts_credentials_cookie_values_and_media_urls() {
         let raw = "HTTP https://cdn.example/video?token=secret failed\nCookie: session=secret-cookie\nAuthorization: Bearer secret-auth\npassword=secret-password token=secret-token\ntrace connection refused";
         let safe = sanitize_diagnostic(raw);

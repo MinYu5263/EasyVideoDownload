@@ -40,15 +40,6 @@ export interface DownloadRecord {
     outputExtension: string | null;
     fileSizeBytes: number | null;
     fileAvailability?: "unknown" | "present" | "missing";
-    successfulOutput?: {
-        formatSnapshot?: VideoFormat | null;
-        formatId: string;
-        formatExtension: string | null;
-        height: number | null;
-        fps: number | null;
-        directory: string;
-        finishedAt: string
-    } | null;
     status: HistoryStatus;
     errorCode: string | null;
     errorDetail: string | null;

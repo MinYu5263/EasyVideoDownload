@@ -57,6 +57,7 @@ export function sanitizeHistoryDetail(value: string | null | undefined) {
 
 export function historyFailureKey(row: Pick<DownloadRecord, "status" | "failureKind"> & Partial<Pick<DownloadRecord, "errorCode">>) {
     if (row.status === "interrupted") return "history.reason.interrupted";
+    if (row.errorCode === "cookieRequired") return "history.reason.cookieRequired";
     if (row.errorCode === "historyFileOccupied") return "history.reason.fileOccupied";
     const deletionCodes = ["historyFileDeleteFailed", "historyFilePermissionDenied", "historyFileReadOnly", "historyFileUnsafe", "historyFileChanged", "historyFileInUse", "historyFileDeletedSaveFailed"];
     if (row.errorCode && deletionCodes.includes(row.errorCode)) return `history.${row.errorCode}`;
@@ -80,6 +81,7 @@ export function historyOperationMessage(error: {
 
 export function historySuggestionKey(row: Pick<DownloadRecord, "status" | "failureKind"> & Partial<Pick<DownloadRecord, "errorCode">>) {
     if (row.status === "interrupted") return "history.suggestion.interrupted";
+    if (row.errorCode === "cookieRequired") return "history.suggestion.cookieRequired";
     if (row.errorCode === "historyFileOccupied") return "history.suggestion.fileOccupied";
     const kinds = ["tools", "cookie", "network", "content", "format", "filesystem", "processing", "output", "execution"];
     return `history.suggestion.${row.failureKind && kinds.includes(row.failureKind) ? row.failureKind : "unknown"}`;

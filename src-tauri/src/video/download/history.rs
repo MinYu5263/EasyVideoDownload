@@ -452,5 +452,7 @@ pub struct HistoryListResult {
 pub(crate) mod actions;
 pub(crate) mod permanent;
 pub(crate) mod recycle;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(test)]
 mod tests;

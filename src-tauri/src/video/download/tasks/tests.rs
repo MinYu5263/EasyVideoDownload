@@ -2431,126 +2431,167 @@ async fn submitting_a_cleared_parse_returns_an_options_error_without_accepting_a
 }
 
 #[tokio::test]
-async fn missing_record_output_proceeds_to_a_real_native_download_on_the_same_record() {
-    use crate::database::download_records::DownloadRecordOutcome;
-    let root = tempfile::Builder::new()
-        .prefix("evd-missing-record-retry-")
-        .tempdir()
-        .unwrap();
-    eprintln!(
-        "owned missing-output retry fixture: {}",
-        root.path().display()
-    );
-    let storage = Storage::new(&root.path().join("app.db"), &root.path().join("legacy"));
-    let db = storage.database().unwrap();
-    let mut original = page();
-    original.download_directory = root.path().to_string_lossy().into();
-    let RecordAcceptance::Accepted(row) = db
-        .accept_download_record(
-            "removed-original",
-            &DownloadSnapshot {
-                page: original.clone(),
-            },
-            false,
-            false,
-        )
-        .unwrap()
-    else {
-        panic!()
+async fn record_output_proceeds_to_a_real_native_download_on_the_same_record() {
+    let cases: &[bool] = if cfg!(any(windows, target_os = "macos")) {
+        &[true, false]
+    } else {
+        &[true]
     };
-    let output = root.path().join("saved.webm");
-    std::fs::write(&output, b"original").unwrap();
-    db.finish_download_record(
-        "removed-original",
-        &DownloadRecordOutcome::Completed {
-            path: output.to_string_lossy().into(),
-            size: 8,
-            extension: Some("webm".into()),
-        },
-    )
+    for &missing in cases {
+        use crate::database::download_records::DownloadRecordOutcome;
+        let root = tempfile::Builder::new()
+            .prefix("evd-missing-record-retry-")
+            .tempdir()
+            .unwrap();
+        eprintln!(
+            "owned missing-output retry fixture: {}",
+            root.path().display()
+        );
+        let storage = Storage::new(&root.path().join("app.db"), &root.path().join("legacy"));
+        let db = storage.database().unwrap();
+        let mut original = page();
+        original.download_directory = root.path().to_string_lossy().into();
+        let RecordAcceptance::Accepted(row) = db
+            .accept_download_record(
+                "removed-original",
+                &DownloadSnapshot {
+                    page: original.clone(),
+                },
+                false,
+                false,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        let output = root.path().join("saved.webm");
+        std::fs::write(&output, b"original").unwrap();
+        db.finish_download_record(
+            "removed-original",
+            &DownloadRecordOutcome::Completed {
+                path: output.to_string_lossy().into(),
+                size: 8,
+                extension: Some("webm".into()),
+            },
+        )
         .unwrap();
-    std::fs::remove_file(&output).unwrap();
-    assert_eq!(
-        db.get_download_record(row.id).unwrap().file_availability,
-        "present",
-        "the user deleted the file outside the app"
-    );
-    for (id, mut config) in settings().tools {
-        for program in &mut config.programs {
-            program.version = if id == RequiredToolId::Ytdlp {
-                "2026.10.04".into()
-            } else {
-                "8.0.0".into()
-            };
+        if missing {
+            std::fs::remove_file(&output).unwrap();
         }
-        db.save_tool(id, &config).unwrap();
-    }
-    let tools = RequiredToolManager::new(storage.clone());
-    let cookies = CookieStore::new(root.path());
-    let manager = two_slot_manager();
-    let a = enqueue(&manager, db.clone(), root.path(), "missing-block-a");
-    let b = enqueue(&manager, db.clone(), root.path(), "missing-block-b");
-    until(|| {
-        root.path().join("missing-block-a.started").exists()
-            && root.path().join("missing-block-b.started").exists()
-    })
+        assert_eq!(
+            db.get_download_record(row.id).unwrap().file_availability,
+            "present",
+            "availability is refreshed when requesting a record download"
+        );
+        for (id, mut config) in settings().tools {
+            for program in &mut config.programs {
+                program.version = if id == RequiredToolId::Ytdlp {
+                    "2026.10.04".into()
+                } else {
+                    "8.0.0".into()
+                };
+            }
+            db.save_tool(id, &config).unwrap();
+        }
+        let tools = RequiredToolManager::new(storage.clone());
+        let cookies = CookieStore::new(root.path());
+        let manager = two_slot_manager();
+        let a = enqueue(&manager, db.clone(), root.path(), "missing-block-a");
+        let b = enqueue(&manager, db.clone(), root.path(), "missing-block-b");
+        until(|| {
+            root.path().join("missing-block-a.started").exists()
+                && root.path().join("missing-block-b.started").exists()
+        })
         .await;
-    let accepted = commands::restart_from_record(
-        None,
-        row.id,
-        "removed-original",
-        RecordRestartMode::CheckOutput,
-        &manager,
-        &tools,
-        &cookies,
-        &storage,
-    )
+        if !missing {
+            let confirmation = commands::restart_from_record(
+                None,
+                row.id,
+                "removed-original",
+                RecordRestartMode::CheckOutput,
+                &manager,
+                &tools,
+                &cookies,
+                &storage,
+            )
+            .await
+            .unwrap();
+            assert_eq!(confirmation.kind, "confirmationRequired");
+            assert!(confirmation.task.is_none());
+            assert_eq!(std::fs::read(&output).unwrap(), b"original");
+        }
+        let accepted = commands::restart_from_record(
+            None,
+            row.id,
+            "removed-original",
+            if missing {
+                RecordRestartMode::CheckOutput
+            } else {
+                RecordRestartMode::ReplaceOutput
+            },
+            &manager,
+            &tools,
+            &cookies,
+            &storage,
+        )
         .await
         .unwrap();
-    assert_eq!(accepted.record.id, row.id);
-    assert_eq!(accepted.task.unwrap().phase, "queued");
-    {
-        let mut inner = manager.inner.lock().unwrap();
-        let execution = inner
-            .entries
-            .get_mut(&accepted.record.request_id)
-            .unwrap()
-            .job
-            .as_mut()
-            .unwrap()
-            .execution
-            .as_mut()
-            .unwrap();
+        assert_eq!(accepted.record.id, row.id);
+        assert_eq!(accepted.task.unwrap().phase, "queued");
+        {
+            let mut inner = manager.inner.lock().unwrap();
+            let execution = inner
+                .entries
+                .get_mut(&accepted.record.request_id)
+                .unwrap()
+                .job
+                .as_mut()
+                .unwrap()
+                .execution
+                .as_mut()
+                .unwrap();
+            assert_eq!(
+                execution.page.selected_format_id,
+                original.selected_format_id
+            );
+            // Replace only the external downloader boundary with the existing native child fixture.
+            execution.runner = super::super::task_snapshot::DownloadExecution::Ytdlp(
+                super::super::tests::fixture("controlled", &output),
+            );
+            execution.command_options = None;
+        }
+        manager.cancel(&a.record.request_id).unwrap();
+        manager.cancel(&b.record.request_id).unwrap();
+        until(|| output.with_extension("started").exists()).await;
+        assert!(
+            !output.exists(),
+            "the old output must be gone before the native downloader starts"
+        );
         assert_eq!(
-            execution.page.selected_format_id,
-            original.selected_format_id
+            db.get_download_record(row.id)
+                .unwrap()
+                .file_deleted_at
+                .is_some(),
+            !missing
         );
-        // Replace only the external downloader boundary with the existing native child fixture.
-        execution.runner = super::super::task_snapshot::DownloadExecution::Ytdlp(
-            super::super::tests::fixture("controlled", &output),
+        // This child has not emitted any transfer samples; do not fabricate a downloading phase.
+        assert_eq!(db.get_download_record(row.id).unwrap().status, "running");
+        assert!(manager
+            .task_for(row.id)
+            .unwrap()
+            .record
+            .error_code
+            .is_none());
+        std::fs::write(output.with_extension("release"), b"release").unwrap();
+        until(|| !manager.is_active().unwrap()).await;
+        let completed = db.get_download_record(row.id).unwrap();
+        assert_eq!(completed.id, row.id);
+        assert_eq!(completed.status, "completed");
+        assert!(completed.error_code.is_none());
+        assert!(output.is_file());
+        assert!(
+            completed.file_deleted_at.is_none(),
+            "a newly completed output clears the old deletion marker"
         );
-        execution.command_options = None;
     }
-    manager.cancel(&a.record.request_id).unwrap();
-    manager.cancel(&b.record.request_id).unwrap();
-    until(|| output.with_extension("started").exists()).await;
-    // This child has not emitted any transfer samples; do not fabricate a downloading phase.
-    assert_eq!(db.get_download_record(row.id).unwrap().status, "running");
-    assert!(manager
-        .task_for(row.id)
-        .unwrap()
-        .record
-        .error_code
-        .is_none());
-    std::fs::write(output.with_extension("release"), b"release").unwrap();
-    until(|| !manager.is_active().unwrap()).await;
-    let completed = db.get_download_record(row.id).unwrap();
-    assert_eq!(completed.id, row.id);
-    assert_eq!(completed.status, "completed");
-    assert!(completed.error_code.is_none());
-    assert!(output.is_file());
-    assert!(
-        completed.file_deleted_at.is_none(),
-        "a missing file was not deleted again"
-    );
 }

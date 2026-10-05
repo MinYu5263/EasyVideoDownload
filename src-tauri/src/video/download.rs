@@ -190,6 +190,16 @@ async fn read_stream(
     Ok(output)
 }
 fn download_failure(detail: &str) -> VideoError {
+    // Match the parsing path before redaction hides the extractor's Cookie hint.
+    if detail.lines().any(|line| {
+        let lower = line.trim_start().to_ascii_lowercase();
+        lower.starts_with("error:")
+            && lower.contains("fresh cookies (not necessarily logged in) are needed")
+    }) {
+        let mut failure = error("cookieRequired", "Platform authentication must be refreshed");
+        failure.failure_kind = Some("cookie");
+        return failure;
+    }
     let kind = failure::failure_kind("downloadFailed", detail, "unknown");
     let detail = failure::sanitize_diagnostic(detail);
     let mut failure = error(

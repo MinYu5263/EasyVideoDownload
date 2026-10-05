@@ -843,7 +843,7 @@ fn history_trash_scopes_counts_search_and_pagination_and_restores_full_snapshot(
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[test]
 fn history_permanent_purge_deletes_native_file_before_record_and_keeps_shared_normal_outputs() {
     use crate::video::download::history::permanent::delete_output_file;
@@ -899,7 +899,7 @@ fn history_permanent_purge_deletes_native_file_before_record_and_keeps_shared_no
         .is_none());
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[test]
 fn history_permanent_purge_reports_file_deleted_save_failure_and_retries_missing_file() {
     use crate::video::download::history::permanent::delete_output_file;

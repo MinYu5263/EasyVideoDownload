@@ -147,14 +147,6 @@ function action(name: string) {
           <dt>{{ t('history.source') }}</dt>
           <dd class="path">{{ sanitizeHistoryLink(record.sourceLink) }}</dd>
         </dl>
-        <section v-if="record.successfulOutput&&record.status!=='completed'" class="last-output">
-          <h3>{{ t('tasks.lastSuccessfulOutput') }}</h3>
-          <p>{{ videoQualityLabel(record.successfulOutput.formatSnapshot) ?? t('history.unknown') }} ·
-            {{ record.successfulOutput.fps ? `${record.successfulOutput.fps} FPS` : t('history.unknown') }} ·
-            {{ record.outputExtension?.toUpperCase() || t('history.unknown') }}</p>
-          <p class="path">{{ record.outputPath }}</p>
-          <p>{{ record.successfulOutput.finishedAt }}</p>
-        </section>
         <div class="detail-actions">
           <ElButton :disabled="systemDisabled" size="small" @click="action('copyLink')">{{
               t('history.copyLink')
