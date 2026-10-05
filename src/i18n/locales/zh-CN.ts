@@ -1,7 +1,6 @@
 const zhCN = {
     tasks: {
         missingOutput: "已下载，原文件未找到。", prepareMissing: "重新下载",
-        lastSuccessfulOutput: "上一次成功下载的文件",
         title: "当前任务", dismiss: "收起", viewHistory: "查看记录", eta: "剩余约 {seconds} 秒",
         alreadyActive: "该视频已在任务队列中。", connectionFailed: "任务状态连接失败，请重试。下载继续在后台进行。",
         retryRetained: "本次重新下载的任务保留在当前列表中。切换筛选后将重新按条件显示。",
@@ -167,6 +166,7 @@ const zhCN = {
         reason: {
             fileOccupied: "删除失败：文件被占用",
             tools: "下载工具无法启动",
+            cookieRequired: "视频信息提取失败，下载器要求更新 Cookie",
             cookie: "Cookie 无法读取或需要登录",
             network: "网络连接失败",
             content: "当前视频无法访问",
@@ -181,6 +181,7 @@ const zhCN = {
         suggestion: {
             fileOccupied: "关闭播放窗口或其他正在使用该文件的程序后重试。",
             tools: "检查工具配置后重新下载。",
+            cookieRequired: "这不代表 Cookie 文件未配置。重新导入最新 Cookie 后重试；若仍失败，检查 yt-dlp 的平台支持。",
             cookie: "重新导入并检查 Cookie。",
             network: "检查网络和代理设置后重新下载。",
             content: "查看原页面和访问条件。",
@@ -239,7 +240,7 @@ const zhCN = {
             desktopOnly: "请在桌面应用中解析和下载视频。",
             cookieSaveFailed: "Cookie 尚未保存成功，请重新打开 Cookie 配置后重试。",
             cookieReadFailed: "无法读取 Cookie 文件，请检查本地文件后重试。",
-            cookieRequired: "该平台需要有效且较新的 Cookie，请更新 Cookie 配置后重试。",
+            cookieRequired: "下载器要求更新 Cookie 后重试，此提示不代表 Cookie 文件未配置。",
             youtubeReloadRequired: "YouTube 播放器返回需重新加载页面，请更新 Cookie 或 yt-dlp 后重试。",
             toolMissing: "未找到 yt-dlp，请在必备工具设置中重新配置。",
             toolSettingsFailed: "无法读取工具配置，请检查设置后重试。",

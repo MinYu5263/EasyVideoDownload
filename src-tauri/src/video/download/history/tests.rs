@@ -221,7 +221,7 @@ fn queued_task_is_not_recovered_until_its_runtime_lock_is_released() {
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[tokio::test]
 async fn cancellation_while_restart_deletion_waits_for_database_preserves_the_output() {
     use crate::database::download_records::{tasks::RecordAcceptance, DownloadRecordOutcome};

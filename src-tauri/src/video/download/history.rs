@@ -392,7 +392,7 @@ pub async fn list_download_records(
             )
             .map(|page| HistoryListResult {
                 page,
-                file_recycling_supported: cfg!(windows),
+                file_recycling_supported: recycle::supported(),
                 file_deletion_supported: permanent::supported(),
             })
     })
@@ -411,5 +411,7 @@ pub struct HistoryListResult {
 pub(crate) mod actions;
 pub(crate) mod permanent;
 mod recycle;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(test)]
 mod tests;

@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 mod windows;
 
+pub(crate) fn supported() -> bool {
+    cfg!(any(windows, target_os = "macos"))
+}
+
 pub(crate) fn recycle_output_file(record: &DownloadRecord) -> Result<bool, StorageError> {
     let output = record
         .output_path
@@ -41,7 +45,11 @@ pub(crate) fn recycle_output_file(record: &DownloadRecord) -> Result<bool, Stora
         )?;
         Ok(true)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        super::macos::recycle(record, &path).map(|(recycled, _)| recycled)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = path;
         Err(StorageError::new(
@@ -56,6 +64,15 @@ fn unsafe_file(detail: impl ToString) -> StorageError {
 }
 
 fn access_failure(error: std::io::Error) -> StorageError {
+    #[cfg(target_os = "macos")]
+    {
+        let mut error = super::permanent::io_failure(error);
+        if error.code == "historyFileDeleteFailed" {
+            error.code = "historyRecycleFailed".into();
+        }
+        return error;
+    }
+    #[cfg(not(target_os = "macos"))]
     StorageError::new(
         if super::super::failure::file_is_occupied(&error) {
             "historyFileOccupied"

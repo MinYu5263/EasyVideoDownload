@@ -404,6 +404,10 @@ fn process_fixture() {
             eprintln!("Cookie error: secret-value");
             std::process::exit(3);
         }
+        "fresh_cookie" => {
+            eprintln!("ERROR: [Douyin] 123: Fresh cookies (not necessarily logged in) are needed; session=private");
+            std::process::exit(3);
+        }
         "sleep" => {
             std::thread::sleep(Duration::from_secs(2));
             std::fs::write(path, "orphaned process").unwrap();
@@ -426,6 +430,7 @@ async fn native_history_distinguishes_actual_failures_skips_and_missing_evidence
         ("success", Some("completed")),
         ("early_failure", Some("failed")),
         ("failure", Some("failed")),
+        ("fresh_cookie", Some("failed")),
         ("already", Some("completed")),
         ("cached_parts", Some("completed")),
         ("unmarked", Some("completed")),
@@ -469,6 +474,16 @@ async fn native_history_distinguishes_actual_failures_skips_and_missing_evidence
                 .error_detail
                 .as_deref()
                 .is_none_or(|v| !v.contains("private.example")));
+            if mode == "fresh_cookie" {
+                assert_eq!(record.error_code.as_deref(), Some("cookieRequired"));
+                assert_eq!(record.failure_kind.as_deref(), Some("cookie"));
+                assert_eq!(record.error_stage.as_deref(), Some("preparing"));
+                assert_eq!(
+                    record.error_detail.as_deref(),
+                    Some("Platform authentication must be refreshed")
+                );
+                assert!(!path.exists());
+            }
         }
     }
 }

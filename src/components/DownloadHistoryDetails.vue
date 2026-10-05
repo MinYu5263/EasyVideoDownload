@@ -123,13 +123,6 @@ function action(name: string) {
           <dt>{{ t('history.source') }}</dt>
           <dd class="path">{{ sanitizeHistoryLink(record.sourceLink) }}</dd>
         </dl>
-        <section v-if="record.successfulOutput&&record.status!=='completed'" class="last-output">
-          <h3>{{ t('tasks.lastSuccessfulOutput') }}</h3>
-          <p>{{ record.successfulOutput.height }}p · {{ record.successfulOutput.fps }} FPS ·
-            {{ record.outputExtension?.toUpperCase() }}</p>
-          <p class="path">{{ record.outputPath }}</p>
-          <p>{{ record.successfulOutput.finishedAt }}</p>
-        </section>
         <div class="detail-actions">
           <ElButton :disabled="systemDisabled" size="small" @click="action('copyLink')">{{
               t('history.copyLink')

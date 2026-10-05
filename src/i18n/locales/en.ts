@@ -4,7 +4,6 @@ const en = {
     tasks: {
         missingOutput: "Downloaded; the original file was not found.",
         prepareMissing: "Download again",
-        lastSuccessfulOutput: "Last successful output",
         title: "Current tasks",
         dismiss: "Dismiss",
         viewHistory: "View history",
@@ -177,6 +176,7 @@ const en = {
         reason: {
             fileOccupied: "Deletion failed: file is in use",
             tools: "Download tools could not start",
+            cookieRequired: "Video extraction failed; the downloader requests fresh cookies",
             cookie: "Cookies could not be read or sign-in is required",
             network: "Network connection failed",
             content: "This video is unavailable",
@@ -191,6 +191,7 @@ const en = {
         suggestion: {
             fileOccupied: "Close the player or any other app using the file, then try again.",
             tools: "Check tool settings and download again.",
+            cookieRequired: "This does not mean the cookie file is unconfigured. Import fresh cookies and retry; if it still fails, check yt-dlp platform support.",
             cookie: "Import and check cookies again.",
             network: "Check your network and proxy settings.",
             content: "Check the original page and access requirements.",
@@ -249,7 +250,7 @@ const en = {
             desktopOnly: "Parse and download videos in the desktop application.",
             cookieSaveFailed: "Your cookies haven't been saved. Reopen this platform's settings and try again.",
             cookieReadFailed: "Couldn't read the cookie file. Check the file and try again.",
-            cookieRequired: "This platform requires valid, up-to-date cookies. Update your cookies in this platform's settings and try again.",
+            cookieRequired: "The downloader requests fresh cookies. Update them and retry; this does not mean the cookie file is unconfigured.",
             youtubeReloadRequired: "YouTube requested a page reload. Update cookies or yt-dlp and retry.",
             toolMissing: "yt-dlp was not found. Set it up in Settings > Required tools and try again.",
             toolSettingsFailed: "Unable to read tool settings. Check Settings and retry.",

@@ -931,6 +931,8 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "libc",
+ "objc2",
+ "objc2-foundation",
  "reqwest",
  "rusqlite",
  "serde",
