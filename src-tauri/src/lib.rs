@@ -3,6 +3,7 @@ mod cookies;
 mod database;
 mod datetime;
 mod desktop;
+mod douyin;
 mod proxy;
 mod required_tools;
 mod thumbnails;
@@ -38,9 +39,14 @@ pub fn run() {
             app.manage(cookies::CookieStore::new(&data_directory));
             app.manage(thumbnails::ThumbnailStore::new(&data_directory));
             app.manage(video::download::DownloadManager::default());
+            app.manage(douyin::lab::LabManager::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            douyin::lab::douyin_lab_get_state,
+            douyin::lab::douyin_lab_parse,
+            douyin::lab::douyin_lab_download,
+            douyin::lab::douyin_lab_cancel,
             app_preferences::get_close_prompt_state,
             app_preferences::respond_to_close_request,
             database::get_app_settings,

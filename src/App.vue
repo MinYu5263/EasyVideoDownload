@@ -1,20 +1,23 @@
 <script setup lang="ts">
-import {computed, onMounted, onUnmounted, ref} from "vue";
-import {ElConfigProvider} from "element-plus";
+import {computed, defineAsyncComponent, onMounted, onUnmounted, ref} from "vue";
+import {ElButton, ElConfigProvider} from "element-plus";
 import {useI18n} from "vue-i18n";
 import AppSidebar from "./components/AppSidebar.vue";
 import DownloadPage from "./components/DownloadPage.vue";
 import SettingsPage from "./components/SettingsPage.vue";
 import HistoryPage from "./components/HistoryPage.vue";
+import {createPageNavigation} from "./composables/usePageNavigation";
 import CloseWindowDialog from "./components/CloseWindowDialog.vue";
 import {elementPlusLocale} from "./i18n";
-import {type AppPageId, appPages} from "./navigation";
+import {appPages} from "./navigation";
 import {useUiPreferences} from "./composables/useUiPreferences";
 import {useAppSettings} from "./composables/useAppSettings";
 import {useAppAppearance} from "./composables/useAppAppearance";
 import {listen, type UnlistenFn} from "@tauri-apps/api/event";
-import {ElButton} from "element-plus";
 import {useDownloadHistory} from "./composables/useDownloadHistory";
+import {useDownloadTasks} from "./composables/useDownloadTasks";
+
+const DouyinLabPage = defineAsyncComponent(() => import("./components/DouyinLabPage.vue"));
 
 const uiPreferences = useUiPreferences();
 const appearance = useAppAppearance();
@@ -38,7 +41,6 @@ onUnmounted(() => {
   disposed = true;
   unlistenNativeError?.();
 });
-import {useDownloadTasks} from "./composables/useDownloadTasks";
 
 const tasks = useDownloadTasks();
 onMounted(tasks.connect);
@@ -54,11 +56,7 @@ const history = useDownloadHistory();
 const downloadBusy = ref(true);
 onMounted(history.refresh);
 onUnmounted(history.dispose);
-const activePageId = computed({
-  get: () => uiPreferences.draft.activePage, set: (value: AppPageId) => {
-    void uiPreferences.update({activePage: value});
-  }
-});
+const {activePageId, labVisited} = createPageNavigation(uiPreferences);
 
 async function retryPreferences() {
   if (!uiPreferences.ready.value) await uiPreferences.load();
@@ -111,6 +109,8 @@ const activePage = computed(
         <DownloadPage v-show="activePage.id === 'download'" :active="activePage.id === 'download'"
                       @busy-change="downloadBusy = $event" @view-history="viewHistory"/>
         <SettingsPage v-show="activePage.id === 'settings'"/>
+        <DouyinLabPage v-if="labVisited" v-show="activePage.id === 'douyin-lab'"
+                       :active="activePage.id === 'douyin-lab'"/>
         <HistoryPage v-show="activePage.id === 'history'" ref="historyPage" :active="activePage.id === 'history'"
                      :downloading="downloadBusy"/>
         <CloseWindowDialog/>

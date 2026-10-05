@@ -833,6 +833,10 @@ mod tests {
     }
 
     fn proxy_response(status: u16) -> (proxy::ProxySettings, std::thread::JoinHandle<String>) {
+        proxy_response_with_timeout(status, Duration::from_secs(3))
+    }
+
+    fn proxy_response_with_timeout(status: u16, startup_timeout: Duration) -> (proxy::ProxySettings, std::thread::JoinHandle<String>) {
         use std::io::Read;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let settings = proxy::ProxySettings {
@@ -842,7 +846,7 @@ mod tests {
         };
         listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let deadline = std::time::Instant::now() + startup_timeout;
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
@@ -897,13 +901,17 @@ mod tests {
         let http = client(&storage, RequiredToolId::Ytdlp).await.unwrap();
         // The test proxy deliberately rejects CONNECT, before any external TLS traffic.
         assert!(http.get("https://download-source.invalid/release").send().await.is_err());
+        // Storage owns an open SQLite connection; release it before deleting its directory on Windows.
+        drop(http);
+        drop(storage);
         root.close().unwrap();
     }
 
     #[test]
     fn missing_or_unavailable_app_proxy_preserves_environment_proxy() {
         for unavailable in [false, true] {
-            let (settings, server) = proxy_response(502);
+            // Unlike in-process probes, this case must also allow native child startup under suite load.
+            let (settings, server) = proxy_response_with_timeout(502, Duration::from_secs(15));
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child.args([
                 "--exact",

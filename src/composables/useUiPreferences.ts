@@ -1,12 +1,12 @@
 import {reactive, ref} from "vue";
 import {invoke, isTauri} from "@tauri-apps/api/core";
 import type {VideoPlatform} from "./videoPlatforms.ts";
-import type {AppPageId} from "../navigation.ts";
+import type {PersistedAppPageId} from "../navigation.ts";
 
 export interface UiPreferences {
     downloadPlatform: VideoPlatform;
     settingsSection: "application" | "tools" | "proxy" | "about";
-    activePage: AppPageId
+    activePage: PersistedAppPageId
 }
 
 export interface PersistenceError {

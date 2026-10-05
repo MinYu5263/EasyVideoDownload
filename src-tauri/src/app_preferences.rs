@@ -325,12 +325,14 @@ pub(crate) fn request_exit(app: &tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         let downloads = app.state::<crate::video::download::DownloadManager>();
         let tools = app.state::<crate::required_tools::managed::ConfigureManager>();
+        let lab = app.state::<crate::douyin::lab::LabManager>();
         let result = async {
             downloads.begin_exit()?;
             tools.begin_exit()?;
+            lab.begin_exit()?;
             // Let process trees stop and real terminal records/installation rollback settle.
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                while downloads.is_active()? || tools.is_active()? {
+                while downloads.is_active()? || tools.is_active()? || lab.is_active()? {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 Ok::<_, String>(())
@@ -344,6 +346,7 @@ pub(crate) fn request_exit(app: &tauri::AppHandle) {
             Err(error) => {
                 downloads.abort_exit();
                 tools.abort_exit();
+                lab.abort_exit();
                 app.state::<AppPreferences>()
                     .exiting
                     .store(false, Ordering::SeqCst);
@@ -364,14 +367,16 @@ pub(crate) fn settle_on_native_exit(app: &tauri::AppHandle) {
     // still exists during this callback; drain Rust work before Tauri cleans up.
     let downloads = app.state::<crate::video::download::DownloadManager>();
     let tools = app.state::<crate::required_tools::managed::ConfigureManager>();
+    let lab = app.state::<crate::douyin::lab::LabManager>();
     app.state::<AppPreferences>()
         .exiting
         .store(true, Ordering::SeqCst);
     let result = tauri::async_runtime::block_on(async {
         downloads.begin_exit()?;
         tools.begin_exit()?;
+        lab.begin_exit()?;
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            while downloads.is_active()? || tools.is_active()? {
+            while downloads.is_active()? || tools.is_active()? || lab.is_active()? {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             Ok::<_, String>(())
@@ -611,6 +616,7 @@ mod tests {
             .plugin(tauri_plugin_dialog::init())
             .manage(AppPreferences::default())
             .manage(crate::video::download::DownloadManager::default())
+            .manage(crate::douyin::lab::LabManager::default())
             .manage(crate::required_tools::managed::ConfigureManager::default())
             .on_window_event(close_requested)
             .setup(move |app| {

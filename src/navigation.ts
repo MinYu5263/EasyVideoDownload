@@ -1,4 +1,4 @@
-import {Clock, Download, Setting} from "@element-plus/icons-vue";
+import {Clock, Download, Operation, Setting} from "@element-plus/icons-vue";
 
 export const appPages = [
     {
@@ -15,6 +15,12 @@ export const appPages = [
         emptyTitleKey: "pages.history.emptyTitle",
     },
     {
+        id: "douyin-lab",
+        labelKey: "navigation.douyinLab",
+        icon: Operation,
+        emptyTitleKey: "douyinLab.title",
+    },
+    {
         id: "settings",
         labelKey: "navigation.settings",
         icon: Setting,
@@ -24,3 +30,4 @@ export const appPages = [
 ] as const;
 
 export type AppPageId = (typeof appPages)[number]["id"];
+export type PersistedAppPageId = Exclude<AppPageId, "douyin-lab">;
