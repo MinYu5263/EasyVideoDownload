@@ -310,6 +310,7 @@ async fn run_download(
 ) -> Result<DownloadResult, VideoError> {
     run_download_with_history(command, directory, cancel, limit, notify, None).await
 }
+#[cfg(test)]
 async fn run_download_with_history(
     command: Command,
     directory: &Path,
