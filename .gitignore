@@ -16,6 +16,20 @@ dist-ssr
 /tests/
 *.test.mjs
 
+# Local development documents
+/docs/superpowers/
+/docs/plans/
+/docs/cookies.md
+/docs/database.md
+
+# Local credentials and runtime data
+.env
+.env.*
+!.env.example
+/cookies/
+*_cookies.txt
+/thumbnails/
+
 # Local databases, backups and compiler caches
 *.db
 *.db-journal
