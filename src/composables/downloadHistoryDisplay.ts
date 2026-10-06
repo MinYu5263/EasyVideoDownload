@@ -1,11 +1,11 @@
 import type {DownloadRecord} from "./useDownloadHistory.ts";
 import {formatVideoSize} from "./videoFormatDisplay.ts";
 
-export function historySize(row: Pick<DownloadRecord, "fileSizeBytes" | "selectedSizeBytes" | "sizeApproximate"> & Partial<Pick<DownloadRecord, "status">>) {
+export function historySize(row: Pick<DownloadRecord, "fileSizeBytes" | "selectedSizeBytes"> & Partial<Pick<DownloadRecord, "status">>) {
     const actual = formatVideoSize(!row.status || row.status === 'completed' ? row.fileSizeBytes : null);
     if (actual) return {kind: "actual", text: actual};
     const selected = formatVideoSize(row.selectedSizeBytes);
-    return selected ? {kind: "stream", text: `${row.sizeApproximate ? "≈ " : ""}${selected}`} : {
+    return selected ? {kind: "stream", text: selected} : {
         kind: "unknown",
         text: ""
     };

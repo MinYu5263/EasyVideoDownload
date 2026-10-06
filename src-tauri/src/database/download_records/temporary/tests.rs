@@ -5,12 +5,13 @@ use crate::video::download::history::permanent::delete_download_files;
 fn fixture() -> (tempfile::TempDir, Database, i64, TemporaryDirectory) {
     let root = tempfile::Builder::new()
         .prefix("evd-owned-partials-")
-        .tempdir()
+        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
         .unwrap();
     eprintln!("owned partial deletion fixture: {}", root.path().display());
-    let db = Database::open(&root.path().join("app.db"), &root.path().join("legacy")).unwrap();
+    let home = root.path().canonicalize().unwrap();
+    let db = Database::open(&home.join("app.db"), &home.join("legacy")).unwrap();
     let mut state = page();
-    state.download_directory = root.path().to_string_lossy().into();
+    state.download_directory = home.to_string_lossy().into();
     let id = db
         .begin_download_record(
             "owner",
@@ -19,7 +20,7 @@ fn fixture() -> (tempfile::TempDir, Database, i64, TemporaryDirectory) {
         )
         .unwrap();
     let temporary = db
-        .prepare_download_temporary_directory("owner", root.path())
+        .prepare_download_temporary_directory("owner", &home)
         .unwrap();
     (root, db, id, temporary)
 }
@@ -27,6 +28,34 @@ fn trash(db: &Database, id: i64) {
     db.finish_download_record("owner", &DownloadRecordOutcome::Paused)
         .unwrap();
     db.delete_download_record(id).unwrap();
+}
+
+#[test]
+#[cfg(any(windows, target_os = "macos"))]
+fn cancelling_removes_owned_fragments_and_record_but_keeps_siblings() {
+    let (root, db, id, temporary) = fixture();
+    std::fs::write(Path::new(&temporary.path).join("视频.part"), b"partial").unwrap();
+    std::fs::write(Path::new(&temporary.path).join("video.ytdl"), b"resume").unwrap();
+    let sibling = root.path().join("other-task.part");
+    std::fs::write(&sibling, b"keep").unwrap();
+    db.finish_download_record("owner", &DownloadRecordOutcome::Cancelled).unwrap();
+    assert_eq!(db.remove_cancelled_download("owner").unwrap(), id);
+    assert!(!Path::new(&temporary.path).exists());
+    assert!(db.find_request_record("owner").unwrap().is_none());
+    assert_eq!(std::fs::read(sibling).unwrap(), b"keep");
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn a_link_inside_owned_fragments_does_not_delete_its_target_or_the_record() {
+    let (root, db, id, temporary) = fixture();
+    let outside = root.path().join("keep.mp4");
+    std::fs::write(&outside, b"keep").unwrap();
+    std::os::unix::fs::symlink(&outside, Path::new(&temporary.path).join("linked.part")).unwrap();
+    db.finish_download_record("owner", &DownloadRecordOutcome::Cancelled).unwrap();
+    assert_eq!(db.remove_cancelled_download("owner").unwrap_err().code, "cancelCleanupFailed");
+    assert_eq!(std::fs::read(outside).unwrap(), b"keep");
+    assert_eq!(db.get_download_record(id).unwrap().status, "cancelled");
 }
 
 #[test]
@@ -64,7 +93,7 @@ fn trash_and_restore_keep_partial_files_and_restart_reuses_the_persisted_directo
 }
 
 #[test]
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn permanent_delete_cleans_only_owned_partial_resume_fragment_and_intermediate_files() {
     let (root, db, id, temporary) = fixture();
     for name in [
@@ -201,7 +230,7 @@ fn a_junction_replacement_cannot_redirect_cleanup_to_other_files() {
 }
 
 #[test]
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn failed_ownership_save_cleans_only_the_new_empty_directory() {
     let (root, db, _id, temporary) = fixture();
     remove_empty(&temporary).unwrap();
@@ -280,7 +309,7 @@ fn a_queued_download_in_a_missing_descendant_reserves_the_owned_directory() {
 }
 
 #[test]
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn unexpected_subdirectory_stops_cleanup_without_deleting_any_files() {
     let (_root, db, id, temporary) = fixture();
     let partial = Path::new(&temporary.path).join("video.part");
@@ -297,7 +326,7 @@ fn unexpected_subdirectory_stops_cleanup_without_deleting_any_files() {
 }
 
 #[test]
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn missing_directory_is_idempotent_and_unknown_legacy_partials_are_kept() {
     let (root, db, id, temporary) = fixture();
     std::fs::remove_dir(&temporary.path).unwrap();
@@ -309,7 +338,7 @@ fn missing_directory_is_idempotent_and_unknown_legacy_partials_are_kept() {
 }
 
 #[test]
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn a_final_output_referenced_by_another_record_is_protected_inside_a_temporary_directory() {
     let (root, db, id, temporary) = fixture();
     let output = Path::new(&temporary.path).join("referenced.mp4");
@@ -343,7 +372,7 @@ fn a_final_output_referenced_by_another_record_is_protected_inside_a_temporary_d
 }
 
 #[test]
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn all_old_directories_are_cleaned_after_changing_the_download_directory() {
     let (root, db, id, original) = fixture();
     std::fs::write(Path::new(&original.path).join("old.part"), b"old").unwrap();

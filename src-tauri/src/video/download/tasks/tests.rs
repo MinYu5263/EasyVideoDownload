@@ -696,6 +696,28 @@ async fn explicit_cancel_after_restart_removes_paused_record_and_fragments() {
     assert!(!Path::new(&directory.path).exists());
     assert!(db.find_request_record("restored").unwrap().is_none());
 }
+#[tokio::test]
+#[cfg(any(windows, target_os = "macos"))]
+async fn explicit_cancel_reports_cleanup_failure_after_stopping_and_keeps_record() {
+    let root = tempfile::tempdir().unwrap();
+    eprintln!("owned failed cleanup fixture: {}", root.path().display());
+    let home = root.path().canonicalize().unwrap();
+    let db = Arc::new(Database::open(&home.join("app.db"), &home.join("legacy")).unwrap());
+    let mut state = page();
+    state.download_directory = home.to_string_lossy().into();
+    db.begin_download_record("cleanup-failure", &DownloadSnapshot { page: state }, &crate::datetime::now()).unwrap();
+    let directory = db.prepare_download_temporary_directory("cleanup-failure", &home).unwrap();
+    let fragment = Path::new(&directory.path).join("video.part");
+    std::fs::write(&fragment, b"keep").unwrap();
+    std::fs::create_dir(Path::new(&directory.path).join("unexpected")).unwrap();
+    db.finish_download_record("cleanup-failure", &crate::database::download_records::DownloadRecordOutcome::Cancelled).unwrap();
+    let error = two_slot_manager().cancel_and_remove("cleanup-failure", db.clone()).await.unwrap_err();
+    assert_eq!(error.code, "cancelCleanupFailed");
+    assert_eq!(error.detail, "Unexpected directory or link inside a temporary download");
+    assert_eq!(db.find_request_record("cleanup-failure").unwrap().unwrap().status, "cancelled");
+    assert_eq!(std::fs::read(fragment).unwrap(), b"keep");
+}
+
 use crate::{
     database::{persistence_tests::page, Database},
     required_tools::{Program, RequiredToolConfig, RequiredToolSource},

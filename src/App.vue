@@ -90,7 +90,7 @@ const {t} = useI18n({useScope: "global"});
 const {watchError, notifyError, notify, notifyDownloadFailure} = useFeedback();
 watchError(uiPreferences.loadError, () => t('persistence.loadFailed'), () => ({key: 'preferences:load'}));
 watchError(uiPreferences.saveError, () => t('persistence.saveFailed'), () => ({key: 'preferences:save'}));
-watchError(tasks.error, error => t(error.code === 'cancelFailed' ? 'download.errors.cancelFailed' :
+watchError(tasks.error, error => t(['cancelFailed', 'cancelCleanupFailed'].includes(error.code) ? `download.errors.${error.code}` :
     ['pauseFailed', 'resumeFailed'].includes(error.code) ? `tasks.${error.code}` : 'tasks.connectionFailed'), error => ({
   key: 'tasks:service', downloadOutcome: error.code === 'resumeFailed' ? 'failed' : undefined,
 }));

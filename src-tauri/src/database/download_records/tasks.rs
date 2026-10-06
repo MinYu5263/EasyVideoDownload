@@ -30,13 +30,20 @@ impl Database {
                 "The task is no longer cancellable",
             ));
         }
-        let protected = protected_output_paths(&tx, &[id])?;
-        crate::video::download::history::permanent::delete_download_fragments(&record, &protected)?;
-        tx.execute("DELETE FROM download_records WHERE id=?1", [id])
-            .map_err(|e| StorageError::new("historyFileDeletedSaveFailed", e))?;
-        tx.commit()
-            .map_err(|e| StorageError::new("historyFileDeletedSaveFailed", e))?;
-        Ok(id)
+        let cleanup = (|| {
+            let protected = protected_output_paths(&tx, &[id])?;
+            crate::video::download::history::permanent::delete_download_fragments(&record, &protected)?;
+            tx.execute("DELETE FROM download_records WHERE id=?1", [id])
+                .map_err(|e| StorageError::new("historyFileDeletedSaveFailed", e))?;
+            tx.commit()
+                .map_err(|e| StorageError::new("historyFileDeletedSaveFailed", e))?;
+            Ok(id)
+        })();
+        cleanup.map_err(|e: StorageError| {
+            log::warn!("cancelCleanupFailed requestId={} code={} detail={}",
+                request_id, e.code, crate::app_logs::safe_text(&e.detail));
+            StorageError::new("cancelCleanupFailed", e.detail)
+        })
     }
     pub fn find_request_record(
         &self,

@@ -220,7 +220,7 @@ fn match_candidate(
     Ok(candidate)
 }
 pub(crate) struct NativeExecution {
-    client: reqwest::Client,
+    client: crate::douyin::http::DouyinClient,
     parsed: ParsedResult,
     candidate: Candidate,
     ffprobe: PathBuf,

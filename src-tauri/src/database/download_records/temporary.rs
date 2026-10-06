@@ -1,5 +1,9 @@
 use super::*;
-use std::{fs::File, path::PathBuf};
+use std::fs::File;
+#[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+mod macos;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TemporaryDirectory {
@@ -52,6 +56,11 @@ fn open_directory(path: &Path) -> Result<File, StorageError> {
     }
     #[cfg(not(windows))]
     options.read(true);
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
     let file = options.open(path).map_err(io_failure)?;
     if !file.metadata().map_err(io_failure)?.is_dir() {
         return Err(unsafe_path("Temporary path is not a directory"));
@@ -221,6 +230,8 @@ pub(crate) fn remove_empty(directory: &TemporaryDirectory) -> Result<(), Storage
         drop(guard);
         #[cfg(windows)]
         delete_empty_directory(directory)?;
+        #[cfg(target_os = "macos")]
+        macos::delete_empty(directory)?;
     }
     Ok(())
 }
@@ -233,7 +244,11 @@ pub(crate) fn delete(directory: &TemporaryDirectory) -> Result<bool, StorageErro
         Ok(_) => {}
     }
     let guard = validate(directory)?;
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::delete(directory, guard)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = guard;
         return Err(StorageError::new(

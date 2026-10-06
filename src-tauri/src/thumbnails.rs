@@ -105,13 +105,16 @@ impl ThumbnailStore {
         {
             return Ok(key);
         }
+        // Match yt-dlp: keep environment/system proxy discovery when the platform
+        // has no explicit app proxy. Adding one below overrides that discovery.
         let mut builder = reqwest::Client::builder()
-            .no_proxy()
             .timeout(Duration::from_secs(12))
             .connect_timeout(Duration::from_secs(5));
         if let Some(proxy) = proxy {
             builder = builder.proxy(
-                reqwest::Proxy::all(proxy.url()).map_err(|_| failure("Invalid thumbnail proxy"))?,
+                reqwest::Proxy::all(proxy.url())
+                    .map_err(|_| failure("Invalid thumbnail proxy"))?
+                    .no_proxy(None),
             );
         }
         let mut response = builder

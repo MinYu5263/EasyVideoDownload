@@ -149,7 +149,8 @@ export function createDownloadTasks(bridge: DownloadTaskBridge) {
             error.value = null;
             return true;
         } catch (e) {
-            error.value = {code: 'cancelFailed', detail: persistenceError(e).detail};
+            const failure = persistenceError(e);
+            error.value = {code: failure.code === 'cancelCleanupFailed' ? failure.code : 'cancelFailed', detail: failure.detail};
             return false;
         }
     }

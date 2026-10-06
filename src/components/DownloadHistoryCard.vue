@@ -22,7 +22,7 @@ import DownloadTaskPauseButton from './DownloadTaskPauseButton.vue';
 import {taskIsActive, type DownloadTaskSnapshot} from '../composables/downloadTaskTypes';
 import {useThumbnail} from "../composables/useThumbnail";
 import {videoQualityLabel} from '../composables/videoFormatTable';
-import {formatVideoSize} from '../composables/videoFormatDisplay';
+import {formatDownloadEta, formatDownloadSpeed} from '../composables/downloadTaskDisplay';
 
 const props = withDefaults(defineProps<{
   record: DownloadRecord;
@@ -53,14 +53,8 @@ const extension = computed(() => props.record.status === 'completed' ? props.rec
 const duration = computed(() => historyDuration(props.record.durationSeconds));
 const status = computed(() => props.task?.phase ?? props.record.status);
 const statusLabel = computed(() => t(props.task ? `tasks.phase.${props.task.phase}` : `history.status.${props.record.status}`));
-const speed = computed(() => {
-  const value = props.task?.speed;
-  return value != null && Number.isFinite(value) && value >= 0 ? `${formatVideoSize(Math.round(value)) ?? '0 B'}/s` : '—';
-});
-const eta = computed(() => {
-  const value = props.task?.eta;
-  return value != null && Number.isFinite(value) && value >= 0 ? Math.ceil(value) : null;
-});
+const speed = computed(() => formatDownloadSpeed(props.task?.speed) ?? '—');
+const eta = computed(() => formatDownloadEta(props.task?.eta, t));
 const icon = computed(() => ({
   queued: Clock,
   running: Clock,
@@ -120,7 +114,7 @@ function action(name: string) {
         <span :class="status" class="status" role="status"><ElIcon><component
             :is="icon"/></ElIcon>{{ statusLabel }}</span>
         <span v-if="task?.phase === 'downloading'" class="transfer-stats">{{ speed }}<template
-            v-if="eta !== null"> · {{ t('tasks.eta', {seconds: eta}) }}</template></span>
+            v-if="eta !== null"> · {{ t('tasks.eta', {duration: eta}) }}</template></span>
       </div>
       <div class="actions">
         <ElButton v-if="!trashed&&status==='cancelled'" :disabled="systemDisabled" size="small"

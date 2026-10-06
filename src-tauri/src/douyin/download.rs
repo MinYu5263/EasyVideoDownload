@@ -252,7 +252,7 @@ fn publish(
 }
 
 pub(crate) async fn download(
-    client: &reqwest::Client,
+    client: &super::http::DouyinClient,
     parsed: &super::ParsedResult,
     candidate: &Candidate,
     directory: &Path,
@@ -538,7 +538,7 @@ mod tests {
             received.await.unwrap();
             token.cancel();
         });
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = super::super::http::client(".douyin.com\tTRUE\t/\tTRUE\t0\tsession\ttest\n", None).unwrap();
         let result = download(
             &client,
             &parsed,

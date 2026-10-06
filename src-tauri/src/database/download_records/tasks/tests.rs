@@ -558,7 +558,6 @@ fn review_recycle_protects_an_alternate_case_shared_output() {
     assert!(output.exists());
 }
 
-#[cfg(windows)]
 fn restart_fixture() -> (
     tempfile::TempDir,
     Database,
