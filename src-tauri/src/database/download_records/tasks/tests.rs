@@ -273,71 +273,6 @@ fn duplicate_submissions_and_stale_completion_cannot_replace_current_attempt() {
 }
 
 #[test]
-fn migration_archives_duplicates_preserves_files_and_id_high_water() {
-    let dir = tempfile::tempdir().unwrap();
-    eprintln!(
-        "temporary unique migration directory: {}",
-        dir.path().display()
-    );
-    let path = dir.path().join("app.db");
-    let c = Connection::open(&path).unwrap();
-    for migration in [
-        include_str!("../../../../migrations/001_settings.sql"),
-        include_str!("../../../../migrations/002_settings_key_value.sql"),
-    ] {
-        c.execute_batch(migration).unwrap();
-    }
-    for migration in [
-        include_str!("../../../../migrations/004_automatic_ytdlp.sql"),
-        include_str!("../../../../migrations/005_persistence.sql"),
-        include_str!("../../../../migrations/006_automatic_tools.sql"),
-        include_str!("../../../../migrations/007_single_input_link.sql"),
-        include_str!("../../../../migrations/008_download_history_cards.sql"),
-        include_str!("../../../../migrations/009_download_history_trash.sql"),
-    ] {
-        c.execute_batch(migration).unwrap();
-    }
-    let output = dir.path().join("old.mp4");
-    std::fs::write(&output, b"original video").unwrap();
-    c.execute("INSERT INTO download_records(id,request_id,platform,video_id,source_link,title,format_id,download_directory,status,started_at,finished_at,output_path,file_size_bytes) VALUES(4,'successful','youtube','abc','https://youtu.be/abc','Old','a',?1,'completed','2026-10-04 10:00:00','2026-10-04 10:00:01',?2,14)", params![dir.path().to_str(),output.to_str()]).unwrap();
-    c.execute("INSERT INTO download_records(id,request_id,platform,video_id,source_link,title,format_id,download_directory,status,started_at,finished_at,error_code) VALUES(99,'later-failure','youtube','abc','https://youtu.be/abc','Failed','a',?1,'failed','2026-10-04 11:00:00','2026-10-04 11:00:01','network')", params![dir.path().to_str()]).unwrap();
-    c.execute("INSERT INTO download_records(id,request_id,platform,video_id,source_link,title,format_id,download_directory,status,started_at,finished_at,output_path,file_size_bytes,deleted_at) VALUES(100,'trash-success','youtube','abc','https://youtu.be/abc','Trash','a',?1,'completed','2026-10-04 12:00:00','2026-10-04 12:00:01',?2,14,'2026-10-04 12:01:00')", params![dir.path().to_str(),output.to_str()]).unwrap();
-    c.pragma_update(None, "user_version", 9).unwrap();
-    drop(c);
-    let db = Database::open(&path, &dir.path().join("legacy")).unwrap();
-    assert_eq!(
-        db.find_download_record("youtube", "abc")
-            .unwrap()
-            .unwrap()
-            .id,
-        4
-    );
-    assert_eq!(std::fs::read(output).unwrap(), b"original video");
-    assert_eq!(
-        db.connection("test")
-            .unwrap()
-            .query_row(
-                "SELECT count(*) FROM download_record_migration_archive",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-        2
-    );
-    let mut state = page();
-    state.video_id = Some("new".into());
-    state.input_link = "https://youtu.be/new".into();
-    state.download_directory = dir.path().to_string_lossy().into();
-    let RecordAcceptance::Accepted(new) = db
-        .accept_download_record("new", &DownloadSnapshot { page: state }, false, false)
-        .unwrap()
-    else {
-        panic!()
-    };
-    assert!(new.id > 100);
-}
-
-#[test]
 fn unrelated_task_directory_does_not_block_history_file_actions() {
     let dir = tempfile::tempdir().unwrap();
     eprintln!(
@@ -418,55 +353,6 @@ fn readonly_lookup_and_same_video_identity_are_platform_scoped() {
     assert_eq!(result.records.len(), 2);
     assert_eq!(result.matched_count, 2);
 }
-#[test]
-fn migration_failure_rolls_back_version_records_and_archive() {
-    let dir = tempfile::tempdir().unwrap();
-    eprintln!(
-        "temporary migration rollback directory: {}",
-        dir.path().display()
-    );
-    let path = dir.path().join("app.db");
-    let connection = Connection::open(&path).unwrap();
-    connection
-        .execute_batch(concat!(
-        include_str!("../../../../migrations/001_settings.sql"),
-        include_str!("../../../../migrations/002_settings_key_value.sql"),
-        include_str!("../../../../migrations/003_beijing_datetime.sql"),
-        include_str!("../../../../migrations/004_automatic_ytdlp.sql"),
-        include_str!("../../../../migrations/005_persistence.sql"),
-        include_str!("../../../../migrations/006_automatic_tools.sql"),
-        include_str!("../../../../migrations/007_single_input_link.sql"),
-        include_str!("../../../../migrations/008_download_history_cards.sql"),
-        include_str!("../../../../migrations/009_download_history_trash.sql"),
-        "PRAGMA user_version=9;"
-        ))
-        .unwrap();
-    connection.execute_batch("INSERT INTO download_records(request_id,platform,video_id,source_link,title,format_id,download_directory,status,started_at) VALUES('a','youtube','abc','https://youtu.be/abc','A','a','C:/Videos','running','2026-10-04 10:00:00'),('b','youtube','abc','https://youtu.be/abc','B','a','C:/Videos','running','2026-10-04 11:00:00'); CREATE TABLE download_record_migration_archive AS SELECT * FROM download_records WHERE 0;CREATE TRIGGER reject_archive BEFORE INSERT ON download_record_migration_archive BEGIN SELECT RAISE(ABORT,'migration failure'); END;").unwrap();
-    drop(connection);
-    assert!(Database::open(&path, &dir.path().join("legacy")).is_err());
-    let old = Connection::open(path).unwrap();
-    assert_eq!(
-        old.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
-            .unwrap(),
-        9
-    );
-    assert_eq!(
-        old.query_row("SELECT count(*) FROM download_records", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
-        2
-    );
-    assert_eq!(
-        old.query_row(
-            "SELECT count(*) FROM download_record_migration_archive",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-            .unwrap(),
-        0
-    );
-}
-
 #[test]
 fn missing_successful_output_can_retry_without_creating_a_second_row() {
     let dir = tempfile::tempdir().unwrap();
@@ -831,12 +717,12 @@ fn restart_rejects_a_different_file_with_the_same_size() {
 
 #[cfg(windows)]
 #[test]
-fn identity_migration_preserves_legacy_records_and_allows_confirmed_restart() {
+fn baseline_unknown_output_identity_allows_confirmed_restart() {
     let (dir, db, snapshot, original) = restart_fixture();
     db.connection("test")
         .unwrap()
         .execute_batch(
-            "ALTER TABLE download_records DROP COLUMN output_identity; PRAGMA user_version=10;",
+            "UPDATE download_records SET output_identity=NULL;",
         )
         .unwrap();
     drop(db);
@@ -850,7 +736,7 @@ fn identity_migration_preserves_legacy_records_and_allows_confirmed_restart() {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        15
+        0
     );
     let RecordAcceptance::Accepted(retry) = db
         .restart_download_record(

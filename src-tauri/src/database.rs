@@ -56,6 +56,12 @@ impl From<AppSettings> for AppSettingsResponse {
 
 pub(crate) const DEFAULT_DOWNLOAD_LIMIT: usize = 3;
 
+// The first-release schema starts at 0. Increase only with a corresponding migration;
+// application releases and packaging do not change the database version automatically.
+const SCHEMA_VERSION: i64 = 0;
+// Fixed file identity (ASCII "EVD1"), independent of schema and application versions.
+const DATABASE_APPLICATION_ID: i32 = 0x45564431;
+
 pub struct Database {
     connection: Mutex<Connection>,
 }
@@ -85,46 +91,51 @@ impl Database {
             connection
                 .pragma_update(None, "foreign_keys", true)
                 .map_err(|e| StorageError::new("loadFailed", e))?;
-            // Inspect and migrate under the same lock so simultaneous launches cannot both import JSON.
+            // Inspect and initialize under one lock so simultaneous launches cannot both import JSON.
             let transaction = connection
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| StorageError::new("loadFailed", e))?;
             let version: i64 = transaction
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .map_err(|e| StorageError::new("loadFailed", e))?;
-            let mut imported_tools = None;
+            let application_id: i32 = transaction
+                .pragma_query_value(None, "application_id", |row| row.get(0))
+                .map_err(|e| StorageError::new("loadFailed", e))?;
+            if application_id != 0 && application_id != DATABASE_APPLICATION_ID {
+                return Err(StorageError::new("loadFailed", "unexpected database application id"));
+            }
+            // SQLite's default version is also 0, so only an empty schema is a new database.
+            let has_schema: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| StorageError::new("loadFailed", e))?;
             match version {
-                0 => {
-                    imported_tools = Some(
-                        required_tools::load_settings(legacy)
-                            .map_err(|e| StorageError::new("loadFailed", e.detail))?,
-                    );
+                0 if !has_schema => {
+                    let imported_tools = required_tools::load_settings(legacy)
+                        .map_err(|e| StorageError::new("loadFailed", e.detail))?;
                     transaction
-                        .execute_batch(include_str!("../migrations/001_settings.sql"))
+                        .execute_batch(include_str!("../migrations/initial.sql"))
                         .map_err(|e| StorageError::new("loadFailed", e))?;
-                    transaction
-                        .execute_batch(include_str!("../migrations/002_settings_key_value.sql"))
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                }
-                1 => {
-                    // Reject incomplete legacy groups before the join can discard them.
-                    read_tools(&transaction, true)?;
-                    let orphaned: bool = transaction
-                        .query_row(
-                            "SELECT EXISTS (SELECT 1 FROM required_tool_programs p WHERE NOT EXISTS
-                         (SELECT 1 FROM required_tools t WHERE t.tool_id = p.tool_id))",
-                            [],
-                            |row| row.get(0),
-                        )
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                    if orphaned {
-                        return Err(StorageError::new("loadFailed", "orphaned legacy program"));
+                    for (id, config) in imported_tools.tools {
+                        write_tool(&transaction, id, &config)
+                            .map_err(|e| StorageError::new("loadFailed", e))?;
                     }
                     transaction
-                        .execute_batch(include_str!("../migrations/002_settings_key_value.sql"))
+                        .pragma_update(None, "user_version", SCHEMA_VERSION)
                         .map_err(|e| StorageError::new("loadFailed", e))?;
                 }
-                2..=15 => {}
+                SCHEMA_VERSION => validate_baseline_tables(&transaction)?,
+                // The development baseline had no application identity. Future version 15
+                // carries our fixed identity and must not be renumbered by an older app.
+                15 if SCHEMA_VERSION == 0 && application_id == 0 => {
+                    validate_baseline_tables(&transaction)?;
+                    transaction
+                        .pragma_update(None, "user_version", SCHEMA_VERSION)
+                        .map_err(|e| StorageError::new("loadFailed", e))?;
+                }
                 _ => {
                     return Err(StorageError::new(
                         "loadFailed",
@@ -132,124 +143,10 @@ impl Database {
                     ))
                 }
             }
-            if version < 3 {
-                migrate_beijing_times(&transaction)?;
+            if application_id == 0 {
                 transaction
-                    .pragma_update(None, "user_version", 3)
+                    .pragma_update(None, "application_id", DATABASE_APPLICATION_ID)
                     .map_err(|e| StorageError::new("loadFailed", e))?;
-            }
-            if version < 4 {
-                transaction
-                    .execute_batch(include_str!("../migrations/004_automatic_ytdlp.sql"))
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-                transaction
-                    .pragma_update(None, "user_version", 4)
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-            }
-            if version < 5 {
-                transaction
-                    .execute_batch(include_str!("../migrations/005_persistence.sql"))
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-                transaction
-                    .pragma_update(None, "user_version", 5)
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-            }
-            if version < 6 {
-                transaction
-                    .execute_batch(include_str!("../migrations/006_automatic_tools.sql"))
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-                transaction
-                    .pragma_update(None, "user_version", 6)
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-            }
-            if version < 7 {
-                transaction
-                    .execute_batch(include_str!("../migrations/007_single_input_link.sql"))
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-                transaction
-                    .pragma_update(None, "user_version", 7)
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-            }
-            if version < 8 {
-                transaction
-                    .execute_batch(include_str!("../migrations/008_download_history_cards.sql"))
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-                transaction
-                    .pragma_update(None, "user_version", 8)
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-            }
-            if version < 9 {
-                transaction
-                    .execute_batch(include_str!("../migrations/009_download_history_trash.sql"))
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-                transaction
-                    .pragma_update(None, "user_version", 9)
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-            }
-            if version < 10 {
-                transaction
-                    .execute_batch(include_str!("../migrations/010_shared_download_tasks.sql"))
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-                transaction
-                    .pragma_update(None, "user_version", 10)
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-            }
-            if version < 11 {
-                transaction
-                    .execute_batch(include_str!("../migrations/011_output_identity.sql"))
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-                transaction
-                    .pragma_update(None, "user_version", 11)
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-            }
-            if version < 12 {
-                let present: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('download_records') WHERE name='format_snapshot_json')", [], |r| r.get(0)).map_err(|e| StorageError::new("loadFailed", e))?;
-                if !present {
-                    transaction
-                        .execute_batch(include_str!(
-                            "../migrations/012_download_format_snapshot.sql"
-                        ))
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                }
-                transaction
-                    .pragma_update(None, "user_version", 12)
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-            }
-            if version < 13 {
-                transaction
-                    .execute_batch(include_str!(
-                        "../migrations/013_download_records_by_format.sql"
-                    ))
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-                transaction
-                    .pragma_update(None, "user_version", 13)
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-            }
-            if version < 14 {
-                transaction
-                    .execute_batch(include_str!("../migrations/014_paused_downloads.sql"))
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-                transaction
-                    .pragma_update(None, "user_version", 14)
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-            }
-            if version < 15 {
-                transaction
-                    .execute_batch(include_str!(
-                        "../migrations/015_download_temporary_directories.sql"
-                    ))
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-                transaction
-                    .pragma_update(None, "user_version", 15)
-                    .map_err(|e| StorageError::new("loadFailed", e))?;
-            }
-            // Legacy JSON is normalized to Beijing time during deserialization.
-            // Import after schema migration so it cannot receive the offset twice.
-            if let Some(old) = imported_tools {
-                for (id, config) in old.tools {
-                    write_tool(&transaction, id, &config)
-                        .map_err(|e| StorageError::new("loadFailed", e))?;
-                }
             }
             transaction
                 .commit()
@@ -363,7 +260,7 @@ impl Database {
     }
     pub fn tools(&self) -> Result<RequiredToolSettings, StorageError> {
         let connection = self.connection("loadFailed")?;
-        read_tools(&connection, false)
+        read_tools(&connection)
     }
 
     #[cfg(test)]
@@ -387,6 +284,34 @@ impl Database {
             .map_err(|e| StorageError::new("saveFailed", e))?;
         Ok(())
     }
+}
+
+fn validate_baseline_tables(connection: &Connection) -> Result<(), StorageError> {
+    // Prepare without reading rows; reject missing runtime tables/columns before
+    // treating version 0 as initialized or renumbering the development baseline.
+    for query in [
+        "SELECT setting_key,value_json,updated_at FROM app_settings LIMIT 0",
+        "SELECT tool_id,program_name,source,manual_path,executable_path,version,checked_at FROM required_tools LIMIT 0",
+        "SELECT platform,input_link,video_id,title,thumbnail_url,thumbnail_cache_path,duration_seconds,
+                extension,formats_json,selected_format_id,selected_height,selected_fps,cookie_fallback,
+                download_directory,directory_customized,parser_fingerprint,parsed_at,updated_at
+         FROM download_page_states LIMIT 0",
+        "SELECT id,request_id,platform,video_id,source_link,title,thumbnail_url,thumbnail_cache_path,
+                duration_seconds,format_id,format_extension,height,fps,selected_size_bytes,
+                size_approximate,cookie_fallback,download_directory,output_path,output_extension,
+                file_size_bytes,status,error_code,error_detail,started_at,finished_at,updated_at,
+                error_stage,failure_kind,deleted_at,file_deleted_at,file_availability,
+                successful_format_id,successful_format_extension,successful_height,successful_fps,
+                successful_directory,successful_finished_at,output_identity,format_snapshot_json,
+                successful_format_snapshot_json,pause_requested
+         FROM download_records LIMIT 0",
+        "SELECT record_id,directory,path,identity FROM download_temporary_directories LIMIT 0",
+    ] {
+        connection
+            .prepare(query)
+            .map_err(|e| StorageError::new("loadFailed", e))?;
+    }
+    Ok(())
 }
 
 fn read_proxy_settings(connection: &Connection) -> Result<Option<ProxySettings>, StorageError> {
@@ -414,29 +339,6 @@ fn read_stored_proxy_settings(connection: &Connection) -> Result<Option<ProxySet
         .map_err(|_| StorageError::new("loadFailed", "Invalid stored proxy settings"))?
         .flatten();
     Ok(settings)
-}
-
-fn migrate_beijing_times(connection: &Connection) -> Result<(), StorageError> {
-    {
-        let mut statement = connection
-            .prepare("SELECT updated_at FROM app_settings UNION ALL SELECT checked_at FROM required_tools")
-            .map_err(|e| StorageError::new("loadFailed", e))?;
-        let dates = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| StorageError::new("loadFailed", e))?;
-        for date in dates {
-            let date = date.map_err(|e| StorageError::new("loadFailed", e))?;
-            if datetime::from_legacy_utc(&date).is_none() {
-                return Err(StorageError::new(
-                    "loadFailed",
-                    format!("invalid legacy UTC time: {date}"),
-                ));
-            }
-        }
-    }
-    connection
-        .execute_batch(include_str!("../migrations/003_beijing_datetime.sql"))
-        .map_err(|e| StorageError::new("loadFailed", e))
 }
 
 fn validate_preferences(settings: &AppSettings) -> Result<(), StorageError> {
@@ -512,17 +414,9 @@ fn read_app_settings(
     Ok(settings)
 }
 
-fn read_tools(connection: &Connection, legacy: bool) -> Result<RequiredToolSettings, StorageError> {
-    let query = if legacy {
-        "SELECT t.tool_id, t.source, t.manual_path,
-                strftime('%Y-%m-%d %H:%M:%S', t.checked_at, 'unixepoch', '+8 hours'),
-                p.program_name, p.executable_path, p.version
-         FROM required_tools t LEFT JOIN required_tool_programs p ON p.tool_id = t.tool_id
-         ORDER BY t.tool_id, p.program_name"
-    } else {
-        "SELECT tool_id, source, manual_path, checked_at, program_name, executable_path, version
-         FROM required_tools ORDER BY tool_id, program_name"
-    };
+fn read_tools(connection: &Connection) -> Result<RequiredToolSettings, StorageError> {
+    let query = "SELECT tool_id, source, manual_path, checked_at, program_name, executable_path, version
+                 FROM required_tools ORDER BY tool_id, program_name";
     let mut settings = RequiredToolSettings::default();
     let mut statement = connection
         .prepare(query)
