@@ -47,9 +47,19 @@ const zhCN = {
 
 
         download: "视频下载",
+        audio: "音频提取",
         history: "下载记录",
         settings: "设置",
         recordCount: "{count} 条下载记录",
+    },
+    audio: {
+        chooseFile: "选择视频文件", dropFile: "将视频拖到此处，或", clickToChoose: "点击选择",
+        parsing: "正在解析…", parseSuccess: "解析成功", extractSuccess: "音频提取成功",
+        extract: "提取音频", extracting: "正在提取…", removeFile: "移除文件",
+        audioInfo: "音频信息", duration: "时长", codec: "编码", outputFormat: "输出格式", bitrate: "码率",
+        sampleRate: "采样率", channels: "声道", channelCount: "{count} 声道",
+        track: "音轨", trackNumber: "音轨 {number}", defaultTrack: "默认", unknown: "未知",
+        singleFile: "请一次选择一个视频文件。", desktopRequired: "请在桌面应用中选择视频并提取音频。",
     },
     pages: {
         download: {

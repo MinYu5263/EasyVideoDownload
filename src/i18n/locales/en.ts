@@ -59,10 +59,36 @@ const en = {
 
 
         download: "Video download",
+        audio: "Audio extraction",
         history: "Download history",
         settings: "Settings",
         recordCount:
             "No downloads in history | {count} download in history | {count} downloads in history",
+    },
+    audio: {
+        chooseFile: "Choose a video file",
+        dropFile: "Drop a video here or",
+        clickToChoose: "click to choose",
+        parsing: "Parsing…",
+        parseSuccess: "Video parsed",
+        extractSuccess: "Audio extracted",
+        extract: "Extract audio",
+        extracting: "Extracting…",
+        removeFile: "Remove file",
+        audioInfo: "Audio information",
+        duration: "Duration",
+        codec: "Codec",
+        outputFormat: "Output format",
+        bitrate: "Bitrate",
+        sampleRate: "Sample rate",
+        channels: "Channels",
+        channelCount: "{count} channel | {count} channels",
+        track: "Audio track",
+        trackNumber: "Track {number}",
+        defaultTrack: "Default",
+        unknown: "Unknown",
+        singleFile: "Choose one video file at a time.",
+        desktopRequired: "Open the desktop app to choose a video and extract audio.",
     },
     pages: {
         download: {

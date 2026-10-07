@@ -1,8 +1,7 @@
 import {createApp, h, nextTick, watch} from "vue";
-import {ElNotification} from "element-plus";
+import {ElLoading, ElNotification} from "element-plus";
 import {getCurrentWindow} from "@tauri-apps/api/window";
 import {error as writeLogError} from "@tauri-apps/plugin-log";
-import {ElLoading} from "element-plus";
 import App from "./App.vue";
 import AppNotification from "./components/AppNotification.vue";
 import {appLocale, i18n} from "./i18n";
@@ -39,6 +38,7 @@ import "element-plus/es/components/skeleton/style/css";
 import "element-plus/es/components/skeleton-item/style/css";
 import "element-plus/es/components/progress/style/css";
 import "element-plus/es/components/scrollbar/style/css";
+import "element-plus/es/components/upload/style/css";
 import "element-plus/es/components/loading/style/css";
 import "element-plus/theme-chalk/dark/css-vars.css";
 import "./styles/theme.css";

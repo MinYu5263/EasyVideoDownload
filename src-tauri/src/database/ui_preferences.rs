@@ -43,7 +43,7 @@ impl UiPreferences {
             "douyin" | "bilibili" | "youtube"
         ) || !matches!(
             self.active_page.as_str(),
-            "download" | "history" | "settings"
+            "download" | "audio" | "history" | "settings"
         ) {
             return Err(StorageError::new(code, "Invalid interface preferences"));
         }

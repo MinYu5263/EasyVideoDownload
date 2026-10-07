@@ -1,13 +1,13 @@
 <script lang="ts" setup>
 import {computed, inject, nextTick, onBeforeUpdate, onUnmounted, ref, watch} from "vue";
 import {
+  type ButtonInstance,
   ElButton,
   ElEmpty,
   ElInput,
   ElMessageBox,
   ElScrollbar,
   ElTooltip,
-  type ButtonInstance,
   type ScrollbarInstance
 } from "element-plus";
 import {ArrowLeft, Search} from "@element-plus/icons-vue";
@@ -430,7 +430,7 @@ async function action(name: string, record: DownloadRecord) {
   <div class="history-container">
     <ContentMotion ref="scopeMotion" :active="props.active" :position="history.trashed.value ? 1 : 0"
                    :view-key="history.trashed.value">
-    <section :aria-busy="history.loading.value" aria-labelledby="page-title" class="history-page">
+      <section :aria-busy="history.loading.value" :aria-label="t('navigation.history')" class="history-page">
       <header class="history-header">
         <div :inert="history.switching.value || undefined" class="history-toolbar">
           <ElButton v-if="history.trashed.value" ref="scopeButton" :aria-label="t('history.backToHistory')"

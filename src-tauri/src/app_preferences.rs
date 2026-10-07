@@ -251,7 +251,9 @@ fn has_active_tasks(app: &tauri::AppHandle) -> Result<bool, String> {
     let tools = app
         .state::<crate::required_tools::managed::ConfigureManager>()
         .is_active()?;
-    Ok(downloads || tools)
+    let audio = app.try_state::<crate::audio::AudioExtractionManager>()
+        .map(|state| state.is_active()).transpose()?.unwrap_or(false);
+    Ok(downloads || tools || audio)
 }
 
 fn emit_close_prompt(app: &tauri::AppHandle) -> Result<(), String> {
@@ -481,12 +483,14 @@ fn exit_after_confirmation(app: &tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         let downloads = app.state::<crate::video::download::DownloadManager>();
         let tools = app.state::<crate::required_tools::managed::ConfigureManager>();
+        let audio = app.try_state::<crate::audio::AudioExtractionManager>();
         let result = async {
             downloads.begin_exit()?;
             tools.begin_exit()?;
+            if let Some(audio) = &audio { audio.begin_exit()?; }
             // Let process trees stop and real terminal records/installation rollback settle.
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                while downloads.is_active()? || tools.is_active()? {
+                while downloads.is_active()? || tools.is_active()? || audio.as_ref().map(|a| a.is_active()).transpose()?.unwrap_or(false) {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 Ok::<_, String>(())
@@ -503,6 +507,7 @@ fn exit_after_confirmation(app: &tauri::AppHandle) {
             Err(error) => {
                 downloads.abort_exit();
                 tools.abort_exit();
+                if let Some(audio) = &audio { audio.abort_exit(); }
                 app.state::<AppPreferences>()
                     .exiting
                     .store(false, Ordering::SeqCst);
@@ -523,14 +528,16 @@ pub(crate) fn settle_on_native_exit(app: &tauri::AppHandle) {
     // still exists during this callback; drain Rust work before Tauri cleans up.
     let downloads = app.state::<crate::video::download::DownloadManager>();
     let tools = app.state::<crate::required_tools::managed::ConfigureManager>();
+    let audio = app.try_state::<crate::audio::AudioExtractionManager>();
     app.state::<AppPreferences>()
         .exiting
         .store(true, Ordering::SeqCst);
     let result = tauri::async_runtime::block_on(async {
         downloads.begin_exit()?;
         tools.begin_exit()?;
+        if let Some(audio) = &audio { audio.begin_exit()?; }
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            while downloads.is_active()? || tools.is_active()? {
+            while downloads.is_active()? || tools.is_active()? || audio.as_ref().map(|a| a.is_active()).transpose()?.unwrap_or(false) {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             Ok::<_, String>(())

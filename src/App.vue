@@ -6,6 +6,7 @@ import AppSidebar from "./components/AppSidebar.vue";
 import DownloadPage from "./components/DownloadPage.vue";
 import SettingsPage from "./components/SettingsPage.vue";
 import HistoryPage from "./components/HistoryPage.vue";
+import AudioExtractionPage from "./components/AudioExtractionPage.vue";
 import ContentMotion from "./components/ContentMotion.vue";
 import {createPageNavigation} from "./composables/usePageNavigation";
 import CloseWindowDialog from "./components/CloseWindowDialog.vue";
@@ -137,6 +138,7 @@ const activePage = computed(
         <DownloadPage v-show="activePage.id === 'download'" :active="activePage.id === 'download'"
                       @busy-change="downloadBusy = $event" @view-history="viewHistory"/>
         <SettingsPage v-show="activePage.id === 'settings'"/>
+          <AudioExtractionPage v-show="activePage.id === 'audio'" :active="activePage.id === 'audio'"/>
         <HistoryPage v-show="activePage.id === 'history'" ref="historyPage" :active="activePage.id === 'history'"
                      :downloading="downloadBusy"/>
         </ContentMotion>

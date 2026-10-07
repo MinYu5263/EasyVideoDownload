@@ -1,4 +1,4 @@
-import {Clock, Download, Setting} from "@element-plus/icons-vue";
+import {Clock, Download, Headset, Setting} from "@element-plus/icons-vue";
 
 export const appPages = [
     {
@@ -7,6 +7,12 @@ export const appPages = [
         icon: Download,
         emptyTitleKey: "pages.download.emptyTitle",
         emptyDescriptionKey: "pages.download.emptyDescription",
+    },
+    {
+        id: "audio",
+        labelKey: "navigation.audio",
+        icon: Headset,
+        emptyTitleKey: "navigation.audio",
     },
     {
         id: "history",

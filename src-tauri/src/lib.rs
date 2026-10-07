@@ -3,6 +3,7 @@
 
 mod app_logs;
 mod app_preferences;
+mod audio;
 mod cookies;
 mod database;
 mod datetime;
@@ -43,6 +44,7 @@ pub fn run() {
             app.manage(cookies::CookieStore::new(&data_directory));
             app.manage(thumbnails::ThumbnailStore::new(&data_directory));
             app.manage(video::download::DownloadManager::default());
+            app.manage(audio::AudioExtractionManager::default());
             #[cfg(target_os = "macos")]
             app_preferences::install_native_quit_handler(app.handle())
                 .map_err(std::io::Error::other)?;
@@ -87,6 +89,11 @@ pub fn run() {
             cookies::save_cookie_contents,
             desktop::import_cookie_file,
             desktop::select_download_directory,
+            desktop::select_audio_source_file,
+            audio::get_audio_extraction_state,
+            audio::parse_audio_source,
+            audio::extract_audio,
+            audio::clear_audio_source,
             video::parse_video,
             video::download::get_default_download_directories,
             video::download::tasks::commands::enqueue_video_download,

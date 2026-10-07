@@ -15,6 +15,20 @@ fn error(detail: impl ToString) -> DesktopError {
 }
 
 #[tauri::command]
+pub async fn select_audio_source_file(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+) -> Result<Option<String>, DesktopError> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog().file().set_parent(&window)
+        .add_filter("Video", &["mp4", "mkv", "mov", "webm", "avi", "m4v", "ts", "mts", "m2ts", "flv", "wmv", "mpeg", "mpg", "ogv"])
+        .add_filter("All files", &["*"])
+        .pick_file(move |path| { let _ = sender.send(path); });
+    receiver.await.map_err(error)?.map(|file| file.into_path()
+        .map(|path| path.to_string_lossy().into_owned()).map_err(error)).transpose()
+}
+
+#[tauri::command]
 pub async fn import_cookie_file(
     app: tauri::AppHandle,
     window: tauri::Window,
