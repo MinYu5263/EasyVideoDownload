@@ -1,7 +1,7 @@
 import {computed, ref} from "vue";
 import {invoke, isTauri} from "@tauri-apps/api/core";
 import {listen} from "@tauri-apps/api/event";
-import {persistenceError, type PersistenceBridge, type PersistenceError} from "./useUiPreferences.ts";
+import {type PersistenceBridge, persistenceError, type PersistenceError} from "./useUiPreferences.ts";
 import type {VideoPlatform} from "./videoPlatforms.ts";
 import type {VideoFormat} from "./useVideoParser.ts";
 
@@ -66,7 +66,7 @@ interface HistoryBridge extends PersistenceBridge {
     listen: (event: string, handler: () => void) => Promise<() => void>
 }
 
-export function createDownloadHistory(bridge: HistoryBridge) {
+export function createDownloadHistory(bridge: HistoryBridge, initialTrashed = false) {
     const records = ref<DownloadRecord[]>([]), totalCount = ref<number | null>(null),
         nextCursor = ref<HistoryCursor | null>(null);
     const loading = ref(false), error = ref<PersistenceError | null>(null);
@@ -83,14 +83,14 @@ export function createDownloadHistory(bridge: HistoryBridge) {
         interrupted: 0
     });
     const filters = ref<HistoryFilters>({query: "", status: null});
-    const trashed = ref(false), trashCount = ref(0);
+    const trashed = ref(initialTrashed), trashCount = ref(0);
     const switching = ref(false);
     let requestedFilters: HistoryFilters = {...filters.value};
-    let requestedTrashed = false;
+    let requestedTrashed = initialTrashed;
     const fileDeletionSupported = ref(false);
     let disposed = false, revision = 0, task: Promise<boolean> | undefined, unlisten: (() => void) | undefined,
         connecting: Promise<void> | undefined;
-    let active: { revision: number; refreshPending: boolean } | undefined;
+    let active: { revision: number; refreshPending: boolean; subscription: (() => void) | undefined } | undefined;
     let historyStatus: HistoryStatus | null = null;
     let loadedThrough: HistoryCursor | null = null;
 
@@ -148,7 +148,7 @@ export function createDownloadHistory(bridge: HistoryBridge) {
             return task;
         }
         if (more && !nextCursor.value) return Promise.resolve(true);
-        const state = {revision, refreshPending: false};
+        const state = {revision, refreshPending: false, subscription: unlisten};
         active = state;
         switching.value = changingView;
         loading.value = true;
@@ -236,6 +236,25 @@ export function createDownloadHistory(bridge: HistoryBridge) {
         return load();
     }
 
+    async function activate() {
+        // Reconnect before deciding whether events have kept the displayed records current
+        const connected = !bridge.desktop || Boolean(unlisten), current = revision;
+        await connect();
+        if (disposed) return false;
+        if (current !== revision) {
+            // Reconcile missed events in the newer scope without resetting its selection
+            return !connected && !connectionError.value ? load() : false;
+        }
+        if (requestedTrashed !== initialTrashed) return setTrashed(initialTrashed);
+
+        // Reuse this scope's data and requests without scheduling a second refresh
+        const currentSubscription = connected && !connectionError.value;
+        if (!connectionError.value && task && active?.revision === revision && active.subscription === unlisten) return task;
+        if (trashed.value !== initialTrashed) return setTrashed(initialTrashed);
+        if (currentSubscription && viewLoaded.value && !error.value) return true;
+        return load();
+    }
+
     return {
         records,
         totalCount,
@@ -247,6 +266,7 @@ export function createDownloadHistory(bridge: HistoryBridge) {
         fileDeletionSupported,
         nextCursor,
         loading,
+        loaded: viewLoaded,
         blockingLoading,
         switching,
         error,
@@ -257,13 +277,17 @@ export function createDownloadHistory(bridge: HistoryBridge) {
         loadMore: () => load(true),
         connect,
         refresh,
+        activate,
         dispose,
         whenIdle
     };
 }
 
-let controller: ReturnType<typeof createDownloadHistory> | undefined;
+export type DownloadHistoryState = ReturnType<typeof createDownloadHistory>;
 
-export function useDownloadHistory() {
+let controller: DownloadHistoryState | undefined, trashController: DownloadHistoryState | undefined;
+
+export function useDownloadHistory(trashed = false) {
+    if (trashed) return trashController ??= createDownloadHistory({desktop: isTauri(), invoke, listen}, true);
     return controller ??= createDownloadHistory({desktop: isTauri(), invoke, listen});
 }
