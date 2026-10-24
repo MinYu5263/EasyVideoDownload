@@ -79,7 +79,7 @@ pnpm icons
 pnpm tauri dev
 ```
 
-在对应系统上构建安装包和免安装压缩包：
+在对应系统上构建发布包：
 
 ```powershell
 npm run package:win
@@ -91,8 +91,8 @@ npm run package:mac
 
 也可以直接运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-win.ps1` 或
 `bash scripts/package-mac.sh`。脚本每次打包前会清空项目根目录的 `dist/`。Windows 脚本生成 NSIS 安装器和包含独立可执行文件的免安装
-zip；macOS 脚本生成 DMG 和可直接解压的 `.app` zip。产物统一复制到 `dist/`，构建前先安装依赖。免安装版仍使用系统应用数据目录，Windows
-还需系统提供 WebView2 运行时。真实解析、下载和文件操作需要在 Tauri 桌面窗口中运行。
+zip；macOS 脚本仅生成 DMG，打包时跳过 Finder 窗口布局设置，不弹出安装窗口。产物统一复制到 `dist/`，构建前先安装依赖。
+免安装版仍使用系统应用数据目录，Windows 还需系统提供 WebView2 运行时。真实解析、下载和文件操作需要在 Tauri 桌面窗口中运行。
 
 发布新版本时运行 `npm run version:set -- 0.3.2`，会同步更新 `package.json`、`Cargo.toml` 和 `Cargo.lock`。Tauri 配置直接读取
 `package.json` 的版本；此命令只修改版本文件，不创建 Git 提交或标签。

@@ -10,7 +10,6 @@ project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$project_root"
 command -v node >/dev/null
 command -v npm >/dev/null
-command -v ditto >/dev/null
 if [[ ! -f node_modules/@tauri-apps/cli/tauri.js ]]; then
   echo 'Install project dependencies before packaging' >&2
   exit 1
@@ -35,30 +34,23 @@ if [[ -e "$output_directory" ]]; then
 fi
 
 node scripts/generate-icons.mjs
-node node_modules/@tauri-apps/cli/tauri.js build --bundles app,dmg
+# Skip Finder layout customization to keep packaging non-interactive
+CI=true TAURI_BUNDLER_DMG_IGNORE_CI=false \
+  node node_modules/@tauri-apps/cli/tauri.js build --ci --bundles dmg
 
-app_path="src-tauri/target/release/bundle/macos/EasyVideoDownload.app"
+# Export and verify the DMG
 shopt -s nullglob
 dmgs=(src-tauri/target/release/bundle/dmg/EasyVideoDownload_"$version"_*.dmg)
-if [[ ! -d "$app_path" || ${#dmgs[@]} -ne 1 ]]; then
-  echo 'Expected one DMG and the macOS application bundle' >&2
+if [[ ${#dmgs[@]} -ne 1 ]]; then
+  echo 'Expected one DMG' >&2
   exit 1
 fi
 
-case "$(uname -m)" in
-  arm64) architecture='arm64' ;;
-  x86_64) architecture='x64' ;;
-  *) echo 'Unsupported macOS architecture' >&2; exit 1 ;;
-esac
+artifact="$output_directory/$(basename "${dmgs[0]}")"
+cp -p "${dmgs[0]}" "$artifact"
 
-app_archive="$output_directory/EasyVideoDownload_${version}_${architecture}.app.zip"
-cp -p "${dmgs[0]}" "$output_directory/"
-ditto -c -k --sequesterRsrc --keepParent "$app_path" "$app_archive"
-
-for artifact in "$output_directory/$(basename "${dmgs[0]}")" "$app_archive"; do
-  if [[ ! -s "$artifact" ]]; then
-    echo "Empty package: $artifact" >&2
-    exit 1
-  fi
-  shasum -a 256 "$artifact"
-done
+if [[ ! -s "$artifact" ]]; then
+  echo "Empty package: $artifact" >&2
+  exit 1
+fi
+shasum -a 256 "$artifact"
