@@ -25,7 +25,8 @@ export function useFeedback() {
         notifications.get(key)?.close();
         let handle: NotificationHandle;
         handle = ElNotification({
-            position: "top-right", duration: 0, showClose: true, customClass: "app-notification",
+            position: "top-right", duration: options.downloadOutcome === "completed" ? 5000 : 0,
+            showClose: true, customClass: "app-notification",
             message: h(AppNotification, {
                 title, type, description: detail || message,
             }),

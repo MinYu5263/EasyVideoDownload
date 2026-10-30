@@ -201,6 +201,13 @@ textarea {
     padding: 0;
 }
 
+/* Mirror the default slide-in path when closing notifications */
+.app-notification.el-notification-fade-leave-to.right {
+    right: 0;
+    transform: translateX(100%);
+    opacity: 1;
+}
+
 .app-notification .el-notification__group {
     min-width: 0;
     flex: 1;
